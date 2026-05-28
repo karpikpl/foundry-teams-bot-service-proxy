@@ -1,0 +1,70 @@
+using System.Text.Json.Serialization;
+using Microsoft.Bot.Builder;
+using Microsoft.Bot.Schema;
+
+namespace AgentChat.Bots;
+
+/// <summary>
+/// Per-conversation state. Persists via Bot Framework IStorage (Cosmos/Blob/Redis).
+///
+/// v2 Foundry Responses API model:
+///   - Threads are replaced by Conversations (conv_xxx ids).
+///   - Agents are identified by (name, version) instead of a GUID.
+///   - Runs are replaced by Responses (resp_xxx ids), used here only for cancellation.
+/// </summary>
+public class ConversationState : IStoreItem
+{
+    /// <summary>Foundry conversation id (conv_xxx). Created lazily on first turn.</summary>
+    public string? ConversationId { get; set; }
+
+    /// <summary>
+    /// Per-agent Foundry endpoint URL that owns the conversation. Used to detect
+    /// URL-routing endpoint changes — if the endpoint changes we spin up a new
+    /// conversation instead of reusing one bound to a different agent.
+    /// </summary>
+    public string? AgentEndpoint { get; set; }
+
+    /// <summary>Response id currently executing — used for cancellation marker.</summary>
+    public string? CurrentResponseId { get; set; }
+
+    // ---- token usage accumulators ----
+    public long PromptTokensTotal     { get; set; }
+    public long CompletionTokensTotal { get; set; }
+    public long TotalTokensTotal      { get; set; }
+    public int  RunCount              { get; set; }
+    public long LastPromptTokens      { get; set; }
+    public long LastCompletionTokens  { get; set; }
+    public long LastTotalTokens       { get; set; }
+    public DateTime? LastRunUtc       { get; set; }
+
+    /// <summary>
+    /// MCP tool names the user said "always approve" for, in this conversation.
+    /// Auto-approval is enforced client-side: when an approval request arrives
+    /// we check this set and, if present, immediately submit an approval item
+    /// without showing the card.
+    /// </summary>
+    public HashSet<string> AutoApproveMcpTools { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Whether to emit the per-run usage footer card.</summary>
+    public bool ShowUsage { get; set; } = false;
+
+    /// <summary>
+    /// Whether to render tool-call cards (MCP results, function outputs,
+    /// code-interpreter blocks). Off by default — these are mostly noise for
+    /// end users; the agent's text summary already reflects the tool result.
+    /// Useful for troubleshooting; toggle with <c>/tools on|off</c>.
+    /// </summary>
+    public bool ShowToolCalls { get; set; } = false;
+
+    /// <summary>
+    /// Conversation reference captured on every turn so we can do proactive
+    /// pushes from a different request later.
+    /// </summary>
+    public ConversationReference? ConversationReference { get; set; }
+
+    public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
+    public DateTime LastActivityUtc { get; set; } = DateTime.UtcNow;
+
+    /// <summary>IStoreItem eTag for optimistic concurrency.</summary>
+    public string ETag { get; set; } = "*";
+}

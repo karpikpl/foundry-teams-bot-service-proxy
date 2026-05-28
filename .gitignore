@@ -1,0 +1,33 @@
+# --- build outputs ---
+bin/
+obj/
+publish/
+*.zip
+
+# --- IDEs ---
+.vs/
+.vscode/
+.idea/
+*.user
+
+# --- nuget ---
+*.nupkg
+*.snupkg
+
+# --- secrets / local config ---
+*.local.json
+appsettings.Development.json
+.env
+.env.local
+secrets/
+
+# --- test outputs ---
+TestResults/
+coverage.*
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- session/scratch ---
+out/

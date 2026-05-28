@@ -1,0 +1,55 @@
+# Things that should NEVER end up in the docker build context (slows builds,
+# bloats images, leaks local state). Keep this aligned with .gitignore where
+# possible — extra entries below for things git tracks but docker shouldn't see.
+
+# --- VCS ---
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- Build outputs ---
+**/bin
+**/obj
+**/publish
+**/*.zip
+
+# --- IDE / editor cruft ---
+.vs
+.vscode
+.idea
+*.user
+*.suo
+*.swp
+*.DS_Store
+
+# --- Tests & local-only artifacts ---
+tests
+TestResults
+**/*.log
+**/coverage.*
+**/StrykerOutput
+
+# --- Terraform / Azure deploy (not part of the app image) ---
+agent-deploy
+*.tfstate
+*.tfstate.*
+.terraform
+
+# --- Documentation / scratch ---
+*.md
+LICENSE
+claude-static-agent.http
+stuff.tf
+
+# --- Secrets ---
+*.env
+*.pfx
+*.pem
+appsettings.Development.json
+appsettings.Local.json
+
+# --- Docker / CI ---
+Dockerfile
+.dockerignore
+docker-compose*.yml

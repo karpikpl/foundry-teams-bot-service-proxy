@@ -1,0 +1,139 @@
+### Foundry per-agent OpenAI Responses endpoint — sample requests
+###
+### Requires the VS Code "REST Client" extension (humao.rest-client).
+###
+### Get a bearer token:
+###   az login
+###   az account get-access-token --resource https://ai.azure.com --query accessToken -o tsv
+### Paste it into @token below (or use {{$processEnv AAD_TOKEN}}).
+
+@host       = your-foundry-account.services.ai.azure.com
+@project    = your-project-name
+@agent      = your-agent-name
+@apiVersion = 2025-05-15-preview
+@base       = https://{{host}}/api/projects/{{project}}/agents/{{agent}}/endpoint/protocols/openai/v1
+
+# Paste a fresh Entra ID token here (audience = https://ai.azure.com)
+@token = PASTE_TOKEN_HERE
+
+
+############################################################
+### 1. Simple one-shot request
+############################################################
+# @name oneShot
+POST {{base}}/responses?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "input": "Say hello in one short sentence."
+}
+
+
+############################################################
+### 2. Streaming (Server-Sent Events)
+############################################################
+POST {{base}}/responses?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "input": "Count from 1 to 5, one number per line.",
+  "stream": true
+}
+
+
+############################################################
+### 3. Multi-turn via previous_response_id
+############################################################
+# @name turn1
+POST {{base}}/responses?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "input": "My favorite color is teal. Remember it."
+}
+
+###
+POST {{base}}/responses?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "input": "What color did I just tell you?",
+  "previous_response_id": "{{turn1.response.body.id}}"
+}
+
+
+############################################################
+### 4. Conversations API — long-lived, server-managed history
+############################################################
+# @name createConv
+POST {{base}}/conversations?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "metadata": { "topic": "demo-chat" }
+}
+
+###
+# Turn 1 attached to the conversation.
+POST {{base}}/responses?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "conversation": "{{createConv.response.body.id}}",
+  "input": "My favorite color is magenta."
+}
+
+###
+# Turn 2 — no previous_response_id needed; the conversation supplies history.
+POST {{base}}/responses?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "conversation": "{{createConv.response.body.id}}",
+  "input": "What's my favorite color?"
+}
+
+###
+# Inspect items in the conversation.
+GET {{base}}/conversations/{{createConv.response.body.id}}/items?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+
+###
+# Delete the conversation when done.
+DELETE {{base}}/conversations/{{createConv.response.body.id}}?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+
+
+############################################################
+### 5. POST items directly (function-call output / MCP approval response)
+############################################################
+# function_call_output (the bot does this after running a function tool):
+POST {{base}}/conversations/{{createConv.response.body.id}}/items?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "items": [
+    { "type": "function_call_output", "call_id": "call_xxx", "output": "result text" }
+  ]
+}
+
+###
+# mcp_approval_response (the bot does this when the user approves a tool):
+POST {{base}}/conversations/{{createConv.response.body.id}}/items?api-version={{apiVersion}}
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "items": [
+    { "type": "mcp_approval_response", "approval_request_id": "mcpr_xxx", "approve": true }
+  ]
+}

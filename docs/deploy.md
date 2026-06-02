@@ -86,6 +86,17 @@ Endpoint: `https://{app}.azurewebsites.net/api/messages`
 
 If you want URL-routed multi-agent: configure additional Bot Service registrations (each is one Teams app entry) and point each at `https://{app}.azurewebsites.net/api/messages/{foundryHost}/{project}/{agent}`.
 
+## Multi-project routing
+
+One App Service can serve Bot Service registrations for multiple Foundry projects by using URL-routed endpoints:
+
+```text
+Teams app A → /api/messages/foundry-a/project-a/agent-one → project-a catalog
+Teams app B → /api/messages/foundry-b/project-b/agent-two → project-b catalog
+```
+
+For routed conversations, the bot derives the project from the incoming agent endpoint and scopes `/agents`, `/agent`, and picker submissions to that project. The configured `Foundry__ProjectEndpoint` remains the fallback for the default `/api/messages` route and for any route that cannot be decoded.
+
 ## Teams app manifest
 
 Generate via `/admin/manifest` — the page lists configured agents and lets you download a sideloadable `.zip` per agent. You can also POST to `/admin/manifest/{agentName}` for an automated flow.

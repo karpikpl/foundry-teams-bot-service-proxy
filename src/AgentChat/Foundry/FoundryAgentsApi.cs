@@ -109,9 +109,14 @@ public static class FoundryAgentsApi
         const string Marker = "/agents/";
         var idx = perAgentEndpoint.IndexOf(Marker, StringComparison.OrdinalIgnoreCase);
         if (idx < 0) return null;
-        // Sanity check: the suffix must look like "/agents/{name}/endpoint/protocols/openai/v1"
+        // Sanity check: the suffix must be exactly
+        // "/agents/{name}/endpoint/protocols/openai/v1".
+        const string TailSuffix = "/endpoint/protocols/openai/v1";
         var tail = perAgentEndpoint.Substring(idx + Marker.Length);
-        if (!tail.Contains("/endpoint/protocols/openai/v1", StringComparison.OrdinalIgnoreCase))
+        if (!tail.EndsWith(TailSuffix, StringComparison.OrdinalIgnoreCase))
+            return null;
+        var agentName = tail.Substring(0, tail.Length - TailSuffix.Length);
+        if (string.IsNullOrWhiteSpace(agentName) || agentName.Contains('/'))
             return null;
         return perAgentEndpoint.Substring(0, idx);
     }

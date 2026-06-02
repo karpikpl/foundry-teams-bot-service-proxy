@@ -41,9 +41,18 @@ public class AgentService
     public string DefaultProjectEndpoint     => _defaultProjectEndpoint;
 
     public AgentService(ILogger<AgentService> logger, IConfiguration config, IHttpClientFactory httpFactory)
+        : this(logger, config, httpFactory, new Azure.Identity.DefaultAzureCredential(new Azure.Identity.DefaultAzureCredentialOptions
+        {
+            ManagedIdentityClientId = config["AZURE_CLIENT_ID"]
+        }))
+    {
+    }
+
+    public AgentService(ILogger<AgentService> logger, IConfiguration config, IHttpClientFactory httpFactory, TokenCredential credential)
     {
         _logger      = logger;
         _httpFactory = httpFactory;
+        _credential  = credential;
 
         var endpoint = config["Foundry:ProjectEndpoint"]
             ?? throw new InvalidOperationException("Foundry:ProjectEndpoint not configured");
@@ -51,11 +60,6 @@ public class AgentService
 
         var ttlSeconds = config.GetValue("Foundry:CatalogCacheSeconds", 300);
         _cacheTtl = TimeSpan.FromSeconds(Math.Max(0, ttlSeconds));
-
-        _credential = new Azure.Identity.DefaultAzureCredential(new Azure.Identity.DefaultAzureCredentialOptions
-        {
-            ManagedIdentityClientId = config["AZURE_CLIENT_ID"]
-        });
     }
 
     /// <summary>
@@ -169,10 +173,10 @@ public class AgentService
     }
 
     public async Task<string?> FindKeyForEndpointAsync(
-        string? agentEndpoint, CancellationToken ct = default)
+        string? agentEndpoint, string? projectEndpoint = null, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(agentEndpoint)) return null;
-        var project = FoundryAgentsApi.ProjectEndpointFor(agentEndpoint) ?? _defaultProjectEndpoint;
+        var project = ResolveProject(projectEndpoint ?? FoundryAgentsApi.ProjectEndpointFor(agentEndpoint));
         var all = await GetDescriptorsAsync(project, ct: ct);
         return all.FirstOrDefault(d => string.Equals(d.Endpoint, agentEndpoint, StringComparison.OrdinalIgnoreCase))?.Key;
     }

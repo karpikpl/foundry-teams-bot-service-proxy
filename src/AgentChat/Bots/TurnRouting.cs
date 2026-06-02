@@ -1,3 +1,4 @@
+using AgentChat.Foundry;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Bot.Builder;
 
@@ -13,6 +14,9 @@ public class TurnRouting
     /// <summary>Per-agent Foundry endpoint (.../agents/{agent}/endpoint/protocols/openai/v1).</summary>
     public string AgentEndpoint { get; init; } = "";
 
+    /// <summary>Project-level Foundry endpoint (.../api/projects/{project}).</summary>
+    public string ProjectEndpoint { get; init; } = "";
+
     /// <summary>True when the URL path pinned us to a specific agent.</summary>
     public bool IsRouted { get; init; }
 
@@ -22,8 +26,18 @@ public class TurnRouting
         var ep = http?.Items[Controllers.BotMessagesController.AgentEndpointKey] as string;
         if (!string.IsNullOrEmpty(ep))
         {
-            return new TurnRouting { AgentEndpoint = ep, IsRouted = true };
+            return new TurnRouting
+            {
+                AgentEndpoint = ep,
+                ProjectEndpoint = FoundryAgentsApi.ProjectEndpointFor(ep) ?? agents.DefaultProjectEndpoint,
+                IsRouted = true
+            };
         }
-        return new TurnRouting { AgentEndpoint = agents.DefaultEndpoint, IsRouted = false };
+        return new TurnRouting
+        {
+            AgentEndpoint = agents.DefaultEndpoint,
+            ProjectEndpoint = agents.DefaultProjectEndpoint,
+            IsRouted = false
+        };
     }
 }

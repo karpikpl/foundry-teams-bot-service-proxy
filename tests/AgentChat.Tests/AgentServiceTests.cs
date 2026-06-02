@@ -1,4 +1,5 @@
 using AgentChat.Services;
+using Azure.Core;
 using FluentAssertions;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -18,7 +19,10 @@ namespace AgentChat.Tests;
 /// </summary>
 public class AgentServiceTests
 {
-    private static AgentService MakeService(Dictionary<string, string?>? overrides = null)
+    private static AgentService MakeService(
+        Dictionary<string, string?>? overrides = null,
+        IHttpClientFactory? httpFactory = null,
+        TokenCredential? credential = null)
     {
         var settings = new Dictionary<string, string?>
         {
@@ -28,8 +32,11 @@ public class AgentServiceTests
             foreach (var kv in overrides) settings[kv.Key] = kv.Value;
 
         var cfg = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
-        var httpFactory = new SimpleHttpClientFactory();
-        return new AgentService(NullLogger<AgentService>.Instance, cfg, httpFactory);
+        return new AgentService(
+            NullLogger<AgentService>.Instance,
+            cfg,
+            httpFactory ?? new SimpleHttpClientFactory(),
+            credential ?? new StaticTokenCredential());
     }
 
     [Fact]
@@ -41,20 +48,20 @@ public class AgentServiceTests
     }
 
     [Fact]
-    public void ProjectEndpoint_is_exposed_for_per_turn_routing()
+    public void DefaultProjectEndpoint_is_exposed_for_per_turn_routing()
     {
         var svc = MakeService();
-        svc.ProjectEndpoint.Should().Be("https://aif-x.services.ai.azure.com/api/projects/proj-x");
+        svc.DefaultProjectEndpoint.Should().Be("https://aif-x.services.ai.azure.com/api/projects/proj-x");
     }
 
     [Fact]
-    public void ProjectEndpoint_trailing_slash_is_normalized_away()
+    public void DefaultProjectEndpoint_trailing_slash_is_normalized_away()
     {
         var svc = MakeService(new()
         {
             ["Foundry:ProjectEndpoint"] = "https://aif-x.services.ai.azure.com/api/projects/proj-x/"
         });
-        svc.ProjectEndpoint.Should().NotEndWith("/");
+        svc.DefaultProjectEndpoint.Should().NotEndWith("/");
     }
 
     [Fact]
@@ -86,6 +93,30 @@ public class AgentServiceTests
         result.Should().BeEmpty();
     }
 
+
+    [Fact]
+    public async Task GetDescriptorsAsync_caches_catalogs_separately_per_project()
+    {
+        var projectA = "https://aif-one.services.ai.azure.com/api/projects/proj-a";
+        var projectB = "https://aif-two.services.ai.azure.com/api/projects/proj-b";
+        var handler = new CatalogHandler();
+        var svc = MakeService(httpFactory: new HandlerHttpClientFactory(handler));
+
+        var firstA = await svc.GetDescriptorsAsync(projectA);
+        var firstB = await svc.GetDescriptorsAsync(projectB);
+        var secondA = await svc.GetDescriptorsAsync(projectA);
+        var secondB = await svc.GetDescriptorsAsync(projectB);
+
+        firstA.Should().ContainSingle(d => d.Name == "agent-proj-a");
+        firstB.Should().ContainSingle(d => d.Name == "agent-proj-b");
+        secondA.Should().BeSameAs(firstA);
+        secondB.Should().BeSameAs(firstB);
+        handler.Counts[projectA].Should().Be(1);
+        handler.Counts[projectB].Should().Be(1);
+        firstA[0].Endpoint.Should().StartWith(projectA);
+        firstB[0].Endpoint.Should().StartWith(projectB);
+    }
+
     [Fact]
     public async Task FindByKeyAsync_returns_null_when_unknown()
     {
@@ -114,5 +145,55 @@ public class AgentServiceTests
     private sealed class SimpleHttpClientFactory : IHttpClientFactory
     {
         public HttpClient CreateClient(string name) => new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+    }
+
+    private sealed class HandlerHttpClientFactory(HttpMessageHandler handler) : IHttpClientFactory
+    {
+        public HttpClient CreateClient(string name) => new(handler, disposeHandler: false);
+    }
+
+    private sealed class StaticTokenCredential : TokenCredential
+    {
+        public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
+            => new("test-token", DateTimeOffset.UtcNow.AddHours(1));
+
+        public override ValueTask<AccessToken> GetTokenAsync(TokenRequestContext requestContext, CancellationToken cancellationToken)
+            => new(GetToken(requestContext, cancellationToken));
+    }
+
+    private sealed class CatalogHandler : HttpMessageHandler
+    {
+        public Dictionary<string, int> Counts { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var url = request.RequestUri!.ToString();
+            var marker = "/agents?";
+            var idx = url.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            var project = idx < 0 ? url : url.Substring(0, idx);
+            Counts[project] = Counts.GetValueOrDefault(project) + 1;
+            var projectName = project.Split('/').Last();
+            var json = $$"""
+            {
+              "data": [
+                {
+                  "name": "agent-{{projectName}}",
+                  "versions": {
+                    "latest": {
+                      "version": "1",
+                      "description": "Agent for {{projectName}}",
+                      "status": "active",
+                      "definition": { "model": "gpt-4o" }
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(json)
+            });
+        }
     }
 }

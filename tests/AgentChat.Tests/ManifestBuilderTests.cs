@@ -90,7 +90,7 @@ public class ManifestBuilderTests
     public void Build_uses_provided_manifest_id_when_given()
     {
         var id = Guid.NewGuid();
-        var m = ManifestBuilder.Build("Agent", "Desc", BotId, id);
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId, manifestId: id);
         m["id"]!.ToString().Should().Be(id.ToString());
     }
 
@@ -125,6 +125,24 @@ public class ManifestBuilderTests
         dev["websiteUrl"].Should().NotBeNull();
         dev["privacyUrl"].Should().NotBeNull();
         dev["termsOfUseUrl"].Should().NotBeNull();
+    }
+
+    [Fact]
+    public void Build_does_not_emit_botEndpointPath_when_omitted_or_default()
+    {
+        var m1 = ManifestBuilder.Build("Agent", "Desc", BotId);
+        m1["bots"]![0]!["x-foundryBotEndpointPath"].Should().BeNull();
+
+        var m2 = ManifestBuilder.Build("Agent", "Desc", BotId, botEndpointPath: "/api/messages");
+        m2["bots"]![0]!["x-foundryBotEndpointPath"].Should().BeNull();
+    }
+
+    [Fact]
+    public void Build_embeds_url_routed_botEndpointPath_when_provided()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId, botEndpointPath: "/api/messages/aif-x/proj/Agent");
+        m["bots"]![0]!["x-foundryBotEndpointPath"]!.ToString()
+            .Should().Be("/api/messages/aif-x/proj/Agent");
     }
 
     [Theory]

@@ -4,90 +4,155 @@ using Azure.Core;
 namespace AgentChat.Services;
 
 /// <summary>
-/// Holds the catalogue of per-agent Foundry endpoints this app knows about,
-/// plus a shared TokenCredential. No SDK clients, no per-startup provisioning —
-/// agent definitions live in Foundry (provisioned by Terraform or the portal),
-/// the app just talks to them via <see cref="FoundryClient"/>.
+/// Owns the Foundry project endpoint, the shared <see cref="TokenCredential"/>,
+/// and a 5-minute cached snapshot of the agents currently exposed by that
+/// project. The picker, /agents command, manifest UI, and default-agent
+/// selection all read from <see cref="GetDescriptorsAsync"/>.
+///
+/// Two HTTP-cheap operations gate everything:
+///   - <see cref="FoundryAgentsApi.ListAgentsAsync"/> for the project
+///   - One token acquisition via the supplied credential
+///
+/// Backward-compat: the historical <c>Foundry:ProjectEndpoint</c> setting is
+/// kept; the agent catalog is no longer configured statically.
 /// </summary>
 public class AgentService
 {
     private readonly ILogger<AgentService> _logger;
     private readonly TokenCredential _credential;
-    private readonly string _defaultEndpoint;
+    private readonly IHttpClientFactory _httpFactory;
+    private readonly string _projectEndpoint;
+    private readonly TimeSpan _cacheTtl;
 
     /// <summary>
-    /// One agent the bot can route to. Identity = per-agent endpoint URL.
+    /// One agent exposed to the bot. Identity = per-agent endpoint URL.
     /// </summary>
-    /// <param name="Key">Short key used by <c>/agents</c> picker submits.</param>
-    /// <param name="Name">Display name (also the Foundry agent name in the URL).</param>
-    /// <param name="Description">User-facing one-liner.</param>
-    /// <param name="Endpoint">Full per-agent endpoint URL (up to <c>/v1</c>).</param>
+    /// <param name="Key">Short key used by /agents picker submits (auto-derived from name).</param>
+    /// <param name="Name">Agent name as it lives in Foundry.</param>
+    /// <param name="Description">User-facing description (from Foundry metadata).</param>
+    /// <param name="Endpoint">Per-agent endpoint URL the bot drives.</param>
     public record AgentDescriptor(string Key, string Name, string Description, string Endpoint);
 
-    public List<AgentDescriptor> Descriptors { get; }
+    // Snapshot cache. Refreshed lazily when expired or on /agents refresh.
+    private IReadOnlyList<AgentDescriptor> _cached = Array.Empty<AgentDescriptor>();
+    private DateTime _cachedAtUtc = DateTime.MinValue;
+    private readonly SemaphoreSlim _refreshLock = new(1, 1);
+
     public TokenCredential Credential => _credential;
-    public string DefaultEndpoint => _defaultEndpoint;
+    public string ProjectEndpoint     => _projectEndpoint;
+    public string DefaultEndpoint     => _cached.FirstOrDefault()?.Endpoint
+                                        ?? FoundryAgentsApi.ComposeAgentEndpoint(_projectEndpoint, "default");
 
-    public AgentService(ILogger<AgentService> logger, IConfiguration config)
+    public AgentService(ILogger<AgentService> logger, IConfiguration config, IHttpClientFactory httpFactory)
     {
-        _logger = logger;
+        _logger      = logger;
+        _httpFactory = httpFactory;
 
-        var projectEndpoint = config["Foundry:ProjectEndpoint"]
+        var endpoint = config["Foundry:ProjectEndpoint"]
             ?? throw new InvalidOperationException("Foundry:ProjectEndpoint not configured");
+        _projectEndpoint = endpoint.TrimEnd('/');
+
+        var ttlSeconds = config.GetValue("Foundry:CatalogCacheSeconds", 300);
+        _cacheTtl = TimeSpan.FromSeconds(Math.Max(0, ttlSeconds));
 
         _credential = new Azure.Identity.DefaultAzureCredential(new Azure.Identity.DefaultAzureCredentialOptions
         {
             ManagedIdentityClientId = config["AZURE_CLIENT_ID"]
         });
-
-        // Build a per-agent endpoint URL of the form:
-        //   {project}/agents/{agentName}/endpoint/protocols/openai/v1
-        // Project endpoint examples:
-        //   https://aif-x.services.ai.azure.com/api/projects/proj-x
-        var projTrimmed = projectEndpoint.TrimEnd('/');
-        string AgentUrl(string agentName) =>
-            $"{projTrimmed}/agents/{agentName}/endpoint/protocols/openai/v1";
-
-        // Descriptors are static configuration; the agent objects themselves
-        // are provisioned in Foundry (via TF). We just list what we know about.
-        // The list can be overridden from config to support customer-specific
-        // catalogs — see <c>Foundry:Agents</c> section, defaults below.
-        Descriptors = new List<AgentDescriptor>();
-
-        var configured = config.GetSection("Foundry:Agents").GetChildren().ToList();
-        if (configured.Count > 0)
-        {
-            foreach (var c in configured)
-            {
-                var key  = c["Key"]  ?? throw new InvalidOperationException($"Foundry:Agents:{c.Key}:Key missing");
-                var name = c["Name"] ?? key;
-                var desc = c["Description"] ?? "";
-                var url  = c["Endpoint"] ?? AgentUrl(name);
-                Descriptors.Add(new AgentDescriptor(key, name, desc, url));
-            }
-        }
-        else
-        {
-            Descriptors.AddRange(new[]
-            {
-                new AgentDescriptor("docs",         "docs-assistant", "Searches Microsoft Learn docs (MCP) and answers with citations.", AgentUrl("docs-assistant")),
-                new AgentDescriptor("code",         "code-helper",    "Runs code with Code Interpreter and a local time/calc function tool.", AgentUrl("code-helper")),
-                new AgentDescriptor("orchestrator", "orchestrator",   "General-purpose assistant; recommend a specialist via /agents.",     AgentUrl("orchestrator"))
-            });
-        }
-
-        // The default endpoint the bot uses when no agent picker / URL routing
-        // is in play. First descriptor wins.
-        _defaultEndpoint = Descriptors[0].Endpoint;
     }
 
-    public AgentDescriptor GetByKey(string key)
-        => Descriptors.FirstOrDefault(d => string.Equals(d.Key, key, StringComparison.OrdinalIgnoreCase))
-           ?? Descriptors.First();
+    /// <summary>
+    /// Return the current agent catalog (cached snapshot). Refreshes if the
+    /// cache is stale; <paramref name="forceRefresh"/> bypasses the TTL.
+    /// </summary>
+    public async Task<IReadOnlyList<AgentDescriptor>> GetDescriptorsAsync(
+        bool forceRefresh = false, CancellationToken ct = default)
+    {
+        if (!forceRefresh
+            && _cached.Count > 0
+            && DateTime.UtcNow - _cachedAtUtc < _cacheTtl)
+        {
+            return _cached;
+        }
 
-    public AgentDescriptor? FindByEndpoint(string endpoint)
-        => Descriptors.FirstOrDefault(d => string.Equals(d.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase));
+        await _refreshLock.WaitAsync(ct);
+        try
+        {
+            if (!forceRefresh
+                && _cached.Count > 0
+                && DateTime.UtcNow - _cachedAtUtc < _cacheTtl)
+            {
+                return _cached;
+            }
 
-    public string? FindKeyForEndpoint(string? endpoint)
-        => string.IsNullOrEmpty(endpoint) ? null : FindByEndpoint(endpoint!)?.Key;
+            var http     = _httpFactory.CreateClient("foundry-agents");
+            var agents   = await FoundryAgentsApi.ListAgentsAsync(http, _projectEndpoint, _credential, ct);
+            var snapshot = agents
+                .Where(a => a.IsActive)
+                .Select(a => new AgentDescriptor(
+                    Key:         KeyFor(a.Name),
+                    Name:        a.Name,
+                    Description: string.IsNullOrWhiteSpace(a.Description)
+                                ? (a.Model is null ? "Foundry agent" : $"Foundry agent ({a.Model})")
+                                : a.Description,
+                    Endpoint:    FoundryAgentsApi.ComposeAgentEndpoint(_projectEndpoint, a.Name)))
+                .ToList();
+
+            _cached      = snapshot;
+            _cachedAtUtc = DateTime.UtcNow;
+            _logger.LogInformation("Refreshed agent catalog: {Count} agent(s) from {Endpoint}", snapshot.Count, _projectEndpoint);
+            return _cached;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to refresh agent catalog from {Endpoint}", _projectEndpoint);
+            // Fall back to whatever we had cached (possibly empty) rather than throw —
+            // a stale list is better than a broken /agents command.
+            return _cached;
+        }
+        finally
+        {
+            _refreshLock.Release();
+        }
+    }
+
+    public async Task<AgentDescriptor?> FindByKeyAsync(string key, CancellationToken ct = default)
+    {
+        var all = await GetDescriptorsAsync(ct: ct);
+        return all.FirstOrDefault(d => string.Equals(d.Key, key, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public async Task<AgentDescriptor?> FindByNameAsync(string name, CancellationToken ct = default)
+    {
+        var all = await GetDescriptorsAsync(ct: ct);
+        return all.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public async Task<AgentDescriptor> DefaultAsync(CancellationToken ct = default)
+    {
+        var all = await GetDescriptorsAsync(ct: ct);
+        return all.FirstOrDefault()
+            ?? throw new InvalidOperationException(
+                $"No active agents found in project {_projectEndpoint}. Create one in Foundry first.");
+    }
+
+    public async Task<string?> FindKeyForEndpointAsync(string? endpoint, CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(endpoint)) return null;
+        var all = await GetDescriptorsAsync(ct: ct);
+        return all.FirstOrDefault(d => string.Equals(d.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase))?.Key;
+    }
+
+    /// <summary>
+    /// Derive a stable, lowercase, URL-safe key from an agent name. The picker
+    /// uses this as the submit value; Cosmos stores it.
+    /// </summary>
+    private static string KeyFor(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "unknown";
+        var chars = name.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray();
+        var key = new string(chars).Trim('-');
+        while (key.Contains("--")) key = key.Replace("--", "-");
+        return string.IsNullOrEmpty(key) ? "unknown" : key;
+    }
 }

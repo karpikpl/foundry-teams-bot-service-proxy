@@ -56,8 +56,6 @@ app.MapControllers();
 app.MapHealthChecks("/health");
 
 var svc = app.Services.GetRequiredService<AgentService>();
-app.Logger.LogInformation("Configured {Count} agents: {Names}",
-    svc.Descriptors.Count,
-    string.Join(", ", svc.Descriptors.Select(d => $"{d.Key}→{d.Name}")));
+app.Logger.LogInformation("Configured Foundry project: {Endpoint}. Agent catalog will be discovered on first /agents request.", svc.ProjectEndpoint);
 
 app.Run();

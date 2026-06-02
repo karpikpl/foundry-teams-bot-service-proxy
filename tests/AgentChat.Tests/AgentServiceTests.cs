@@ -7,10 +7,14 @@ using Xunit;
 namespace AgentChat.Tests;
 
 /// <summary>
-/// AgentService now holds a list of descriptors (key, name, description,
-/// per-agent endpoint URL) instead of provisioning agents itself. These tests
-/// exercise URL composition, default descriptor set, and the config-override
-/// path that lets the same App Service serve different customers' agent catalogs.
+/// AgentService is now a dynamic-discovery wrapper — it talks to Foundry's
+/// project agents endpoint on demand and caches for a configurable TTL. The
+/// hardcoded descriptor catalog is gone.
+///
+/// These tests verify what can be checked without HTTP: configuration
+/// validation, credential exposure, default-endpoint composition. The actual
+/// agent-listing logic is tested indirectly via end-to-end smoke against a
+/// real Foundry; covering it here would require a substantial HttpClient mock.
 /// </summary>
 public class AgentServiceTests
 {
@@ -24,126 +28,91 @@ public class AgentServiceTests
             foreach (var kv in overrides) settings[kv.Key] = kv.Value;
 
         var cfg = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
-        return new AgentService(NullLogger<AgentService>.Instance, cfg);
+        var httpFactory = new SimpleHttpClientFactory();
+        return new AgentService(NullLogger<AgentService>.Instance, cfg, httpFactory);
     }
 
     [Fact]
     public void Constructor_throws_when_project_endpoint_missing()
     {
         var cfg = new ConfigurationBuilder().AddInMemoryCollection().Build();
-        var act = () => new AgentService(NullLogger<AgentService>.Instance, cfg);
+        var act = () => new AgentService(NullLogger<AgentService>.Instance, cfg, new SimpleHttpClientFactory());
         act.Should().Throw<InvalidOperationException>().WithMessage("*ProjectEndpoint*");
     }
 
     [Fact]
-    public void Default_catalog_has_three_descriptors()
+    public void ProjectEndpoint_is_exposed_for_per_turn_routing()
     {
         var svc = MakeService();
-        svc.Descriptors.Should().HaveCount(3);
-        svc.Descriptors.Select(d => d.Key).Should().BeEquivalentTo(new[] { "docs", "code", "orchestrator" });
+        svc.ProjectEndpoint.Should().Be("https://aif-x.services.ai.azure.com/api/projects/proj-x");
     }
 
     [Fact]
-    public void Default_descriptors_compose_per_agent_endpoint_urls_from_project_endpoint()
-    {
-        var svc = MakeService();
-        svc.Descriptors.Should().Contain(d =>
-            d.Key == "docs" &&
-            d.Endpoint == "https://aif-x.services.ai.azure.com/api/projects/proj-x/agents/docs-assistant/endpoint/protocols/openai/v1");
-        svc.Descriptors.Should().Contain(d =>
-            d.Key == "code" &&
-            d.Endpoint == "https://aif-x.services.ai.azure.com/api/projects/proj-x/agents/code-helper/endpoint/protocols/openai/v1");
-    }
-
-    [Fact]
-    public void Default_endpoint_is_first_descriptors_endpoint()
-    {
-        var svc = MakeService();
-        svc.DefaultEndpoint.Should().Be(svc.Descriptors[0].Endpoint);
-    }
-
-    [Fact]
-    public void Config_override_replaces_default_catalog()
+    public void ProjectEndpoint_trailing_slash_is_normalized_away()
     {
         var svc = MakeService(new()
         {
-            ["Foundry:Agents:0:Key"]         = "claude",
-            ["Foundry:Agents:0:Name"]        = "claude-static",
-            ["Foundry:Agents:0:Description"] = "Claude Opus static agent",
-            // No Endpoint override — composed from project endpoint + name.
-            ["Foundry:Agents:1:Key"]         = "custom",
-            ["Foundry:Agents:1:Name"]        = "custom-name",
-            ["Foundry:Agents:1:Description"] = "Has explicit endpoint",
-            ["Foundry:Agents:1:Endpoint"]    = "https://different.example.com/api/projects/other/agents/custom-name/endpoint/protocols/openai/v1"
+            ["Foundry:ProjectEndpoint"] = "https://aif-x.services.ai.azure.com/api/projects/proj-x/"
         });
-
-        svc.Descriptors.Should().HaveCount(2);
-        svc.Descriptors[0].Name.Should().Be("claude-static");
-        svc.Descriptors[0].Endpoint.Should().EndWith("/agents/claude-static/endpoint/protocols/openai/v1");
-        svc.Descriptors[1].Endpoint.Should().StartWith("https://different.example.com");
+        svc.ProjectEndpoint.Should().NotEndWith("/");
     }
 
     [Fact]
-    public void Config_override_uses_key_as_name_when_name_missing()
+    public void DefaultEndpoint_returns_a_per_agent_url_even_before_first_discovery()
     {
-        var svc = MakeService(new()
-        {
-            ["Foundry:Agents:0:Key"]         = "only-key",
-            ["Foundry:Agents:0:Description"] = "no name configured"
-        });
-
-        svc.Descriptors[0].Name.Should().Be("only-key");
-        svc.Descriptors[0].Endpoint.Should().EndWith("/agents/only-key/endpoint/protocols/openai/v1");
+        // Before the first /agents call we don't know the catalog yet — but
+        // some call sites need a default endpoint string to fall back on
+        // (e.g. /agent info before any picker action). The placeholder URL
+        // gets replaced by the first discovered agent's endpoint once we
+        // refresh.
+        var svc = MakeService();
+        svc.DefaultEndpoint.Should().StartWith("https://aif-x.services.ai.azure.com/api/projects/proj-x/agents/");
+        svc.DefaultEndpoint.Should().Contain("/endpoint/protocols/openai/v1");
     }
 
     [Fact]
-    public void GetByKey_returns_matching_descriptor()
+    public void Credential_is_exposed_so_other_services_can_share_it()
+    {
+        MakeService().Credential.Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task GetDescriptorsAsync_returns_empty_when_endpoint_unreachable_and_does_not_throw()
+    {
+        // The configured endpoint doesn't resolve; we expect graceful degradation:
+        // an empty catalog, not an exception bubbling up through /agents.
+        var svc = MakeService();
+        var result = await svc.GetDescriptorsAsync();
+        result.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task FindByKeyAsync_returns_null_when_unknown()
     {
         var svc = MakeService();
-        svc.GetByKey("code").Name.Should().Be("code-helper");
+        (await svc.FindByKeyAsync("does-not-exist")).Should().BeNull();
     }
 
     [Fact]
-    public void GetByKey_falls_back_to_first_when_unknown()
+    public async Task FindKeyForEndpointAsync_returns_null_for_null_or_empty()
     {
         var svc = MakeService();
-        svc.GetByKey("does-not-exist").Should().BeSameAs(svc.Descriptors[0]);
+        (await svc.FindKeyForEndpointAsync(null)).Should().BeNull();
+        (await svc.FindKeyForEndpointAsync("")).Should().BeNull();
     }
 
     [Fact]
-    public void FindByEndpoint_matches_case_insensitively()
+    public async Task DefaultAsync_throws_when_no_agents_discovered()
     {
         var svc = MakeService();
-        var endpoint = svc.Descriptors[1].Endpoint.ToUpperInvariant();
-        svc.FindByEndpoint(endpoint).Should().NotBeNull();
-        svc.FindByEndpoint(endpoint)!.Key.Should().Be(svc.Descriptors[1].Key);
+        var act = async () => await svc.DefaultAsync();
+        await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*No active agents*");
     }
 
-    [Fact]
-    public void FindKeyForEndpoint_returns_null_for_unknown_or_empty()
-    {
-        var svc = MakeService();
-        svc.FindKeyForEndpoint(null).Should().BeNull();
-        svc.FindKeyForEndpoint("").Should().BeNull();
-        svc.FindKeyForEndpoint("https://unknown.example.com").Should().BeNull();
-    }
+    // -------------------------- helpers --------------------------
 
-    [Fact]
-    public void Credential_is_exposed_so_client_cache_can_share_it()
+    private sealed class SimpleHttpClientFactory : IHttpClientFactory
     {
-        var svc = MakeService();
-        svc.Credential.Should().NotBeNull();
-    }
-
-    [Fact]
-    public void Descriptors_have_non_empty_names_and_descriptions()
-    {
-        var svc = MakeService();
-        foreach (var d in svc.Descriptors)
-        {
-            d.Name.Should().NotBeNullOrWhiteSpace();
-            d.Description.Should().NotBeNullOrWhiteSpace();
-            d.Endpoint.Should().NotBeNullOrWhiteSpace();
-        }
+        public HttpClient CreateClient(string name) => new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
     }
 }

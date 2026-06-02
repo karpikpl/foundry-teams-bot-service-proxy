@@ -125,11 +125,21 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             case "/agents":
+            {
+                var forceRefresh = parts.Length > 1 && parts[1].Trim().Equals("refresh", StringComparison.OrdinalIgnoreCase);
+                var catalog      = await _agents.GetDescriptorsAsync(forceRefresh: forceRefresh, ct: ct);
+                if (catalog.Count == 0)
+                {
+                    await turnContext.SendActivityAsync(MessageFactory.Text(
+                        "No agents are available in the configured Foundry project. Create one in Foundry first, then `/agents refresh`."), ct);
+                    break;
+                }
+                var currentKey = await _agents.FindKeyForEndpointAsync(state.AgentEndpoint, ct);
                 await turnContext.SendActivityAsync(
-                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildAgentPickerCard(
-                        _agents.Descriptors, _agents.FindKeyForEndpoint(state.AgentEndpoint))),
+                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildAgentPickerCard(catalog, currentKey)),
                     ct);
                 break;
+            }
 
             case "/stop":
                 await CancelCurrentRunAsync(turnContext, state, ct);
@@ -270,10 +280,11 @@ public class FoundryBot : TeamsActivityHandler
             ct);
     }
 
-    private Task HandleAgentInfoCommandAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
+    private async Task HandleAgentInfoCommandAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
     {
         var endpoint = state.AgentEndpoint ?? _agents.DefaultEndpoint;
-        var desc     = _agents.FindByEndpoint(endpoint);
+        var catalog  = await _agents.GetDescriptorsAsync(ct: ct);
+        var desc     = catalog.FirstOrDefault(d => string.Equals(d.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase));
         var facts = new List<(string, string)>
         {
             ("--- Agent", ""),
@@ -289,7 +300,7 @@ public class FoundryBot : TeamsActivityHandler
             ("Conversation ID", state.ConversationId ?? "(not yet created)"),
             ("Teams convo ID",  turnContext.Activity.Conversation.Id)
         });
-        return turnContext.SendActivityAsync(
+        await turnContext.SendActivityAsync(
             MessageFactory.Attachment(AdaptiveCardBuilder.BuildInfoCard("Agent info", "🤖", facts)), ct);
     }
 
@@ -361,7 +372,13 @@ public class FoundryBot : TeamsActivityHandler
             await turnContext.SendActivityAsync(MessageFactory.Text("Pick an agent first."), ct);
             return;
         }
-        var agent = _agents.GetByKey(key!);
+        var agent = await _agents.FindByKeyAsync(key!, ct);
+        if (agent is null)
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                $"Agent `{key}` is no longer available. Type `/agents` to see the current list."), ct);
+            return;
+        }
         if (!string.Equals(state.AgentEndpoint, agent.Endpoint, StringComparison.OrdinalIgnoreCase))
         {
             if (!string.IsNullOrEmpty(state.ConversationId) && !string.IsNullOrEmpty(state.AgentEndpoint))

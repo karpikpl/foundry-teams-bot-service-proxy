@@ -32,7 +32,7 @@ public static class ManifestBuilder
         ("/help",    "List commands")
     };
 
-    public static JObject Build(string agentName, string agentDescription, string botId, Guid? manifestId = null)
+    public static JObject Build(string agentName, string agentDescription, string botId, string? botEndpointPath = null, Guid? manifestId = null)
     {
         if (string.IsNullOrWhiteSpace(agentName))
             throw new ArgumentException("agentName is required", nameof(agentName));
@@ -58,6 +58,38 @@ public static class ManifestBuilder
         if (nameFull.Length > MaxFullNameChars)
             nameFull = nameFull.Substring(0, MaxFullNameChars);
 
+        var botBlock = new JObject
+        {
+            ["botId"]              = botId,
+            ["scopes"]             = new JArray("personal", "team", "groupChat"),
+            ["supportsFiles"]      = false,
+            ["isNotificationOnly"] = false,
+            ["commandLists"] = new JArray
+            {
+                new JObject
+                {
+                    ["scopes"]   = new JArray("personal", "team", "groupChat"),
+                    ["commands"] = new JArray(DefaultCommands.Select(c => new JObject
+                    {
+                        ["title"]       = c.title,
+                        ["description"] = c.description
+                    }))
+                }
+            }
+        };
+
+        // Embed the URL-routed messaging endpoint into the bot metadata when
+        // it isn't the default /api/messages. Bot Service registrations created
+        // for this manifest must use the same path so traffic lands on the right
+        // per-agent route in the proxy.
+        // Note: this is informational only — the actual messaging URL is configured
+        // on the Bot Service resource, not in the Teams manifest. We add it as a
+        // custom property under the bot for human reference.
+        if (!string.IsNullOrEmpty(botEndpointPath) && botEndpointPath != "/api/messages")
+        {
+            botBlock["x-foundryBotEndpointPath"] = botEndpointPath;
+        }
+
         return new JObject
         {
             ["$schema"]         = SchemaUrl,
@@ -75,28 +107,7 @@ public static class ManifestBuilder
             ["name"]        = new JObject { ["short"] = nameShort, ["full"] = nameFull },
             ["description"] = new JObject { ["short"] = shortDesc, ["full"] = fullDesc },
             ["accentColor"] = "#5B67D1",
-            ["bots"] = new JArray
-            {
-                new JObject
-                {
-                    ["botId"]              = botId,
-                    ["scopes"]             = new JArray("personal", "team", "groupChat"),
-                    ["supportsFiles"]      = false,
-                    ["isNotificationOnly"] = false,
-                    ["commandLists"] = new JArray
-                    {
-                        new JObject
-                        {
-                            ["scopes"]   = new JArray("personal", "team", "groupChat"),
-                            ["commands"] = new JArray(DefaultCommands.Select(c => new JObject
-                            {
-                                ["title"]       = c.title,
-                                ["description"] = c.description
-                            }))
-                        }
-                    }
-                }
-            },
+            ["bots"]        = new JArray { botBlock },
             ["validDomains"] = new JArray()
         };
     }

@@ -31,6 +31,11 @@
   .consent-card .consent-link-button{display:inline-block;background:#0969da;color:#fff;text-decoration:none;font-weight:600;border-radius:6px;padding:8px 12px;margin:2px 0 6px}
   .consent-card .consent-link-button:hover{background:#0550ae;color:#fff}
   .consent-card .consent-help{color:#57606a;margin-top:2px}
+  .approval-card{background:#fff8c5;border:1px solid #eac54f;border-radius:8px;padding:12px 14px;margin:8px 0;font-size:13px;line-height:1.6}
+  .approval-card pre{margin:6px 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;word-wrap:break-word;background:rgba(0,0,0,.05);padding:6px 8px;border-radius:4px;max-height:160px;overflow:auto}
+  .approval-card button{border:0;border-radius:6px;padding:8px 12px;margin-right:8px;font-weight:600;cursor:pointer}
+  .approval-card .approve{background:#1a7f37;color:#fff}
+  .approval-card .deny{background:#cf222e;color:#fff}
   .err{color:#cf222e;font-size:13px;background:#ffebe9;border:1px solid #ff8182;border-radius:6px;padding:8px 12px;margin:8px 0}
   .usage{font-size:11px;color:#8b949e;text-align:center;margin:8px 0}
   .composer{display:flex;gap:8px;padding:12px 20px;border-top:1px solid #d0d7de;background:#fff;flex-shrink:0}
@@ -111,6 +116,7 @@
   // wants to keep talking — switching agents always resets to keep semantics
   // matched with how Foundry conversations are bound to one agent.
   let convState = { agentKey: null, conversationId: null };
+  let pendingApproval = null;
 
   picker.addEventListener('change', () => resetConversation());
   resetBtn.addEventListener('click', () => resetConversation());
@@ -123,6 +129,7 @@
       }).catch(() => {});
     }
     convState = { agentKey: null, conversationId: null };
+    pendingApproval = null;
     messages.innerHTML = '<div class="empty">Pick an agent and send a message to start.</div>';
     convDiv.textContent = '(no conversation yet)';
   }
@@ -144,6 +151,10 @@
     e.preventDefault();
     const text = input.value.trim();
     if (!text) return;
+    if (pendingApproval) {
+      appendError('MCP approval pending — please Approve or Deny first.');
+      return;
+    }
     const agentKey = picker.value;
     sendBtn.disabled = true;
     input.value = '';
@@ -239,6 +250,25 @@
         scrollToBottom();
         break;
       }
+      case 'approval': {
+        const a = JSON.parse(data);
+        pendingApproval = a;
+        const card = document.createElement('div');
+        card.className = 'approval-card';
+        card.innerHTML =
+          `<div>🔐 <strong>Approve MCP tool call?</strong></div>` +
+          `<div>Server: <code>${escapeHtml(a.server_label || '')}</code></div>` +
+          `<div>Tool: <code>${escapeHtml(a.tool_name || '')}</code></div>` +
+          `<pre>${escapeHtml(a.arguments_summary || '{}')}</pre>` +
+          `<button class="approve" type="button">Approve</button>` +
+          `<button class="deny" type="button">Deny</button>`;
+        card.querySelector('.approve').addEventListener('click', () => sendApproval(true, card));
+        card.querySelector('.deny').addEventListener('click', () => sendApproval(false, card));
+        messages.insertBefore(card, agentBubble.parentElement);
+        removeEmptyAgentBubble(agentBubble);
+        scrollToBottom();
+        break;
+      }
       case 'done': {
         const d = JSON.parse(data);
         const usage = document.createElement('div');
@@ -255,11 +285,64 @@
     }
   }
 
+  async function sendApproval(approve, card) {
+    if (!pendingApproval) return;
+    sendBtn.disabled = true;
+    card.querySelectorAll('button').forEach(b => b.disabled = true);
+    const agentBubble = appendAgentPlaceholder();
+    try {
+      const requestId = pendingApproval.approval_request_id;
+      const r = await fetch('/admin/chat/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          agentKey: convState.agentKey,
+          conversationId: convState.conversationId,
+          approval: { requestId, approve },
+          ...scopePayload
+        })
+      });
+      pendingApproval = null;
+      if (!r.ok || !r.body) {
+        agentBubble.classList.add('err');
+        agentBubble.textContent = `HTTP ${r.status}: ${await r.text()}`;
+        return;
+      }
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let sep;
+        while ((sep = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, sep);
+          buf = buf.slice(sep + 2);
+          handleSseBlock(block, agentBubble);
+        }
+      }
+    } catch (e) {
+      agentBubble.classList.add('err');
+      agentBubble.textContent = e.message;
+    } finally {
+      sendBtn.disabled = false;
+      input.focus();
+    }
+  }
+
   function appendUser(text) {
     const m = document.createElement('div');
     m.className = 'msg user';
     m.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
     messages.appendChild(m);
+    scrollToBottom();
+  }
+  function appendError(text) {
+    const e = document.createElement('div');
+    e.className = 'err';
+    e.textContent = text;
+    messages.appendChild(e);
     scrollToBottom();
   }
   function appendAgentPlaceholder() {

@@ -52,17 +52,12 @@ public static class AdaptiveCardBuilder
                 new AdaptiveSubmitAction
                 {
                     Title = "✅ Approve", Style = "positive",
-                    Data  = JObject.FromObject(new { action = "approve", approvalRequestId, conversationId, toolName, serverLabel })
-                },
-                new AdaptiveSubmitAction
-                {
-                    Title = "🔁 Always approve",
-                    Data  = JObject.FromObject(new { action = "approve_always", approvalRequestId, conversationId, toolName, serverLabel })
+                    Data  = JObject.FromObject(new { action = "mcp_approval", approve = true, approval_request_id = approvalRequestId, conversationId })
                 },
                 new AdaptiveSubmitAction
                 {
                     Title = "❌ Deny", Style = "destructive",
-                    Data  = JObject.FromObject(new { action = "deny", approvalRequestId, conversationId, toolName, serverLabel })
+                    Data  = JObject.FromObject(new { action = "mcp_approval", approve = false, approval_request_id = approvalRequestId, conversationId })
                 }
             }
         };

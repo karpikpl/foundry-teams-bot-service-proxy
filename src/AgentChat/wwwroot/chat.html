@@ -202,9 +202,14 @@
         const c = JSON.parse(data);
         const card = document.createElement('div');
         card.className = 'consent-card';
+        const link = String(c.consentLink || '');
+        const isHttps = link.startsWith('https://');
+        if (!isHttps) console.warn('Invalid consent link received; not rendering clickable button.', link);
         card.innerHTML =
           `<div class="consent-title">🔑 <strong>Sign-in required</strong> for MCP server <code>${escapeHtml(c.serverLabel)}</code>.</div>` +
-          `<a class="consent-link-button" href="${escapeAttr(c.consentLink)}" target="_blank" rel="noopener">🔗 Open consent link</a>` +
+          (isHttps
+            ? `<a class="consent-link-button" href="${escapeAttr(link)}" target="_blank" rel="noopener">🔗 Open consent link</a>`
+            : `<div class="err">Consent link was missing or invalid.</div>`) +
           `<div class="consent-help">Then send your message again.</div>`;
         messages.insertBefore(card, agentBubble.parentElement);
         removeEmptyAgentBubble(agentBubble);

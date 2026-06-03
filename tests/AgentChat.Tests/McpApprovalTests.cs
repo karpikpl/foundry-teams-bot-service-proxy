@@ -87,6 +87,11 @@ public class McpApprovalTests
         json.Should().Contain("\"approval_request_id\":\"mcpr_1\"");
         json.Should().Contain("\"approve\":false");
         json.Should().NotContain("message");
+        // Foundry rejects payloads carrying both previous_response_id and
+        // conversation ("Cannot provide both 'previous_response_id' and
+        // 'conversation' in the same request"). The conversation binding is
+        // implicit via the previous response id.
+        json.Should().NotContain("\"conversation\"");
     }
 
     [Fact]

@@ -432,9 +432,12 @@ public class FoundryBot : TeamsActivityHandler
         {
             try
             {
+                // Foundry rejects requests that set both PreviousResponseId
+                // and ConversationOptions ("Cannot provide both
+                // 'previous_response_id' and 'conversation'"). The previous
+                // response id implicitly carries the bound conversation.
                 var resumeOpts = new CreateResponseOptions
                 {
-                    ConversationOptions = new ResponseConversationOptions(state.ConversationId!),
                     PreviousResponseId  = state.PendingConsentResponseId!,
                     StreamingEnabled    = true,
                 };

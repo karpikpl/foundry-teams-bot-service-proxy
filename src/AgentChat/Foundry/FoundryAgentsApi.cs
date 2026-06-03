@@ -93,6 +93,19 @@ public static class FoundryAgentsApi
     }
 
     /// <summary>
+    /// Compose a Foundry project endpoint from route values.
+    /// </summary>
+    public static string ComposeProjectEndpoint(string foundryHost, string project)
+    {
+        if (foundryHost.StartsWith("https%3A", StringComparison.OrdinalIgnoreCase))
+        {
+            return Uri.UnescapeDataString(foundryHost).TrimEnd('/');
+        }
+
+        return $"https://{foundryHost}.services.ai.azure.com/api/projects/{project}";
+    }
+
+    /// <summary>
     /// Compose the per-agent endpoint URL the rest of the bot drives.
     /// </summary>
     public static string ComposeAgentEndpoint(string projectEndpoint, string agentName)

@@ -18,7 +18,7 @@ This is a **sample** that solves the practical problem of exposing Foundry agent
 - **Function tools** dispatched in-process (no external sidecar)
 - **Per-agent URL routing** — one App Service can serve many agents across many Foundry projects
 - **Server-side conversations** so Foundry's portal shows tracing tied to your real conversation IDs
-- **Teams-app manifest generation** — `/admin/manifest` downloads a sideloadable `.zip` per agent
+- **Teams-app manifest generation** — `/admin/manifest` asks for a Bot Service app ID and downloads a sideloadable `.zip` per agent
 - **Cosmos-backed per-conversation state** with no key access (AAD only)
 - **Docker image** published to GHCR (multi-arch, signed)
 - **150+ tests** covering cards, state, JWT validation, URL safety, tool dispatch
@@ -90,9 +90,10 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 
 ### Sideload to Teams
 
-1. Visit `https://{app}.azurewebsites.net/admin/manifest` — pick an agent, download the `.zip`
-2. In Teams: **Apps → Manage your apps → Upload an app → Upload a custom app** → pick the zip
-3. Open a 1:1 chat with the bot. Type `/help`.
+1. Visit `https://{app}.azurewebsites.net/admin` for browser chat or manifest generation. The popup can use the configured default Foundry project or another host/project.
+2. For manifests, pick an agent and paste the Azure Bot Service **Microsoft App ID** (Application/client ID). The app generates the `.zip` directly; no bot registration store is used.
+3. In Teams: **Apps → Manage your apps → Upload an app → Upload a custom app** → pick the zip.
+4. Open a 1:1 chat with the bot. Type `/help`.
 
 ## Configuration
 
@@ -112,6 +113,8 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 | `BOTSERVICE_UAMI_CLIENTID` | ✅ | UMI client id the JWT middleware validates `aud` against |
 | `AZURE_CLIENT_ID` | optional | If set, `ManagedIdentityCredential` targets this specific UAMI |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | optional | App Insights wiring |
+
+Cosmos is only used for per-conversation bot state. Manifest generation no longer stores bot ↔ agent registrations; operators paste the Bot Service app ID into the inline manifest form.
 
 ### Default agent catalog vs. custom
 

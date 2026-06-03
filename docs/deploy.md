@@ -99,7 +99,9 @@ For routed conversations, the bot derives the project from the incoming agent en
 
 ## Teams app manifest
 
-Generate via `/admin/manifest` — the page lists configured agents and lets you download a sideloadable `.zip` per agent. You can also POST to `/admin/manifest/{agentName}` for an automated flow.
+Generate via `/admin` → **Generate Teams Manifest** (or go directly to `/admin/manifest` for the configured default project). Pick an agent, paste that agent's Azure Bot Service **Microsoft App ID** from the Bot Service **Configuration** blade, and submit the form to download a sideloadable `.zip`. For another Foundry project, use the landing-page popup or `/admin/{foundryHost}/{project}/manifest`.
+
+The app no longer persists bot ↔ agent registrations; the Bot ID is validated as a GUID and used only for the manifest download request.
 
 To sideload manually:
 

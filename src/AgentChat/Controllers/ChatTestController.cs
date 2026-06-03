@@ -1,6 +1,7 @@
 using System.ClientModel;
 using System.Text;
 using System.Text.Json;
+using AgentChat.Bots;
 using AgentChat.Foundry;
 using AgentChat.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -201,6 +202,13 @@ public class ChatTestController : ControllerBase
                     case StreamingResponseErrorUpdate err:
                         await WriteSseAsync("error", $"{err.Code ?? "error"}: {err.Message ?? "unknown"}", ct);
                         return;
+
+                    default:
+                        if (TryParseConsentEvent(update, out var serverLabel, out var link))
+                        {
+                            await WriteSseAsync("consent", JsonSerializer.Serialize(new { serverLabel, consentLink = link }), ct);
+                        }
+                        break;
                 }
             }
         }
@@ -245,7 +253,7 @@ public class ChatTestController : ControllerBase
         }
     }
 
-    private static bool TryParseConsent(ResponseItem item, out string serverLabel, out string consentLink)
+    private bool TryParseConsent(ResponseItem item, out string serverLabel, out string consentLink)
     {
         serverLabel = ""; consentLink = "";
         try
@@ -255,9 +263,44 @@ public class ChatTestController : ControllerBase
             var root = doc.RootElement;
             if (!string.Equals(root.GetProperty("type").GetString(), "oauth_consent_request", StringComparison.OrdinalIgnoreCase))
                 return false;
-            consentLink = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() ?? "" : "";
+
+            var rawLink = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
+            var cleanUrl = ConsentLinkParser.ExtractConsentUrl(rawLink);
+            if (string.IsNullOrEmpty(cleanUrl))
+            {
+                _logger.LogWarning("Skipping OAuth consent request {ItemId}: no URL found in consent_link", root.TryGetProperty("id", out var id) ? id.GetString() : null);
+                return false;
+            }
+
+            consentLink = cleanUrl;
             serverLabel = root.TryGetProperty("server_label", out var sl) ? sl.GetString() ?? "" : "";
-            return !string.IsNullOrEmpty(consentLink);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private bool TryParseConsentEvent(StreamingResponseUpdate update, out string serverLabel, out string consentLink)
+    {
+        serverLabel = ""; consentLink = "";
+        try
+        {
+            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(update);
+            using var doc = JsonDocument.Parse(bd);
+            var root = doc.RootElement;
+            if (!string.Equals(root.GetProperty("type").GetString(), "response.oauth_consent_requested", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var rawLink = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
+            var cleanUrl = ConsentLinkParser.ExtractConsentUrl(rawLink);
+            if (string.IsNullOrEmpty(cleanUrl))
+            {
+                _logger.LogWarning("Skipping OAuth consent event {ItemId}: no URL found in consent_link", root.TryGetProperty("item_id", out var id) ? id.GetString() : null);
+                return false;
+            }
+
+            consentLink = cleanUrl;
+            serverLabel = root.TryGetProperty("server_label", out var sl) ? sl.GetString() ?? "" : "";
+            return true;
         }
         catch { return false; }
     }

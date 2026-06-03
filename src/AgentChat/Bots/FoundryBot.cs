@@ -985,7 +985,7 @@ public class FoundryBot : TeamsActivityHandler
     /// Foundry-specific <c>oauth_consent_request</c> shape. Returns true and
     /// fills <paramref name="consent"/> on match.
     /// </summary>
-    private static bool TryExtractConsentRequest(ResponseItem item, out PendingConsent consent)
+    private bool TryExtractConsentRequest(ResponseItem item, out PendingConsent consent)
     {
         consent = null!;
         try
@@ -998,12 +998,17 @@ public class FoundryBot : TeamsActivityHandler
                 return false;
 
             var link = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
-            if (string.IsNullOrEmpty(link)) return false;
+            var cleanUrl = ConsentLinkParser.ExtractConsentUrl(link);
+            if (string.IsNullOrEmpty(cleanUrl))
+            {
+                _logger.LogWarning("Skipping OAuth consent request {ItemId}: no URL found in consent_link", root.TryGetProperty("id", out var missingId) ? missingId.GetString() : null);
+                return false;
+            }
 
             var id    = root.TryGetProperty("id",           out var i)  ? i.GetString()  : null;
             var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
 
-            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", link!);
+            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", cleanUrl);
             return true;
         }
         catch
@@ -1019,7 +1024,7 @@ public class FoundryBot : TeamsActivityHandler
     /// it's distinct from the item-level <c>oauth_consent_request</c> shape
     /// that may appear inside <c>response.output_item.done</c>.
     /// </summary>
-    private static bool TryExtractConsentEvent(StreamingResponseUpdate update, out PendingConsent consent)
+    private bool TryExtractConsentEvent(StreamingResponseUpdate update, out PendingConsent consent)
     {
         consent = null!;
         try
@@ -1032,12 +1037,17 @@ public class FoundryBot : TeamsActivityHandler
                 return false;
 
             var link = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
-            if (string.IsNullOrEmpty(link)) return false;
+            var cleanUrl = ConsentLinkParser.ExtractConsentUrl(link);
+            if (string.IsNullOrEmpty(cleanUrl))
+            {
+                _logger.LogWarning("Skipping OAuth consent event {ItemId}: no URL found in consent_link", root.TryGetProperty("item_id", out var missingId) ? missingId.GetString() : null);
+                return false;
+            }
 
             var id    = root.TryGetProperty("item_id",      out var i)  ? i.GetString()  : null;
             var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
 
-            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", link!);
+            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", cleanUrl);
             return true;
         }
         catch

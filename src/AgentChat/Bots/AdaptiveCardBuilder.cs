@@ -205,20 +205,15 @@ public static class AdaptiveCardBuilder
     public static Attachment BuildConsentCard(
         string serverLabel, string consentLink, string conversationId)
     {
-        // Foundry's consent_link is typically very long (~1000 chars of base64
-        // query data). Pull the URL out and render as a short markdown link.
-        // If we can't find a URL in there, fall back to showing the raw value
-        // so the user at least sees what Foundry sent.
-        var cleanUrl = ExtractFirstUrl(consentLink);
-        var linkBlock = cleanUrl is not null
+        var linkBlock = !string.IsNullOrWhiteSpace(consentLink)
             ? new AdaptiveTextBlock
             {
-                Text = $"[🔗 Open consent link]({cleanUrl})",
+                Text = $"[🔗 Open consent link]({consentLink})",
                 Wrap = true
             }
             : new AdaptiveTextBlock
             {
-                Text = string.IsNullOrEmpty(consentLink) ? "(no consent link returned)" : consentLink,
+                Text = "(no consent link returned)",
                 Wrap = true,
                 Size = AdaptiveTextSize.Small
             };
@@ -254,14 +249,6 @@ public static class AdaptiveCardBuilder
             }
         };
         return AsAttachment(card);
-    }
-
-    private static string? ExtractFirstUrl(string? raw)
-    {
-        if (string.IsNullOrEmpty(raw)) return null;
-        var m = System.Text.RegularExpressions.Regex.Match(
-            raw, @"https?://\S+", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-        return m.Success ? m.Value : null;
     }
 
     // -------------------------------------------------------------------- cancel

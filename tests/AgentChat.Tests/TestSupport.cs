@@ -1,6 +1,10 @@
+using System.Net;
+using System.Text;
 using Azure.Core;
+using System.ClientModel.Primitives;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using AgentChat.Foundry;
 using AgentChat.Services;
 
 namespace AgentChat.Tests;
@@ -47,6 +51,53 @@ internal static class TestServices
         return dir is null
             ? Path.GetFullPath("src/AgentChat/wwwroot")
             : Path.Combine(dir.FullName, "src", "AgentChat", "wwwroot");
+    }
+}
+
+internal sealed class RecordingFoundryHandler : HttpMessageHandler
+{
+    private readonly Queue<Func<HttpRequestMessage, HttpResponseMessage>> _responders = new();
+    public List<(string Method, string Url, string Body)> Requests { get; } = new();
+
+    public void EnqueueJson(HttpStatusCode status, string json)
+        => _responders.Enqueue(_ => new HttpResponseMessage(status)
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json")
+        });
+
+    public void EnqueueSse(params string[] eventJsonPayloads)
+        => _responders.Enqueue(_ =>
+        {
+            var sb = new StringBuilder();
+            foreach (var payload in eventJsonPayloads)
+            {
+                sb.Append("data: ").Append(payload).Append("\n\n");
+            }
+            sb.Append("data: [DONE]\n\n");
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(sb.ToString(), Encoding.UTF8, "text/event-stream")
+            };
+        });
+
+    public AgentClientCache ToClientCache(AgentService agents)
+        => new(agents, endpoint => new FoundryClient(
+            endpoint,
+            agents.Credential,
+            transport: new HttpClientPipelineTransport(new HttpClient(this, disposeHandler: false))));
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
+        Requests.Add((request.Method.Method, request.RequestUri!.ToString(), body));
+        if (_responders.Count == 0)
+        {
+            return new HttpResponseMessage(HttpStatusCode.NotFound)
+            {
+                Content = new StringContent($"No fake Foundry response queued for {request.Method} {request.RequestUri}")
+            };
+        }
+        return _responders.Dequeue()(request);
     }
 }
 

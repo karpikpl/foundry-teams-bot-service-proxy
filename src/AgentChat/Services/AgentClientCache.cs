@@ -11,11 +11,13 @@ namespace AgentChat.Services;
 public class AgentClientCache
 {
     private readonly AgentService _agents;
+    private readonly Func<string, FoundryClient>? _clientFactory;
     private readonly ConcurrentDictionary<string, FoundryClient> _clients = new(StringComparer.OrdinalIgnoreCase);
 
-    public AgentClientCache(AgentService agents)
+    public AgentClientCache(AgentService agents, Func<string, FoundryClient>? clientFactory = null)
     {
         _agents = agents;
+        _clientFactory = clientFactory;
     }
 
     public FoundryClient For(string endpoint)
@@ -23,7 +25,7 @@ public class AgentClientCache
         if (string.IsNullOrEmpty(endpoint))
             throw new ArgumentException("endpoint is required", nameof(endpoint));
 
-        return _clients.GetOrAdd(endpoint, ep => new FoundryClient(ep, _agents.Credential));
+        return _clients.GetOrAdd(endpoint, ep => _clientFactory?.Invoke(ep) ?? new FoundryClient(ep, _agents.Credential));
     }
 
     public FoundryClient Default => For(_agents.DefaultEndpoint);

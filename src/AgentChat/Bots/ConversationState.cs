@@ -24,7 +24,11 @@ public class ConversationState : IStoreItem
     /// </summary>
     public string? AgentEndpoint { get; set; }
 
-    /// <summary>Response id currently executing — used for cancellation marker.</summary>
+    /// <summary>
+    /// Latest Foundry response id in this conversation. Subsequent turns chain
+    /// with previous_response_id so approval responses, tool results, and user
+    /// messages remain in the same Responses chain.
+    /// </summary>
     public string? CurrentResponseId { get; set; }
 
     /// <summary>Response id used for resuming after OAuth consent. Set when a

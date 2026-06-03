@@ -183,7 +183,41 @@ public class AdaptiveCardBuilderTests
         actions[0]!["style"]?.ToString().Should().Be("destructive");
     }
 
-    // ============================================================ Connected agent
+    // ============================================================ Consent
+
+    [Fact]
+    public void ConsentCard_uses_warning_style_and_renders_server_label()
+    {
+        var att = AdaptiveCardBuilder.BuildConsentCard("microsoft_learn", "https://consent.example/x", "conv_1");
+        StylesIn((JToken)att.Content).Should().Contain("warning");
+        AllText(att).Should().Contain(t => t.Contains("microsoft_learn"));
+    }
+
+    [Fact]
+    public void ConsentCard_has_open_url_action_with_the_consent_link()
+    {
+        var att = AdaptiveCardBuilder.BuildConsentCard("srv", "https://consent.example/login?data=abc", "conv_1");
+        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var openUrl = actions.OfType<JObject>().First(a => a["type"]!.ToString() == "Action.OpenUrl");
+        openUrl["url"]!.ToString().Should().Be("https://consent.example/login?data=abc");
+    }
+
+    [Fact]
+    public void ConsentCard_has_continue_and_cancel_submit_actions()
+    {
+        var att = AdaptiveCardBuilder.BuildConsentCard("srv", "https://consent.example/x", "conv_123");
+        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var submits = actions.OfType<JObject>().Where(a => a["type"]!.ToString() == "Action.Submit").ToList();
+        submits.Should().HaveCount(2);
+
+        var cont = submits.First(a => ((JObject)a["data"]!)["action"]!.ToString() == "consent_continue");
+        ((JObject)cont["data"]!)["conversationId"]!.ToString().Should().Be("conv_123");
+        ((JObject)cont["data"]!)["serverLabel"]!.ToString().Should().Be("srv");
+        cont["style"]?.ToString().Should().Be("positive");
+
+        var cancel = submits.First(a => ((JObject)a["data"]!)["action"]!.ToString() == "consent_cancel");
+        cancel["style"]?.ToString().Should().Be("destructive");
+    }
 
     [Fact]
     public void ConnectedAgentCard_renders_subagent_name_and_message()

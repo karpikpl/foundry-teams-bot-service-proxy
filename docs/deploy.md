@@ -109,6 +109,45 @@ To sideload manually:
 
 For organization-wide rollout, submit the manifest to your Teams admin center.
 
+## Per-user identity (Teams SSO → Foundry)
+
+When you want each Teams user's identity to flow through to Foundry (and from there to MCP servers configured with OAuth identity passthrough), enable Teams SSO:
+
+### One-time setup
+
+1. **Register an AAD app for the bot**:
+   - `Expose an API` → add a scope `access_as_user`
+   - `Application ID URI` = `api://<bot-app-id>`
+   - Add Teams as a known client (client ids `1fec8e78-bce4-4aaf-ab1b-5451cc387264` for desktop and `5e3ce6c0-2b1f-4285-8d4b-75ee78787346` for mobile/web)
+   - Add **delegated permission** for the Foundry resource:
+     - API: `https://ai.azure.com`
+     - Permission: `user_impersonation`
+   - Add **delegated permission** for any MCP server scopes the agent will OBO into (e.g., Microsoft Graph delegated scopes)
+2. **On the Bot Service registration**, add an **OAuth Connection Setting**:
+   - Service Provider: **Azure Active Directory v2**
+   - Client ID / client secret (or use a Federated Identity Credential on the App Service UMI to avoid storing a secret)
+   - Token Exchange URL: `api://<bot-app-id>`
+   - Scopes: `https://ai.azure.com/user_impersonation offline_access`
+3. **In the generated Teams manifest**, the bot embeds `webApplicationInfo` when `TeamsSso__AadAppId` is configured. This is what lets Teams attempt silent SSO without showing a sign-in card.
+4. **App settings**:
+   - `TeamsSso__Enabled = true`
+   - `TeamsSso__ConnectionName = <OAuth connection name from step 2>`
+   - `TeamsSso__AadAppId = <bot AAD app id from step 1>`
+   - `TeamsSso__Resource = api://<bot-app-id>/access_as_user`
+
+### Runtime behavior
+
+- Every user must have **Foundry User** role on the Foundry project. Foundry rejects user-delegated tokens otherwise.
+- The user's tenant must match the Foundry project's tenant — Foundry doesn't support cross-tenant OAuth identity passthrough.
+- On the user's first message, Teams attempts silent SSO via the `webApplicationInfo` configuration. If consent is missing, an OAuthCard renders; on click the user signs in, then the bot replays the original message.
+- For MCP tools configured with OAuth identity passthrough, Foundry surfaces a sign-in card the first time the user hits the tool (the bot renders it as an Adaptive Card with the consent link). One-time per user per MCP server.
+
+### What happens without Teams SSO
+
+- The bot falls back to its UMI / app identity for the Foundry call. Functionality works, but:
+  - Foundry traces don't show the human user
+  - MCP servers configured with OAuth identity passthrough won't have a user identity to pass through — Foundry will surface an error (or use the agent identity if configured)
+
 ## Troubleshooting
 
 | Symptom | Likely cause |

@@ -194,6 +194,54 @@ public static class AdaptiveCardBuilder
         return AsAttachment(card);
     }
 
+    // -------------------------------------------------------------------- oauth consent
+
+    /// <summary>
+    /// Surfaced when an MCP tool uses OAuth identity passthrough and Foundry
+    /// has no cached credential for the current user. The consent link points
+    /// to Foundry's hosted consent page; the user signs in there, then clicks
+    /// "I've signed in" in chat to resume the turn.
+    /// </summary>
+    public static Attachment BuildConsentCard(
+        string serverLabel, string consentLink, string conversationId)
+    {
+        var card = new AdaptiveCard(Schema)
+        {
+            Body =
+            {
+                HeaderBar("🔑", "Sign-in required", $"on MCP server `{serverLabel}`", AdaptiveContainerStyle.Warning),
+                new AdaptiveTextBlock
+                {
+                    Text     = "Foundry needs you to sign in to this tool's MCP server before it can be used in this chat. " +
+                               "Open the consent link, complete the sign-in, then click **I've signed in**.",
+                    Wrap     = true,
+                    Size     = AdaptiveTextSize.Small
+                }
+            },
+            Actions =
+            {
+                new AdaptiveOpenUrlAction
+                {
+                    Title = "🔗 Open consent link",
+                    Url   = new Uri(consentLink)
+                },
+                new AdaptiveSubmitAction
+                {
+                    Title = "✅ I've signed in",
+                    Style = "positive",
+                    Data  = JObject.FromObject(new { action = "consent_continue", conversationId, serverLabel })
+                },
+                new AdaptiveSubmitAction
+                {
+                    Title = "❌ Cancel",
+                    Style = "destructive",
+                    Data  = JObject.FromObject(new { action = "consent_cancel", conversationId, serverLabel })
+                }
+            }
+        };
+        return AsAttachment(card);
+    }
+
     // -------------------------------------------------------------------- cancel
 
     public static Attachment BuildCancelCard(string conversationId, string responseId)

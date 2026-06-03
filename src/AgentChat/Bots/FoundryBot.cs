@@ -27,6 +27,7 @@ public class FoundryBot : TeamsActivityHandler
     private readonly IConfiguration _config;
     private readonly IHttpContextAccessor _httpContext;
     private readonly AgentClientCache _clientCache;
+    private readonly TeamsSsoService _sso;
     private readonly ILogger<FoundryBot> _logger;
 
     public FoundryBot(
@@ -35,6 +36,7 @@ public class FoundryBot : TeamsActivityHandler
         IConfiguration config,
         IHttpContextAccessor httpContext,
         AgentClientCache clientCache,
+        TeamsSsoService sso,
         ILogger<FoundryBot> logger)
     {
         _agents      = agents;
@@ -42,6 +44,7 @@ public class FoundryBot : TeamsActivityHandler
         _config      = config;
         _httpContext = httpContext;
         _clientCache = clientCache;
+        _sso         = sso;
         _logger      = logger;
     }
 
@@ -334,12 +337,91 @@ public class FoundryBot : TeamsActivityHandler
             case "select_agent":
                 await HandleAgentSelectAsync(turnContext, state, data, ct);
                 break;
+            case "consent_continue":
+                await HandleConsentContinueAsync(turnContext, state, ct);
+                break;
+            case "consent_cancel":
+                state.PendingConsentResponseId = null;
+                await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    "❌ Sign-in cancelled. Type your question again to retry."), ct);
+                break;
             case "cancel":
                 await CancelCurrentRunAsync(turnContext, state, ct);
                 break;
             default:
                 _logger.LogWarning("Unknown card action: {Action}", action);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// User clicked "I've signed in" on a consent card. Re-stream the previously
+    /// paused response by passing <c>previous_response_id</c>; Foundry will
+    /// retry the MCP tool call using the now-cached user credential.
+    /// </summary>
+    private async Task HandleConsentContinueAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(state.PendingConsentResponseId))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "I don't see a pending sign-in for this conversation. Type your question to start over."), ct);
+            return;
+        }
+        if (string.IsNullOrEmpty(state.ConversationId))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text("Conversation state lost — type your question to start over."), ct);
+            state.PendingConsentResponseId = null;
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+            return;
+        }
+
+        var routing  = TurnRouting.From(_httpContext, _agents);
+        var foundry  = _clientCache.For(state.AgentEndpoint ?? routing.AgentEndpoint);
+
+        // Honor SSO for the resume call too.
+        var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
+        if (!auth.ShouldProceed) return;
+
+        // The streaming loop builds CreateResponseOptions per iteration; we need
+        // the first one to include PreviousResponseId. The simplest way is a
+        // one-shot override: drain the response with previous_response_id set,
+        // then resume the regular loop for any subsequent follow-ups.
+        var sw         = Stopwatch.StartNew();
+        var streaming  = new StreamingMessageHelper(turnContext);
+        await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = Microsoft.Bot.Schema.ActivityTypes.Typing }, ct);
+
+        using (auth.Scope)
+        {
+            try
+            {
+                var resumeOpts = new CreateResponseOptions
+                {
+                    ConversationOptions = new ResponseConversationOptions(state.ConversationId!),
+                    PreviousResponseId  = state.PendingConsentResponseId!,
+                    StreamingEnabled    = true,
+                };
+
+                // Clear the pending marker BEFORE the call so a failed retry doesn't
+                // cause an infinite "I've signed in" loop.
+                state.PendingConsentResponseId = null;
+                await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+
+                var responses = foundry.OpenAI.GetResponsesClient();
+                var stop = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, resumeOpts, sw, ct);
+                if (stop) return;
+
+                // If the agent has further tool calls / approvals queued after the
+                // resume, drop into the regular loop.
+                await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Resume-after-consent failed");
+                try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    "⚠️ Couldn't resume after sign-in: " + ex.Message), ct);
+            }
         }
     }
 
@@ -368,12 +450,19 @@ public class FoundryBot : TeamsActivityHandler
         var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(routing.ProjectEndpoint, ct)).Endpoint;
         var foundry  = _clientCache.For(endpoint);
 
-        await PostConversationItemsAsync(foundry, conversationId, new[]
-        {
-            ResponseItem.CreateMcpApprovalResponseItem(approvalRequestId, approve)
-        }, ct);
+        // The approval flow is itself a follow-on Foundry call; honor SSO.
+        var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
+        if (!auth.ShouldProceed) return;
 
-        await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+        using (auth.Scope)
+        {
+            await PostConversationItemsAsync(foundry, conversationId, new[]
+            {
+                ResponseItem.CreateMcpApprovalResponseItem(approvalRequestId, approve)
+            }, ct);
+
+            await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+        }
     }
 
     private async Task HandleAgentSelectAsync(ITurnContext turnContext, ConversationState state, JObject data, CancellationToken ct)
@@ -425,7 +514,102 @@ public class FoundryBot : TeamsActivityHandler
 
     // ---------------------------------------------------------------- main turn
 
+    /// <summary>
+    /// Outcome of acquiring per-turn user auth: either a scope to wrap the
+    /// turn in (which may be null when SSO is disabled and we fall back to
+    /// UMI), or a signal that we sent a sign-in card and the caller should
+    /// stop processing this turn.
+    /// </summary>
+    private readonly record struct UserAuth(IDisposable? Scope, bool SignInSent)
+    {
+        public bool ShouldProceed => !SignInSent;
+    }
+
+    /// <summary>
+    /// Acquire a user-delegated Foundry token via Teams SSO and return a
+    /// <see cref="FoundryUserAuthScope"/> to wrap subsequent Foundry calls.
+    /// When SSO is disabled, returns a no-op scope so callers fall back to
+    /// the UMI/app token (today's behavior). When SSO is enabled but the
+    /// user isn't signed in, sends an OAuthCard and signals the caller to
+    /// pause; the user's silent Teams SSO (or explicit sign-in) will
+    /// re-trigger via the <c>signin/tokenExchange</c> invoke handler.
+    /// </summary>
+    private async Task<UserAuth> TryAcquireUserAuthAsync(
+        ITurnContext turnContext, ConversationState state, string? pendingMessage, CancellationToken ct)
+    {
+        if (!_sso.Enabled) return new UserAuth(null, false);
+
+        var token = await _sso.TryGetUserTokenAsync(turnContext, ct);
+        if (token is not null && !string.IsNullOrEmpty(token.Token))
+        {
+            return new UserAuth(FoundryUserAuthScope.Use(token.Token), false);
+        }
+
+        // No token yet — Teams will normally attempt silent SSO when the
+        // OAuthCard is shown with a tokenExchangeResource. The user
+        // experience varies: invisible if SSO + consent already granted;
+        // an interactive Sign In button otherwise.
+        if (!string.IsNullOrEmpty(pendingMessage))
+        {
+            state.PendingSsoMessage = pendingMessage;
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+        }
+        await SendSignInCardAsync(turnContext, ct);
+        return new UserAuth(null, true);
+    }
+
+    /// <summary>
+    /// Send an OAuthCard so Teams can attempt silent SSO or surface a sign-in
+    /// button. The <c>tokenExchangeResource</c> on the card is what makes
+    /// Teams attempt silent SSO instead of opening a browser window.
+    /// </summary>
+    private async Task SendSignInCardAsync(ITurnContext turnContext, CancellationToken ct)
+    {
+        var resource = await _sso.GetSignInResourceAsync(turnContext, ct);
+        if (resource is null)
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "⚠️ Sign-in is required but the OAuth connection isn't configured properly. Contact your admin."), ct);
+            return;
+        }
+
+        var oauthCard = new OAuthCard
+        {
+            Text                   = "Sign in to use the Foundry agent",
+            ConnectionName         = _sso.ConnectionName,
+            TokenExchangeResource  = resource.TokenExchangeResource,
+            Buttons = new List<CardAction>
+            {
+                new CardAction
+                {
+                    Title = "Sign in",
+                    Type  = ActionTypes.Signin,
+                    Value = resource.SignInLink
+                }
+            }
+        };
+
+        await turnContext.SendActivityAsync(
+            MessageFactory.Attachment(new Attachment
+            {
+                ContentType = OAuthCard.ContentType,
+                Content     = oauthCard
+            }),
+            ct);
+    }
+
     private async Task RunAgentTurnAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct)
+    {
+        var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct);
+        if (!auth.ShouldProceed) return;
+
+        using (auth.Scope)
+        {
+            await RunAgentTurnInnerAsync(turnContext, state, userText, ct);
+        }
+    }
+
+    private async Task RunAgentTurnInnerAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct)
     {
         var routing = TurnRouting.From(_httpContext, _agents);
         var targetEndpoint = routing.IsRouted
@@ -524,6 +708,9 @@ public class FoundryBot : TeamsActivityHandler
         }
     }
 
+    /// <summary>Pending OAuth consent request surfaced by Foundry's MCP passthrough.</summary>
+    private sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
+
     /// <returns>True when the loop should stop (success, error, or paused for user).</returns>
     private async Task<bool> ProcessStreamAsync(
         ITurnContext turnContext,
@@ -537,6 +724,7 @@ public class FoundryBot : TeamsActivityHandler
     {
         var pendingFunctionCalls = new List<FunctionCallResponseItem>();
         var pendingApprovals     = new List<McpToolCallApprovalRequestItem>();
+        var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
         bool hadError = false;
 
@@ -555,7 +743,8 @@ public class FoundryBot : TeamsActivityHandler
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
-                        turnContext, state, streaming, done.Item, pendingFunctionCalls, pendingApprovals, seenIds, ct);
+                        turnContext, state, streaming, done.Item,
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -671,6 +860,26 @@ public class FoundryBot : TeamsActivityHandler
             return true; // pause for user
         }
 
+        // 2b) OAuth consent — Foundry's MCP identity passthrough wants the user to
+        //     sign in to the MCP server. Show a card with the consent link;
+        //     resume via card submit (consent_continue), which retries this
+        //     same response with previous_response_id.
+        if (pendingConsents.Count > 0)
+        {
+            await streaming.FinalizeAsync(ct);
+            state.PendingConsentResponseId = state.CurrentResponseId;
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+
+            foreach (var c in pendingConsents)
+            {
+                await turnContext.SendActivityAsync(
+                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildConsentCard(
+                        serverLabel: c.ServerLabel, consentLink: c.ConsentLink, conversationId: state.ConversationId!)),
+                    ct);
+            }
+            return true; // pause for user
+        }
+
         // 3) Done — emit usage card if enabled.
         await streaming.FinalizeAsync(ct);
         if (state.ShowUsage && state.LastTotalTokens > 0)
@@ -693,6 +902,7 @@ public class FoundryBot : TeamsActivityHandler
         ResponseItem item,
         List<FunctionCallResponseItem> pendingFunctionCalls,
         List<McpToolCallApprovalRequestItem> pendingApprovals,
+        List<PendingConsent> pendingConsents,
         HashSet<string> seenIds,
         CancellationToken ct)
     {
@@ -742,14 +952,54 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             default:
-                // Unknown item type — e.g. a Foundry-specific tool call the
-                // OpenAI SDK doesn't know yet (azure_ai_search_call, etc.).
-                // Log the raw payload so we can decide whether to render it.
-                LogUnknownItem(item);
+                // Unknown item type — could be (a) a Foundry-specific item kind
+                // the OpenAI SDK doesn't model (oauth_consent_request,
+                // azure_ai_search_call, …) or (b) something brand new. Parse
+                // raw JSON and handle the cases we know about; log the rest.
+                if (TryExtractConsentRequest(item, out var consent))
+                {
+                    pendingConsents.Add(consent);
+                }
+                else
+                {
+                    LogUnknownItem(item);
+                }
                 break;
 
             // MessageResponseItem and McpToolDefinitionListItem don't need cards;
             // their text is already streamed via output_text deltas.
+        }
+    }
+
+    /// <summary>
+    /// Parse a base ResponseItem the SDK didn't model and recognize the
+    /// Foundry-specific <c>oauth_consent_request</c> shape. Returns true and
+    /// fills <paramref name="consent"/> on match.
+    /// </summary>
+    private static bool TryExtractConsentRequest(ResponseItem item, out PendingConsent consent)
+    {
+        consent = null!;
+        try
+        {
+            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(item);
+            using var doc = System.Text.Json.JsonDocument.Parse(bd);
+            var root = doc.RootElement;
+            var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (!string.Equals(type, "oauth_consent_request", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var link = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
+            if (string.IsNullOrEmpty(link)) return false;
+
+            var id    = root.TryGetProperty("id",           out var i)  ? i.GetString()  : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+
+            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", link!);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -823,5 +1073,47 @@ public class FoundryBot : TeamsActivityHandler
             BinaryContent.Create(BinaryData.FromString(sb.ToString())),
             include: null,
             options: null);
+    }
+
+    // ---------------------------------------------------------------- Teams SSO invoke
+
+    /// <summary>
+    /// Called by Bot Framework when an invoke activity with name
+    /// <c>signin/verifyState</c> or <c>signin/tokenExchange</c> arrives —
+    /// Teams' SSO flow. We just confirm the token is now cached, then replay
+    /// the user's pending message (if we stored one) so the original turn
+    /// resumes seamlessly.
+    /// </summary>
+    protected override async Task OnSignInInvokeAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
+    {
+        var state = await _state.GetOrCreateAsync(turnContext.Activity.Conversation.Id, cancellationToken);
+        await _state.TouchAsync(turnContext.Activity.Conversation.Id, turnContext.Activity.GetConversationReference(), cancellationToken);
+
+        // Confirm the token is now cached server-side. If not, the user's
+        // sign-in didn't complete successfully.
+        var token = await _sso.TryGetUserTokenAsync(turnContext, cancellationToken);
+        if (token is null || string.IsNullOrEmpty(token.Token))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "⚠️ Sign-in didn't complete. Try again or contact your admin."), cancellationToken);
+            return;
+        }
+
+        // Replay the user's pending message, if we saved one.
+        var pending = state.PendingSsoMessage;
+        if (string.IsNullOrEmpty(pending))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "✅ Signed in. Send your message to start the conversation."), cancellationToken);
+            return;
+        }
+
+        state.PendingSsoMessage = null;
+        await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, cancellationToken);
+
+        // We're inside an invoke turn — replay the message as if the user just
+        // typed it. The TryAcquireUserAuthAsync inside RunAgentTurnAsync will
+        // now succeed silently because the token is cached.
+        await RunAgentTurnAsync(turnContext, state, pending, cancellationToken);
     }
 }

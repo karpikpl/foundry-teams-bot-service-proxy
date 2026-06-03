@@ -5,6 +5,58 @@ using OpenAI;
 namespace AgentChat.Foundry;
 
 /// <summary>
+/// Per-request user-token scope. When a value is set on this AsyncLocal, the
+/// <see cref="FoundryClient"/>'s auth policy uses it as the Bearer token for
+/// the outgoing Foundry call instead of acquiring an app/UMI token. The
+/// scope flows through async/await chains so callers just wrap the call:
+///
+/// <code>
+///   using (FoundryUserAuthScope.Use(userToken))
+///   {
+///       await foreach (var ev in client.OpenAI.GetResponsesClient().CreateResponseStreamingAsync(opts)) { ... }
+///   }
+/// </code>
+///
+/// Outside any scope, the policy falls back to the configured
+/// <see cref="TokenCredential"/> (App Service UMI). That fallback is what
+/// admin/catalog calls (e.g. /admin/agents) continue to use.
+/// </summary>
+public static class FoundryUserAuthScope
+{
+    private static readonly AsyncLocal<string?> _userToken = new();
+
+    /// <summary>Current per-request user token, or null if not set.</summary>
+    public static string? Current => _userToken.Value;
+
+    /// <summary>
+    /// Set the per-request user token for the duration of the returned scope.
+    /// The previous value is restored on dispose so scopes can nest cleanly.
+    /// </summary>
+    public static IDisposable Use(string userToken)
+    {
+        if (string.IsNullOrEmpty(userToken))
+            throw new ArgumentException("userToken is required", nameof(userToken));
+
+        var previous = _userToken.Value;
+        _userToken.Value = userToken;
+        return new Restore(previous);
+    }
+
+    private sealed class Restore : IDisposable
+    {
+        private readonly string? _previous;
+        private bool _disposed;
+        public Restore(string? previous) { _previous = previous; }
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _userToken.Value = _previous;
+        }
+    }
+}
+
+/// <summary>
 /// Thin per-agent wrapper around the OpenAI .NET SDK, targeting a Foundry
 /// per-agent endpoint URL of the form:
 ///   <c>https://{host}/api/projects/{project}/agents/{agent}/endpoint/protocols/openai/v1</c>
@@ -12,7 +64,8 @@ namespace AgentChat.Foundry;
 /// All we add over the bare SDK is:
 ///   1. <see cref="EntraIdAuthenticationPolicy"/> — fetches bearer tokens from
 ///      a <see cref="TokenCredential"/> (UMI / DefaultAzureCredential) with
-///      scope <c>https://ai.azure.com/.default</c>.
+///      scope <c>https://ai.azure.com/.default</c>. If <see cref="FoundryUserAuthScope.Current"/>
+///      is set (e.g. inside a per-turn user-token scope) that token wins.
 ///   2. <see cref="ApiVersionPolicy"/> — appends <c>?api-version=...</c> to
 ///      every request, since Foundry requires it.
 ///
@@ -41,7 +94,9 @@ public sealed class FoundryClient
         OpenAI = new OpenAIClient(new EntraIdAuthenticationPolicy(credential, TokenScope), options);
     }
 
-    /// <summary>Adds <c>Authorization: Bearer &lt;token&gt;</c> using a cached AAD token.</summary>
+    /// <summary>Adds <c>Authorization: Bearer &lt;token&gt;</c> using either the
+    /// per-request user token from <see cref="FoundryUserAuthScope"/> or, as a
+    /// fallback, a cached AAD app token via the configured <see cref="TokenCredential"/>.</summary>
     private sealed class EntraIdAuthenticationPolicy : AuthenticationPolicy
     {
         private readonly TokenCredential _credential;
@@ -57,19 +112,23 @@ public sealed class FoundryClient
 
         public override void Process(PipelineMessage message, IReadOnlyList<PipelinePolicy> pipeline, int currentIndex)
         {
-            message.Request.Headers.Set("Authorization", "Bearer " + GetTokenSync());
+            var userToken = FoundryUserAuthScope.Current;
+            var bearer    = userToken ?? GetAppTokenSync();
+            message.Request.Headers.Set("Authorization", "Bearer " + bearer);
             if (currentIndex < pipeline.Count - 1)
                 pipeline[currentIndex + 1].Process(message, pipeline, currentIndex + 1);
         }
 
         public override async ValueTask ProcessAsync(PipelineMessage message, IReadOnlyList<PipelinePolicy> pipeline, int currentIndex)
         {
-            message.Request.Headers.Set("Authorization", "Bearer " + await GetTokenAsync().ConfigureAwait(false));
+            var userToken = FoundryUserAuthScope.Current;
+            var bearer    = userToken ?? await GetAppTokenAsync().ConfigureAwait(false);
+            message.Request.Headers.Set("Authorization", "Bearer " + bearer);
             if (currentIndex < pipeline.Count - 1)
                 await pipeline[currentIndex + 1].ProcessAsync(message, pipeline, currentIndex + 1).ConfigureAwait(false);
         }
 
-        private string GetTokenSync()
+        private string GetAppTokenSync()
         {
             lock (_lock)
             {
@@ -81,7 +140,7 @@ public sealed class FoundryClient
             return fetched.Token;
         }
 
-        private async ValueTask<string> GetTokenAsync()
+        private async ValueTask<string> GetAppTokenAsync()
         {
             lock (_lock)
             {

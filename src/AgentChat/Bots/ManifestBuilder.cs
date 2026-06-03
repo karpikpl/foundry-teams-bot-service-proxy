@@ -36,7 +36,6 @@ public static class ManifestBuilder
         string agentName,
         string agentDescription,
         string botId,
-        string? botEndpointPath = null,
         Guid? manifestId = null,
         string? ssoAadAppId = null,
         string? ssoResource = null)
@@ -84,18 +83,6 @@ public static class ManifestBuilder
                 }
             }
         };
-
-        // Embed the URL-routed messaging endpoint into the bot metadata when
-        // it isn't the default /api/messages. Bot Service registrations created
-        // for this manifest must use the same path so traffic lands on the right
-        // per-agent route in the proxy.
-        // Note: this is informational only — the actual messaging URL is configured
-        // on the Bot Service resource, not in the Teams manifest. We add it as a
-        // custom property under the bot for human reference.
-        if (!string.IsNullOrEmpty(botEndpointPath) && botEndpointPath != "/api/messages")
-        {
-            botBlock["x-foundryBotEndpointPath"] = botEndpointPath;
-        }
 
         var manifest = new JObject
         {

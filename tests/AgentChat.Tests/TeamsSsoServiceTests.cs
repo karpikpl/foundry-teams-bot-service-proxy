@@ -29,24 +29,16 @@ public class TeamsSsoServiceTests
     }
 
     [Fact]
-    public void Enabled_only_when_both_flag_and_connection_name_set()
+    public void Enabled_when_connection_name_is_set()
     {
-        Make(new() { ["TeamsSso:Enabled"] = "true" }).Enabled.Should().BeFalse();
-        Make(new() { ["TeamsSso:ConnectionName"] = "x" }).Enabled.Should().BeFalse();
-        Make(new()
-        {
-            ["TeamsSso:Enabled"]        = "true",
-            ["TeamsSso:ConnectionName"] = "foundry-oauth"
-        }).Enabled.Should().BeTrue();
+        Make(new() { ["TeamsSso:ConnectionName"] = "foundry-oauth" })
+            .Enabled.Should().BeTrue();
     }
 
     [Fact]
     public void ConnectionName_is_exposed()
     {
-        Make(new()
-        {
-            ["TeamsSso:Enabled"]        = "true",
-            ["TeamsSso:ConnectionName"] = "my-conn"
-        }).ConnectionName.Should().Be("my-conn");
+        Make(new() { ["TeamsSso:ConnectionName"] = "my-conn" })
+            .ConnectionName.Should().Be("my-conn");
     }
 }

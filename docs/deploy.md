@@ -130,8 +130,7 @@ When you want each Teams user's identity to flow through to Foundry (and from th
    - Scopes: `https://ai.azure.com/user_impersonation offline_access`
 3. **In the generated Teams manifest**, the bot embeds `webApplicationInfo` when `TeamsSso__AadAppId` is configured. This is what lets Teams attempt silent SSO without showing a sign-in card.
 4. **App settings**:
-   - `TeamsSso__Enabled = true`
-   - `TeamsSso__ConnectionName = <OAuth connection name from step 2>`
+   - `TeamsSso__ConnectionName = <OAuth connection name from step 2>` *(SSO turns on automatically when this is set)*
    - `TeamsSso__AadAppId = <bot AAD app id from step 1>`
    - `TeamsSso__Resource = api://<bot-app-id>/access_as_user`
 

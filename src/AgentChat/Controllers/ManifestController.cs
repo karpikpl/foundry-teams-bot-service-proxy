@@ -162,8 +162,6 @@ public class ManifestController : ControllerBase
         var agent = agents.FirstOrDefault(a => string.Equals(a.Name, agentName, StringComparison.OrdinalIgnoreCase));
         if (agent is null) return NotFound($"Agent '{agentName}' not found in project {projectEndpoint}.");
 
-        var botEndpointPath = $"/api/messages/{foundryHost}/{project}/{agent.Name}";
-
         var description = string.IsNullOrWhiteSpace(agent.Description)
             ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
             : agent.Description;
@@ -172,7 +170,6 @@ public class ManifestController : ControllerBase
             agentName:        registration.DisplayName ?? agent.Name,
             agentDescription: description,
             botId:            registration.BotId,
-            botEndpointPath:  botEndpointPath,
             ct: ct);
 
         return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}.zip");
@@ -214,13 +211,12 @@ public class ManifestController : ControllerBase
     }
 
     private async Task<byte[]> BuildManifestZipAsync(
-        string agentName, string agentDescription, string botId, string? botEndpointPath, CancellationToken ct)
+        string agentName, string agentDescription, string botId, CancellationToken ct)
     {
         var ssoAppId   = _config["TeamsSso:AadAppId"];
         var ssoResource = _config["TeamsSso:Resource"];
         var manifest   = ManifestBuilder.Build(
             agentName, agentDescription, botId,
-            botEndpointPath: botEndpointPath,
             ssoAadAppId: ssoAppId,
             ssoResource: ssoResource);
 

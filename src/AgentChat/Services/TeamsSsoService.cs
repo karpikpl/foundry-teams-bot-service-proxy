@@ -20,8 +20,8 @@ namespace AgentChat.Services;
 ///      - Scopes: <c>https://ai.azure.com/user_impersonation offline_access</c>
 ///   3. Update the Teams manifest <c>webApplicationInfo</c> with the bot AAD
 ///      app id + resource (handled by <see cref="Bots.ManifestBuilder"/>).
-///   4. Set <c>TeamsSso__Enabled=true</c> and
-///      <c>TeamsSso__ConnectionName=&lt;OAuth connection name&gt;</c>.
+///   4. Set <c>TeamsSso__ConnectionName=&lt;OAuth connection name&gt;</c>.
+///      SSO turns on automatically whenever a connection name is configured.
 ///
 /// At runtime this service just calls <c>UserTokenClient.GetUserTokenAsync</c>;
 /// Bot Service handles the SSO + OBO dance internally (cached, refreshed).
@@ -33,20 +33,21 @@ public sealed class TeamsSsoService
 {
     private readonly ILogger<TeamsSsoService> _logger;
     private readonly string? _connectionName;
-    private readonly bool _enabled;
 
-    public bool Enabled => _enabled && !string.IsNullOrEmpty(_connectionName);
+    // SSO is on whenever the operator wired up a connection name. No separate
+    // feature flag — if the connection isn't configured, the calls below
+    // would 400 anyway, so there's nothing to gate.
+    public bool Enabled => !string.IsNullOrEmpty(_connectionName);
     public string? ConnectionName => _connectionName;
 
     public TeamsSsoService(IConfiguration config, ILogger<TeamsSsoService> logger)
     {
         _logger         = logger;
-        _enabled        = config.GetValue("TeamsSso:Enabled", false);
         _connectionName = config["TeamsSso:ConnectionName"];
 
-        if (_enabled && string.IsNullOrEmpty(_connectionName))
+        if (Enabled)
         {
-            _logger.LogWarning("TeamsSso:Enabled=true but TeamsSso:ConnectionName not configured — SSO disabled.");
+            _logger.LogInformation("Teams SSO enabled (connection={Connection}).", _connectionName);
         }
     }
 

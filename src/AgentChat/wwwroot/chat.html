@@ -25,7 +25,10 @@
   .tool-card .head{font-weight:600;margin-bottom:4px}
   .tool-card pre{margin:6px 0 0;font-family:ui-monospace,Consolas,monospace;font-size:11px;white-space:pre-wrap;word-wrap:break-word;background:rgba(0,0,0,.05);padding:6px 8px;border-radius:4px;max-height:200px;overflow:auto}
   .consent-card{background:#ddf4ff;border:1px solid #54aeff;border-radius:8px;padding:12px 14px;margin:8px 0;font-size:13px;line-height:1.6}
-  .consent-card a{color:#0969da;font-weight:600}
+  .consent-card .consent-title{margin-bottom:8px}
+  .consent-card .consent-link-button{display:inline-block;background:#0969da;color:#fff;text-decoration:none;font-weight:600;border-radius:6px;padding:8px 12px;margin:2px 0 6px}
+  .consent-card .consent-link-button:hover{background:#0550ae;color:#fff}
+  .consent-card .consent-help{color:#57606a;margin-top:2px}
   .err{color:#cf222e;font-size:13px;background:#ffebe9;border:1px solid #ff8182;border-radius:6px;padding:8px 12px;margin:8px 0}
   .usage{font-size:11px;color:#8b949e;text-align:center;margin:8px 0}
   .composer{display:flex;gap:8px;padding:12px 20px;border-top:1px solid #d0d7de;background:#fff;flex-shrink:0}
@@ -200,10 +203,11 @@
         const card = document.createElement('div');
         card.className = 'consent-card';
         card.innerHTML =
-          `🔑 <strong>Sign-in required</strong> for MCP server <code>${escapeHtml(c.serverLabel)}</code>.<br>` +
-          `<a href="${escapeAttr(c.consentLink)}" target="_blank" rel="noopener">Open consent link</a> ` +
-          `then send your message again.`;
+          `<div class="consent-title">🔑 <strong>Sign-in required</strong> for MCP server <code>${escapeHtml(c.serverLabel)}</code>.</div>` +
+          `<a class="consent-link-button" href="${escapeAttr(c.consentLink)}" target="_blank" rel="noopener">🔗 Open consent link</a>` +
+          `<div class="consent-help">Then send your message again.</div>`;
         messages.insertBefore(card, agentBubble.parentElement);
+        removeEmptyAgentBubble(agentBubble);
         scrollToBottom();
         break;
       }
@@ -242,6 +246,10 @@
     return b;
   }
   function scrollToBottom() { messages.scrollTop = messages.scrollHeight; }
+  function removeEmptyAgentBubble(agentBubble) {
+    if (agentBubble.textContent.trim()) return;
+    agentBubble.parentElement?.remove();
+  }
   function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function escapeAttr(s) { return escapeHtml(s); }
 

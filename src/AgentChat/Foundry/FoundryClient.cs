@@ -80,7 +80,7 @@ public sealed class FoundryClient
     public string Endpoint { get; }
     public OpenAIClient OpenAI { get; }
 
-    public FoundryClient(string endpoint, TokenCredential credential, string apiVersion = DefaultApiVersion)
+    public FoundryClient(string endpoint, TokenCredential credential, string apiVersion = DefaultApiVersion, PipelineTransport? transport = null)
     {
         if (!endpoint.EndsWith("/")) endpoint += "/";
         Endpoint = endpoint;
@@ -89,6 +89,10 @@ public sealed class FoundryClient
         {
             Endpoint = new Uri(endpoint)
         };
+        if (transport is not null)
+        {
+            options.Transport = transport;
+        }
         options.AddPolicy(new ApiVersionPolicy(apiVersion), PipelinePosition.PerCall);
 
         OpenAI = new OpenAIClient(new EntraIdAuthenticationPolicy(credential, TokenScope), options);

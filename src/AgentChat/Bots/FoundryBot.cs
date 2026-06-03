@@ -420,45 +420,24 @@ public class FoundryBot : TeamsActivityHandler
         var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
         if (!auth.ShouldProceed) return;
 
-        // The streaming loop builds CreateResponseOptions per iteration; we need
-        // the first one to include PreviousResponseId. The simplest way is a
-        // one-shot override: drain the response with previous_response_id set,
-        // then resume the regular loop for any subsequent follow-ups.
-        var sw         = Stopwatch.StartNew();
-        var streaming  = new StreamingMessageHelper(turnContext);
         await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = Microsoft.Bot.Schema.ActivityTypes.Typing }, ct);
 
         using (auth.Scope)
         {
             try
             {
-                // Foundry rejects requests that set both PreviousResponseId
-                // and ConversationOptions ("Cannot provide both
-                // 'previous_response_id' and 'conversation'"). The previous
-                // response id implicitly carries the bound conversation.
-                var resumeOpts = new CreateResponseOptions
-                {
-                    PreviousResponseId  = state.PendingConsentResponseId!,
-                    StreamingEnabled    = true,
-                };
+                var previousResponseId = state.PendingConsentResponseId!;
 
                 // Clear the pending marker BEFORE the call so a failed retry doesn't
                 // cause an infinite "I've signed in" loop.
                 state.PendingConsentResponseId = null;
                 await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-                var responses = foundry.OpenAI.GetResponsesClient();
-                var stop = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, resumeOpts, sw, ct);
-                if (stop) return;
-
-                // If the agent has further tool calls / approvals queued after the
-                // resume, drop into the regular loop.
-                await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+                await StreamResponseLoopAsync(turnContext, state, foundry, ct, firstPreviousResponseId: previousResponseId);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Resume-after-consent failed");
-                try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
                 await turnContext.SendActivityAsync(MessageFactory.Text(
                     "⚠️ Couldn't resume after sign-in: " + ex.Message), ct);
             }
@@ -499,14 +478,26 @@ public class FoundryBot : TeamsActivityHandler
 
         using (auth.Scope)
         {
-            var resumeOpts = McpApproval.BuildResumeOptions(conversationId, previousResponseId, approvalRequestId, approve);
-
-            var sw = Stopwatch.StartNew();
-            var streaming = new StreamingMessageHelper(turnContext);
-            var responses = foundry.OpenAI.GetResponsesClient();
-            var stop = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, resumeOpts, sw, ct);
-            if (!stop) await StreamResponseLoopAsync(turnContext, state, foundry, ct);
-            try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
+            try
+            {
+                var approvalItem = ResponseItem.CreateMcpApprovalResponseItem(approvalRequestId, approve);
+                _logger.LogInformation(
+                    "Submitting MCP approval response {ApprovalRequestId}; previous_response_id={PreviousResponseId}; approve={Approve}",
+                    approvalRequestId, previousResponseId, approve);
+                await StreamResponseLoopAsync(
+                    turnContext,
+                    state,
+                    foundry,
+                    ct,
+                    new[] { approvalItem },
+                    previousResponseId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Resume-after-MCP-approval failed");
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    "⚠️ Couldn't resume after MCP approval: " + ex.Message), ct);
+            }
         }
     }
 
@@ -539,6 +530,7 @@ public class FoundryBot : TeamsActivityHandler
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed cleanup of old conv during agent switch"); }
             }
             state.ConversationId = null;
+            state.CurrentResponseId = null;
         }
         state.AgentEndpoint = agent.Endpoint;
         await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
@@ -552,9 +544,7 @@ public class FoundryBot : TeamsActivityHandler
             await turnContext.SendActivityAsync(MessageFactory.Text("Nothing is running right now."), ct);
             return;
         }
-        state.CurrentResponseId = null;
-        await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
-        await turnContext.SendActivityAsync(MessageFactory.Text("🛑 Cancellation requested."), ct);
+        await turnContext.SendActivityAsync(MessageFactory.Text("🛑 Cancellation requested. If the turn already finished, conversation history was preserved."), ct);
     }
 
     // ---------------------------------------------------------------- main turn
@@ -582,9 +572,15 @@ public class FoundryBot : TeamsActivityHandler
     private async Task<UserAuth> TryAcquireUserAuthAsync(
         ITurnContext turnContext, ConversationState state, string? pendingMessage, CancellationToken ct)
     {
-        if (!_sso.Enabled) return new UserAuth(null, false);
+        if (!_sso.Enabled)
+        {
+            _logger.LogInformation("Teams SSO disabled; using app identity for this turn.");
+            return new UserAuth(null, false);
+        }
 
         var token = await _sso.TryGetUserTokenAsync(turnContext, ct);
+        _logger.LogInformation("Teams SSO cached token lookup: {TokenState}.",
+            token is not null && !string.IsNullOrEmpty(token.Token) ? "present" : "absent");
         if (token is not null && !string.IsNullOrEmpty(token.Token))
         {
             return new UserAuth(FoundryUserAuthScope.Use(token.Token), false);
@@ -598,7 +594,9 @@ public class FoundryBot : TeamsActivityHandler
         {
             state.PendingSsoMessage = pendingMessage;
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+            _logger.LogInformation("Stored pending Teams SSO message for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
         }
+        _logger.LogInformation("Sending Teams SSO sign-in card for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
         await SendSignInCardAsync(turnContext, ct);
         return new UserAuth(null, true);
     }
@@ -682,6 +680,7 @@ public class FoundryBot : TeamsActivityHandler
             }
             state.AgentEndpoint  = targetEndpoint;
             state.ConversationId = null;
+            state.CurrentResponseId = null;
         }
 
         var foundry = _clientCache.For(targetEndpoint);
@@ -698,14 +697,9 @@ public class FoundryBot : TeamsActivityHandler
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
         }
 
-        // Post the user message into the conversation as an explicit item so
-        // Foundry traces show user attribution cleanly.
-        await PostConversationItemsAsync(foundry, state.ConversationId!, new[]
-        {
-            ResponseItem.CreateUserMessageItem(userText)
-        }, ct);
-
-        await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+        _logger.LogInformation("Calling RunAgentTurnAsync for conversation {ConversationId}; current response id: {ResponseId}",
+            state.ConversationId, state.CurrentResponseId ?? "(none)");
+        await StreamResponseLoopAsync(turnContext, state, foundry, ct, new[] { ResponseItem.CreateUserMessageItem(userText) });
     }
 
     // ---------------------------------------------------------------- streaming loop
@@ -719,7 +713,9 @@ public class FoundryBot : TeamsActivityHandler
         ITurnContext turnContext,
         ConversationState state,
         Foundry.FoundryClient foundry,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyList<ResponseItem>? initialInputItems = null,
+        string? firstPreviousResponseId = null)
     {
         var sw         = Stopwatch.StartNew();
         var streaming  = new StreamingMessageHelper(turnContext);
@@ -729,6 +725,8 @@ public class FoundryBot : TeamsActivityHandler
         try
         {
             int safety = 0;
+            IReadOnlyList<ResponseItem>? nextInputItems = initialInputItems;
+            string? nextPreviousResponseId = firstPreviousResponseId;
             while (true)
             {
                 if (++safety > 8)
@@ -737,33 +735,76 @@ public class FoundryBot : TeamsActivityHandler
                     break;
                 }
 
-                var opts = new CreateResponseOptions
-                {
-                    ConversationOptions = new ResponseConversationOptions(state.ConversationId!),
-                    StreamingEnabled    = true,
-                };
+                var opts = BuildResponseOptions(state, nextInputItems, nextPreviousResponseId);
+                _logger.LogInformation(
+                    "Foundry POST starting for conversation {ConversationId}; previous_response_id={PreviousResponseId}; conversation_bound={ConversationBound}; input_items={InputItemCount}",
+                    state.ConversationId,
+                    opts.PreviousResponseId ?? "(none)",
+                    opts.ConversationOptions is not null,
+                    opts.InputItems.Count);
 
-                var stop = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, opts, sw, ct);
-                if (stop) break;
+                var step = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, opts, sw, ct);
+                if (step.Stop) break;
+                nextInputItems = step.NextInputItems;
+                nextPreviousResponseId = null;
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Stream processing failed");
-            try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
+            await FinalizeStreamingSafelyAsync(streaming, ct);
             await turnContext.SendActivityAsync(MessageFactory.Text("⚠️ The agent encountered an error: " + ex.Message), ct);
         }
         finally
         {
-            try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
+            await FinalizeStreamingSafelyAsync(streaming, ct);
+        }
+    }
+
+    private static CreateResponseOptions BuildResponseOptions(
+        ConversationState state,
+        IReadOnlyList<ResponseItem>? inputItems,
+        string? previousResponseIdOverride = null)
+    {
+        var opts = new CreateResponseOptions { StreamingEnabled = true };
+        var previousResponseId = previousResponseIdOverride ?? state.CurrentResponseId;
+        if (!string.IsNullOrEmpty(previousResponseId))
+        {
+            opts.PreviousResponseId = previousResponseId;
+        }
+        else
+        {
+            opts.ConversationOptions = new ResponseConversationOptions(state.ConversationId!);
+        }
+
+        if (inputItems is not null)
+        {
+            foreach (var item in inputItems)
+                opts.InputItems.Add(item);
+        }
+
+        return opts;
+    }
+
+    private sealed record StreamStep(bool Stop, IReadOnlyList<ResponseItem>? NextInputItems = null);
+
+    private async Task FinalizeStreamingSafelyAsync(StreamingMessageHelper streaming, CancellationToken ct)
+    {
+        try
+        {
+            await streaming.FinalizeAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to finalize streaming activity.");
         }
     }
 
     /// <summary>Pending OAuth consent request surfaced by Foundry's MCP passthrough.</summary>
     private sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
 
-    /// <returns>True when the loop should stop (success, error, or paused for user).</returns>
-    private async Task<bool> ProcessStreamAsync(
+    /// <returns>Whether the loop should stop, or the input items for the next response hop.</returns>
+    private async Task<StreamStep> ProcessStreamAsync(
         ITurnContext turnContext,
         ConversationState state,
         Foundry.FoundryClient foundry,
@@ -780,14 +821,21 @@ public class FoundryBot : TeamsActivityHandler
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
+        bool sawMcpToolCall = false;
+        bool sawTextDelta = false;
+        bool startedFromApprovalResponse = clearsPendingApprovalOnStart;
 
         await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
         {
             switch (update)
             {
                 case StreamingResponseCreatedUpdate created:
-                    state.CurrentResponseId = created.Response?.Id;
-                    responseIdForResume = created.Response?.Id ?? responseIdForResume;
+                    if (!string.IsNullOrEmpty(created.Response?.Id))
+                    {
+                        state.CurrentResponseId = created.Response.Id;
+                        responseIdForResume = created.Response.Id;
+                    }
+                    _logger.LogInformation("Foundry response created: {ResponseId}", state.CurrentResponseId ?? "(none)");
                     if (clearsPendingApprovalOnStart && McpApproval.HasPending(state))
                     {
                         McpApproval.Clear(state);
@@ -797,11 +845,16 @@ public class FoundryBot : TeamsActivityHandler
                     break;
 
                 case StreamingResponseOutputTextDeltaUpdate delta when !string.IsNullOrEmpty(delta.Delta):
+                    sawTextDelta = true;
                     streaming.AppendDelta(delta.Delta!);
                     await streaming.MaybeFlushAsync(ct);
                     break;
 
                 case StreamingResponseOutputItemDoneUpdate done:
+                    if (done.Item is McpToolCallItem)
+                    {
+                        sawMcpToolCall = true;
+                    }
                     await HandleCompletedItemAsync(
                         turnContext, state, streaming, done.Item, responseIdForResume,
                         pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, ct);
@@ -824,7 +877,7 @@ public class FoundryBot : TeamsActivityHandler
                     }
                     state.RunCount++;
                     state.LastRunUtc = DateTime.UtcNow;
-                    state.CurrentResponseId = null;
+                    _logger.LogInformation("Foundry response completed: {ResponseId}", state.CurrentResponseId ?? "(none)");
                     await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
                     break;
 
@@ -864,7 +917,7 @@ public class FoundryBot : TeamsActivityHandler
             }
         }
 
-        if (hadError) return true;
+        if (hadError) return new StreamStep(true);
 
         // 1) Function calls — dispatch and post outputs; continue loop.
         if (pendingFunctionCalls.Count > 0)
@@ -892,8 +945,8 @@ public class FoundryBot : TeamsActivityHandler
                 // The full untruncated result still goes to the agent.
                 outputs.Add(ResponseItem.CreateFunctionCallOutputItem(fc.CallId, result));
             }
-            await PostConversationItemsAsync(foundry, state.ConversationId!, outputs, ct);
-            return false;
+            _logger.LogInformation("Continuing Foundry response with {OutputCount} function output item(s).", outputs.Count);
+            return new StreamStep(false, outputs);
         }
 
         // 2) MCP approvals — Foundry cannot continue until we send an
@@ -913,7 +966,7 @@ public class FoundryBot : TeamsActivityHandler
                     approvalRequestId: req.ApprovalRequestId,
                     conversationId: state.ConversationId!)),
                 ct);
-            return true; // pause for user
+            return new StreamStep(true); // pause for user
         }
 
         // 2b) OAuth consent — Foundry's MCP identity passthrough wants the user to
@@ -933,7 +986,14 @@ public class FoundryBot : TeamsActivityHandler
                         serverLabel: c.ServerLabel, consentLink: c.ConsentLink, conversationId: state.ConversationId!)),
                     ct);
             }
-            return true; // pause for user
+            return new StreamStep(true); // pause for user
+        }
+
+        if (sawMcpToolCall || (startedFromApprovalResponse && !sawTextDelta))
+        {
+            _logger.LogInformation("Continuing Foundry response after MCP approval/tool hop using previous_response_id={ResponseId}.", state.CurrentResponseId ?? "(none)");
+            await streaming.FinalizeAsync(ct);
+            return new StreamStep(false);
         }
 
         // 3) Done — emit usage card if enabled.
@@ -948,7 +1008,7 @@ public class FoundryBot : TeamsActivityHandler
                     sw.Elapsed)),
                 ct);
         }
-        return true;
+        return new StreamStep(true);
     }
 
     private async Task HandleCompletedItemAsync(
@@ -1235,7 +1295,11 @@ public class FoundryBot : TeamsActivityHandler
                 var request = data.ToObject<TokenExchangeRequest>();
                 if (request is not null)
                 {
+                    _logger.LogInformation("Received signin/tokenExchange invoke for user {UserId}.",
+                        turnContext.Activity.From?.Id);
                     var exchanged = await _sso.ExchangeTokenAsync(turnContext, request, ct);
+                    _logger.LogInformation("Teams signin/tokenExchange token exchange result: {TokenState}.",
+                        exchanged is not null && !string.IsNullOrEmpty(exchanged.Token) ? "present" : "absent");
                     if (exchanged is not null && !string.IsNullOrEmpty(exchanged.Token))
                     {
                         _logger.LogInformation("Teams signin/tokenExchange completed for user {UserId}.", turnContext.Activity.From?.Id);
@@ -1249,7 +1313,10 @@ public class FoundryBot : TeamsActivityHandler
             }
         }
 
-        return await _sso.TryGetUserTokenAsync(turnContext, ct);
+        var cached = await _sso.TryGetUserTokenAsync(turnContext, ct);
+        _logger.LogInformation("Teams sign-in invoke token fallback: {TokenState}.",
+            cached is not null && !string.IsNullOrEmpty(cached.Token) ? "present" : "absent");
+        return cached;
     }
 
     protected override async Task OnSignInInvokeAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)

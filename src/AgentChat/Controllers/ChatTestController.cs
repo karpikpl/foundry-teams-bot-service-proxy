@@ -33,6 +33,7 @@ namespace AgentChat.Controllers;
 public class ChatTestController : ControllerBase
 {
     private static readonly ConcurrentDictionary<string, PendingMcpApproval> PendingApprovals = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, string> CurrentResponseIds = new(StringComparer.Ordinal);
 
     private readonly AgentService _agents;
     private readonly AgentClientCache _clientCache;
@@ -102,6 +103,7 @@ public class ChatTestController : ControllerBase
         if (agent is null) return NotFound(new { error = $"agent '{agentKey}' not found" });
 
         PendingApprovals.TryRemove(PendingKey(agentKey, conversationId), out _);
+        CurrentResponseIds.TryRemove(PendingKey(agentKey, conversationId), out _);
         var foundry = _clientCache.For(agent.Endpoint);
         try
         {
@@ -166,10 +168,10 @@ public class ChatTestController : ControllerBase
         }
 
         var foundry   = _clientCache.For(agent.Endpoint);
-        var convs     = foundry.OpenAI.GetConversationClient();
         var responses = foundry.OpenAI.GetResponsesClient();
-        CreateResponseOptions opts;
 
+        IReadOnlyList<ResponseItem>? inputItems;
+        string? firstPreviousResponseId = null;
         if (body.Approval is { } approval)
         {
             if (!PendingApprovals.TryGetValue(pendingKey, out var pending) ||
@@ -178,99 +180,35 @@ public class ChatTestController : ControllerBase
                 await WriteSseAsync("error", "I don't see that pending MCP approval anymore. Send your message again to retry.", ct);
                 return;
             }
-            opts = BuildApprovalResumeOptions(body.ConversationId, pending.PreviousResponseId, approval.RequestId, approval.Approve);
+            inputItems = new[] { ResponseItem.CreateMcpApprovalResponseItem(approval.RequestId, approval.Approve) };
+            firstPreviousResponseId = pending.PreviousResponseId;
         }
         else
         {
-            // 1. Post the user message to the conversation.
-            try
-            {
-                var sb = new StringBuilder();
-                sb.Append("{\"items\":[");
-                sb.Append(System.ClientModel.Primitives.ModelReaderWriter.Write(
-                    ResponseItem.CreateUserMessageItem(body.Message!)).ToString());
-                sb.Append("]}");
-                await convs.CreateConversationItemsAsync(
-                    body.ConversationId,
-                    BinaryContent.Create(BinaryData.FromString(sb.ToString())),
-                    include: null,
-                    options: null);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "POST conversation items failed");
-                await WriteSseAsync("error", $"Failed to post message: {ex.Message}", ct);
-                return;
-            }
-
-            opts = new CreateResponseOptions
-            {
-                ConversationOptions = new ResponseConversationOptions(body.ConversationId),
-                StreamingEnabled    = true
-            };
+            inputItems = new[] { ResponseItem.CreateUserMessageItem(body.Message!) };
         }
 
-        // 2. Stream the response.
+        // Stream the response. A user turn binds the Foundry conversation only
+        // when no prior response id is known; otherwise every hop chains via
+        // previous_response_id, matching the Foundry Responses sample.
         try
         {
-            var seenIds = new HashSet<string>();
-            var responseIdForResume = opts.PreviousResponseId;
-            var clearsPendingApprovalOnStart = body.Approval is not null;
-            await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
+            int safety = 0;
+            var clearApprovalOnNextStream = body.Approval is not null;
+            while (true)
             {
-                switch (update)
+                if (++safety > 8)
                 {
-                    case StreamingResponseCreatedUpdate created:
-                        responseIdForResume = created.Response?.Id ?? responseIdForResume;
-                        if (clearsPendingApprovalOnStart)
-                        {
-                            PendingApprovals.TryRemove(pendingKey, out _);
-                            clearsPendingApprovalOnStart = false;
-                        }
-                        break;
-
-                    case StreamingResponseOutputTextDeltaUpdate d when !string.IsNullOrEmpty(d.Delta):
-                        await WriteSseAsync("text", d.Delta!, ct);
-                        break;
-
-                    case StreamingResponseOutputItemDoneUpdate done:
-                        var item = done.Item;
-                        if (item.Id is { } id && !seenIds.Add(id)) break;
-                        if (await HandleItemAsync(item, pendingKey, responseIdForResume, ct)) return;
-                        break;
-
-                    case StreamingResponseCompletedUpdate completed:
-                        responseIdForResume = completed.Response?.Id ?? responseIdForResume;
-                        var u = completed.Response?.Usage;
-                        var payload = JsonSerializer.Serialize(new
-                        {
-                            inputTokens  = u?.InputTokenCount  ?? 0,
-                            outputTokens = u?.OutputTokenCount ?? 0,
-                            totalTokens  = u?.TotalTokenCount  ?? 0
-                        });
-                        await WriteSseAsync("done", payload, ct);
-                        break;
-
-                    case StreamingResponseFailedUpdate failed:
-                        await WriteSseAsync("error", failed.Response?.Error?.Message ?? "Run failed", ct);
-                        return;
-
-                    case StreamingResponseErrorUpdate err:
-                        await WriteSseAsync("error", $"{err.Code ?? "error"}: {err.Message ?? "unknown"}", ct);
-                        return;
-
-                    default:
-                        if (TryParseApprovalEvent(update, responseIdForResume, out var approvalEvent))
-                        {
-                            await EmitApprovalAsync(pendingKey, approvalEvent, ct);
-                            return;
-                        }
-                        if (TryParseConsentEvent(update, out var serverLabel, out var link))
-                        {
-                            await WriteSseAsync("consent", JsonSerializer.Serialize(new { serverLabel, consentLink = link }), ct);
-                        }
-                        break;
+                    await WriteSseAsync("error", "Aborting after too many tool/approval round-trips.", ct);
+                    return;
                 }
+
+                var opts = BuildResponseOptions(body.ConversationId, pendingKey, inputItems, firstPreviousResponseId);
+                var step = await StreamFoundryOnceAsync(responses, opts, pendingKey, clearApprovalOnNextStream, ct);
+                clearApprovalOnNextStream = false;
+                if (step.Stop) return;
+                inputItems = step.NextInputItems;
+                firstPreviousResponseId = null;
             }
         }
         catch (OperationCanceledException) { /* client disconnected */ }
@@ -279,6 +217,119 @@ public class ChatTestController : ControllerBase
             _logger.LogError(ex, "Stream failed");
             await WriteSseAsync("error", ex.Message, ct);
         }
+    }
+
+    private sealed record StreamStep(bool Stop, IReadOnlyList<ResponseItem>? NextInputItems = null);
+
+    private static CreateResponseOptions BuildResponseOptions(
+        string conversationId,
+        string pendingKey,
+        IReadOnlyList<ResponseItem>? inputItems,
+        string? previousResponseIdOverride = null)
+    {
+        var opts = new CreateResponseOptions { StreamingEnabled = true };
+        var previousResponseId = previousResponseIdOverride
+                                 ?? (CurrentResponseIds.TryGetValue(pendingKey, out var current) ? current : null);
+        if (!string.IsNullOrEmpty(previousResponseId))
+        {
+            opts.PreviousResponseId = previousResponseId;
+        }
+        else
+        {
+            opts.ConversationOptions = new ResponseConversationOptions(conversationId);
+        }
+
+        if (inputItems is not null)
+        {
+            foreach (var item in inputItems)
+                opts.InputItems.Add(item);
+        }
+
+        return opts;
+    }
+
+    private async Task<StreamStep> StreamFoundryOnceAsync(
+        ResponsesClient responses,
+        CreateResponseOptions opts,
+        string pendingKey,
+        bool clearsPendingApproval,
+        CancellationToken ct)
+    {
+        var seenIds = new HashSet<string>();
+        var responseIdForResume = opts.PreviousResponseId;
+        var sawMcpToolCall = false;
+        var sawTextDelta = false;
+        var startedFromApprovalResponse = clearsPendingApproval;
+        await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
+        {
+            switch (update)
+            {
+                case StreamingResponseCreatedUpdate created:
+                    responseIdForResume = created.Response?.Id ?? responseIdForResume;
+                    if (!string.IsNullOrEmpty(created.Response?.Id))
+                    {
+                        CurrentResponseIds[pendingKey] = created.Response.Id;
+                    }
+                    if (clearsPendingApproval)
+                    {
+                        PendingApprovals.TryRemove(pendingKey, out _);
+                        clearsPendingApproval = false;
+                    }
+                    break;
+
+                case StreamingResponseOutputTextDeltaUpdate d when !string.IsNullOrEmpty(d.Delta):
+                    sawTextDelta = true;
+                    await WriteSseAsync("text", d.Delta!, ct);
+                    break;
+
+                case StreamingResponseOutputItemDoneUpdate done:
+                    var item = done.Item;
+                    if (item.Id is { } id && !seenIds.Add(id)) break;
+                    if (item is McpToolCallItem) sawMcpToolCall = true;
+                    if (await HandleItemAsync(item, pendingKey, responseIdForResume, ct)) return new StreamStep(true);
+                    break;
+
+                case StreamingResponseCompletedUpdate completed:
+                    responseIdForResume = completed.Response?.Id ?? responseIdForResume;
+                    if (!string.IsNullOrEmpty(completed.Response?.Id))
+                    {
+                        CurrentResponseIds[pendingKey] = completed.Response.Id;
+                    }
+                    var u = completed.Response?.Usage;
+                    var payload = JsonSerializer.Serialize(new
+                    {
+                        inputTokens  = u?.InputTokenCount  ?? 0,
+                        outputTokens = u?.OutputTokenCount ?? 0,
+                        totalTokens  = u?.TotalTokenCount  ?? 0
+                    });
+                    await WriteSseAsync("done", payload, ct);
+                    break;
+
+                case StreamingResponseFailedUpdate failed:
+                    await WriteSseAsync("error", failed.Response?.Error?.Message ?? "Run failed", ct);
+                    return new StreamStep(true);
+
+                case StreamingResponseErrorUpdate err:
+                    await WriteSseAsync("error", $"{err.Code ?? "error"}: {err.Message ?? "unknown"}", ct);
+                    return new StreamStep(true);
+
+                default:
+                    if (TryParseApprovalEvent(update, responseIdForResume, out var approvalEvent))
+                    {
+                        await EmitApprovalAsync(pendingKey, approvalEvent, ct);
+                        return new StreamStep(true);
+                    }
+                    if (TryParseConsentEvent(update, out var serverLabel, out var link))
+                    {
+                        await WriteSseAsync("consent", JsonSerializer.Serialize(new { serverLabel, consentLink = link }), ct);
+                    }
+                    break;
+            }
+        }
+
+        return sawMcpToolCall || (startedFromApprovalResponse && !sawTextDelta)
+            ? new StreamStep(false)
+            : new StreamStep(true);
     }
 
     private async Task<bool> HandleItemAsync(ResponseItem item, string pendingKey, string? responseIdForResume, CancellationToken ct)

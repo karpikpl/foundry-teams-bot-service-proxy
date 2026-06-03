@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using AgentChat.Controllers;
 using AgentChat.Services;
@@ -87,14 +88,77 @@ public class ChatTestControllerTests
         handler.RequestedProjects.Should().BeEmpty();
     }
 
-    private static ChatTestController MakeController(CatalogHandler handler, bool withHttpContext = false)
+    [Fact]
+    public async Task Approval_resume_chains_with_previous_response_id_and_continues_to_final_output()
     {
-        var service = TestServices.AgentService(handler);
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueSse(
+            ResponseCreated("resp_approval"),
+            "{\"type\":\"response.mcp_approval_requested\",\"approval_request_id\":\"mcpr_1\",\"server_label\":\"srv\",\"tool_name\":\"lookup\",\"tool_arguments\":\"{}\"}",
+            ResponseCompleted("resp_approval"));
+        foundry.EnqueueSse(
+            ResponseCreated("resp_tool_result"),
+            ResponseCompleted("resp_tool_result"));
+        foundry.EnqueueSse(
+            ResponseCreated("resp_final"),
+            TextDelta("tool says ok"),
+            ResponseCompleted("resp_final"));
+        var controller = MakeController(catalog, withHttpContext: true, clientCache: foundry.ToClientCache(service), service: service);
+
+        await controller.StreamMessage(new ChatTestController.MessageRequest("agent-a", "conv-approval", "needs tool"), CancellationToken.None);
+        var first = await ReadResponseAsync(controller);
+        first.Should().Contain("event: approval");
+
+        controller = MakeController(catalog, withHttpContext: true, clientCache: foundry.ToClientCache(service), service: service);
+        await controller.StreamMessage(new ChatTestController.MessageRequest(
+            "agent-a",
+            "conv-approval",
+            null,
+            Approval: new ChatTestController.ApprovalRequest("mcpr_1", true)), CancellationToken.None);
+        var second = await ReadResponseAsync(controller);
+
+        second.Should().Contain("tool says ok");
+        var responseRequests = foundry.Requests.Where(r => r.Method == "POST" && r.Url.Contains("/responses")).ToList();
+        responseRequests.Should().HaveCount(3);
+        responseRequests[0].Body.Should().Contain("conversation");
+        responseRequests[0].Body.Should().Contain("needs tool");
+        responseRequests[1].Body.Should().Contain("previous_response_id");
+        responseRequests[1].Body.Should().Contain("resp_approval");
+        responseRequests[1].Body.Should().Contain("mcp_approval_response");
+        responseRequests[2].Body.Should().Contain("previous_response_id");
+        responseRequests[2].Body.Should().Contain("resp_tool_result");
+    }
+
+    [Fact]
+    public async Task StreamMessage_emits_sse_error_when_foundry_stream_throws()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.BadRequest, "{\"error\":{\"message\":\"bad foundry request\"}}");
+        var controller = MakeController(catalog, withHttpContext: true, clientCache: foundry.ToClientCache(service), service: service);
+
+        await controller.StreamMessage(new ChatTestController.MessageRequest("agent-a", "conv-error", "boom"), CancellationToken.None);
+
+        var sse = await ReadResponseAsync(controller);
+        sse.Should().Contain("event: error");
+        sse.Should().Contain("bad foundry request");
+    }
+
+    private static ChatTestController MakeController(
+        CatalogHandler handler,
+        bool withHttpContext = false,
+        AgentClientCache? clientCache = null,
+        AgentService? service = null)
+    {
+        service ??= TestServices.AgentService(handler);
         var env = new Mock<IWebHostEnvironment>();
         env.SetupGet(e => e.WebRootPath).Returns(TestServices.WebRootPath());
         var controller = new ChatTestController(
             service,
-            new AgentClientCache(service),
+            clientCache ?? new AgentClientCache(service),
             env.Object,
             NullLogger<ChatTestController>.Instance);
 
@@ -106,4 +170,20 @@ public class ChatTestControllerTests
 
         return controller;
     }
+
+    private static async Task<string> ReadResponseAsync(ChatTestController controller)
+    {
+        controller.Response.Body.Position = 0;
+        using var reader = new StreamReader(controller.Response.Body, Encoding.UTF8);
+        return await reader.ReadToEndAsync();
+    }
+
+    private static string ResponseCreated(string id)
+        => $"{{\"type\":\"response.created\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"in_progress\",\"output\":[]}}}}";
+
+    private static string TextDelta(string text)
+        => $"{{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\"}}";
+
+    private static string ResponseCompleted(string id)
+        => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";
 }

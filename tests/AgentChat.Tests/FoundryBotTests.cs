@@ -9,6 +9,7 @@ using Microsoft.Bot.Schema;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using System.Net;
 using Newtonsoft.Json.Linq;
 using Xunit;
 using ConversationState = AgentChat.Bots.ConversationState;
@@ -85,6 +86,85 @@ public class FoundryBotTests
         (await bot.Store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
     }
 
+    [Fact]
+    public async Task Teams_message_sends_user_visible_error_when_foundry_stream_throws()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv_error\"}");
+        foundry.EnqueueJson(HttpStatusCode.BadRequest, "{\"error\":{\"message\":\"bad foundry request\"}}");
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(),
+            new HttpContextAccessor(),
+            foundry.ToClientCache(agents),
+            new FakeSsoService(token: null, enabled: false),
+            NullLogger<FoundryBot>.Instance);
+        var adapter = new TestAdapter();
+        var turn = MakeMessageTurn(adapter, "boom", convId: "conv-teams-error");
+
+        await bot.InvokeAsync(turn);
+
+        adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
+        var errorReply = adapter.GetNextReply().AsMessageActivity().Text;
+        errorReply.Should().Contain("The agent encountered an error");
+        errorReply.Should().Contain("bad foundry request");
+    }
+
+    [Fact]
+    public async Task Signin_token_exchange_replay_calls_foundry_responses_create()
+    {
+        var sso = new FakeSsoService(token: "foundry-user-token");
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv_foundry\"}");
+        foundry.EnqueueSse(
+            ResponseCreated("resp_sso"),
+            TextDelta("replayed"),
+            ResponseCompleted("resp_sso"));
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(),
+            new HttpContextAccessor(),
+            foundry.ToClientCache(agents),
+            sso,
+            NullLogger<FoundryBot>.Instance);
+        var adapter = new TestAdapter();
+        var convId = "conv-sso-foundry";
+        await store.SaveAsync(convId, new ConversationState { PendingSsoMessage = "pending question" });
+
+        var turn = MakeInvokeTurn(adapter, convId, "signin/tokenExchange", JObject.FromObject(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        }));
+
+        await bot.InvokeAsync(turn);
+
+        foundry.Requests.Should().Contain(r => r.Method == "POST" && r.Url.Contains("/responses"));
+        var responsesCreate = foundry.Requests.Single(r => r.Method == "POST" && r.Url.Contains("/responses"));
+        responsesCreate.Body.Should().Contain("pending question");
+        responsesCreate.Body.Should().Contain("conversation");
+        responsesCreate.Body.Should().NotContain("previous_response_id");
+        (await store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
+    }
+
+    private static string ResponseCreated(string id)
+        => $"{{\"type\":\"response.created\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"in_progress\",\"output\":[]}}}}";
+
+    private static string TextDelta(string text)
+        => $"{{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\"}}";
+
+    private static string ResponseCompleted(string id)
+        => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";
+
     private static SpyFoundryBot MakeBot(TeamsSsoService? sso = null)
     {
         var agents = TestServices.AgentService(new CatalogHandler("agent-a"));
@@ -125,6 +205,24 @@ public class FoundryBotTests
         return new TurnContext(adapter, activity);
     }
 
+    private sealed class ExposedFoundryBot : FoundryBot
+    {
+        public ExposedFoundryBot(
+            AgentService agents,
+            ConversationStore state,
+            IConfiguration config,
+            IHttpContextAccessor httpContext,
+            AgentClientCache clientCache,
+            TeamsSsoService sso,
+            ILogger<FoundryBot> logger)
+            : base(agents, state, config, httpContext, clientCache, sso, logger)
+        {
+        }
+
+        public Task InvokeAsync(ITurnContext turnContext)
+            => OnTurnAsync(turnContext, CancellationToken.None);
+    }
+
     private sealed class SpyFoundryBot : FoundryBot
     {
         public ConversationStore Store { get; }
@@ -163,8 +261,10 @@ public class FoundryBotTests
         private readonly string? _token;
         public int ExchangeCalls { get; private set; }
 
-        public FakeSsoService(string? token)
-            : base(TestServices.Config(new KeyValuePair<string, string?>("TeamsSso:ConnectionName", "foundry-oauth")), NullLogger<TeamsSsoService>.Instance)
+        public FakeSsoService(string? token, bool enabled = true)
+            : base(enabled
+                ? TestServices.Config(new KeyValuePair<string, string?>("TeamsSso:ConnectionName", "foundry-oauth"))
+                : TestServices.Config(), NullLogger<TeamsSsoService>.Instance)
         {
             _token = token;
         }

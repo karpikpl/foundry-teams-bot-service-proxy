@@ -27,36 +27,36 @@ public class AdaptiveCardBuilderTests
     }
 
     [Fact]
-    public void ApprovalCard_includes_all_three_actions_with_tool_metadata()
+    public void ApprovalCard_includes_two_submit_actions_with_required_payload_shape()
     {
         var att = AdaptiveCardBuilder.BuildApprovalCard(
             toolName: "search", serverLabel: "microsoft_learn",
             arguments: "{\"q\":\"foundry\"}",
-            approvalRequestId: "appr_123", conversationId: "conv_456");
+            approvalRequestId: "mcpr_123", conversationId: "conv_456");
 
         att.ContentType.Should().Be(AdaptiveCard.ContentType);
         var actions = (JArray)((JObject)att.Content)["actions"]!;
-        actions.Should().HaveCount(3);
+        actions.Should().HaveCount(2);
 
+        actions.Select(a => ((JObject)a["data"]!)["approve"]!.Value<bool>())
+            .Should().BeEquivalentTo(new[] { true, false });
         foreach (var act in actions)
         {
             var data = (JObject)act["data"]!;
-            data["approvalRequestId"]!.ToString().Should().Be("appr_123");
+            data["action"]!.ToString().Should().Be("mcp_approval");
+            data["approval_request_id"]!.ToString().Should().Be("mcpr_123");
             data["conversationId"]!.ToString().Should().Be("conv_456");
-            data["toolName"]!.ToString().Should().Be("search");
-            data["serverLabel"]!.ToString().Should().Be("microsoft_learn");
         }
     }
 
     [Theory]
-    [InlineData("approve",        "Approve")]
-    [InlineData("approve_always", "Always approve")]
-    [InlineData("deny",           "Deny")]
-    public void ApprovalCard_action_titles_match_action_payload(string actionId, string titleContains)
+    [InlineData(true,  "Approve")]
+    [InlineData(false, "Deny")]
+    public void ApprovalCard_action_titles_match_approve_flag(bool approve, string titleContains)
     {
         var att = MakeApproval();
         var actions = (JArray)((JObject)att.Content)["actions"]!;
-        var act = actions.First(a => ((JObject)a["data"]!)["action"]!.ToString() == actionId);
+        var act = actions.First(a => ((JObject)a["data"]!)["approve"]!.Value<bool>() == approve);
         act["title"]!.ToString().Should().Contain(titleContains);
     }
 
@@ -72,8 +72,8 @@ public class AdaptiveCardBuilderTests
     {
         var att = MakeApproval();
         var actions = (JArray)((JObject)att.Content)["actions"]!;
-        var approve = actions.First(a => ((JObject)a["data"]!)["action"]!.ToString() == "approve");
-        var deny    = actions.First(a => ((JObject)a["data"]!)["action"]!.ToString() == "deny");
+        var approve = actions.First(a => ((JObject)a["data"]!)["approve"]!.Value<bool>());
+        var deny    = actions.First(a => !((JObject)a["data"]!)["approve"]!.Value<bool>());
 
         approve["style"]?.ToString().Should().Be("positive");
         deny["style"]?.ToString().Should().Be("destructive");

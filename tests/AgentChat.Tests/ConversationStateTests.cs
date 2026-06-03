@@ -18,6 +18,8 @@ public class ConversationStateTests
         s.AgentEndpoint.Should().BeNull();
         s.CurrentResponseId.Should().BeNull();
         s.PendingConsentResponseId.Should().BeNull();
+        s.PendingApprovalRequestId.Should().BeNull();
+        s.PendingApprovalResponseId.Should().BeNull();
         s.AutoApproveMcpTools.Should().NotBeNull().And.BeEmpty();
         s.ShowUsage.Should().BeFalse();
         s.ShowToolCalls.Should().BeFalse();
@@ -46,6 +48,11 @@ public class ConversationStateTests
             ConversationId    = "conv_abc",
             AgentEndpoint     = "https://aif.example.com/api/projects/p/agents/docs-assistant/endpoint/protocols/openai/v1",
             CurrentResponseId = "resp_123",
+            PendingApprovalRequestId = "mcpr_123",
+            PendingApprovalServerLabel = "srv",
+            PendingApprovalToolName = "tool",
+            PendingApprovalArgumentsSummary = "{}",
+            PendingApprovalResponseId = "resp_pending",
             ShowUsage         = true,
             ShowToolCalls     = true,
             PromptTokensTotal = 1000,
@@ -67,6 +74,8 @@ public class ConversationStateTests
         rt.ConversationId.Should().Be(s.ConversationId);
         rt.AgentEndpoint.Should().Be(s.AgentEndpoint);
         rt.CurrentResponseId.Should().Be(s.CurrentResponseId);
+        rt.PendingApprovalRequestId.Should().Be("mcpr_123");
+        rt.PendingApprovalResponseId.Should().Be("resp_pending");
         rt.ShowUsage.Should().Be(s.ShowUsage);
         rt.ShowToolCalls.Should().Be(s.ShowToolCalls);
         rt.PromptTokensTotal.Should().Be(s.PromptTokensTotal);

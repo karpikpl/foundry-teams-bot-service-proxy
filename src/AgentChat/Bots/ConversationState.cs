@@ -36,6 +36,13 @@ public class ConversationState : IStoreItem
     /// <c>signin/tokenExchange</c> invoke handler.</summary>
     public string? PendingSsoMessage { get; set; }
 
+    /// <summary>MCP tool-call approval request currently awaiting an explicit Approve/Deny click.</summary>
+    public string? PendingApprovalRequestId { get; set; }
+    public string? PendingApprovalServerLabel { get; set; }
+    public string? PendingApprovalToolName { get; set; }
+    public string? PendingApprovalArgumentsSummary { get; set; }
+    public string? PendingApprovalResponseId { get; set; }
+
     // ---- token usage accumulators ----
     public long PromptTokensTotal     { get; set; }
     public long CompletionTokensTotal { get; set; }

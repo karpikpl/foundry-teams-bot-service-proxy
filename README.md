@@ -186,7 +186,7 @@ docker build -t fb:local .
 1. **One `OpenAIClient` per per-agent URL.** Wrapped with two pipeline policies: a bearer-token auth policy that pulls AAD tokens from `TokenCredential` (scope `https://ai.azure.com/.default`), and an api-version policy that appends `?api-version=2025-05-15-preview`.
 2. **Server-side conversations.** First user message creates a Foundry conversation; subsequent turns reuse it. `/reset` deletes it.
 3. **Streaming.** The Foundry Responses API returns standard OpenAI SSE; we forward text deltas to Teams as streaming chunks (via the `streaminfo` Adaptive Card entity protocol).
-4. **MCP approvals.** When the agent wants to call an MCP tool, Foundry emits an `mcp_approval_request` item. The bot either auto-approves (if the user previously hit "Always approve") or shows an Adaptive Card with the tool name + arguments. On click, we POST an `mcp_approval_response` item back and resume the stream.
+4. **MCP approvals.** When the agent wants to call an MCP tool that requires approval, Foundry emits an `mcp_approval_request` item. The bot and `/admin/chat` pause, show an Approve/Deny card, then resume with a `mcp_approval_response` input item chained via `previous_response_id`.
 5. **Function tools.** Same pattern with `function_call` items, dispatched by `FunctionToolDispatcher` (sample implementations: `get_current_time`, `calculate`).
 6. **Per-conversation state in Cosmos.** Just `ConversationId`, `AgentEndpoint`, token counters, and the auto-approve set. ETag-`*` writes (Bot Framework guarantees per-conversation serialization, so last-writer-wins is safe).
 

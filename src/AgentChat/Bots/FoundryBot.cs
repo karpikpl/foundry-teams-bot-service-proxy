@@ -97,6 +97,12 @@ public class FoundryBot : TeamsActivityHandler
             return;
         }
 
+        if (McpApproval.HasPending(state))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(McpApproval.PendingReminder), ct);
+            return;
+        }
+
         await RunAgentTurnAsync(turnContext, state, raw, ct);
     }
 
@@ -329,6 +335,7 @@ public class FoundryBot : TeamsActivityHandler
 
         switch (action)
         {
+            case "mcp_approval":
             case "approve":
             case "deny":
             case "approve_always":
@@ -427,24 +434,27 @@ public class FoundryBot : TeamsActivityHandler
 
     private async Task HandleApprovalSubmitAsync(ITurnContext turnContext, ConversationState state, JObject data, CancellationToken ct)
     {
-        var approvalRequestId = data.Value<string>("approvalRequestId") ?? "";
-        var conversationId    = data.Value<string>("conversationId")    ?? state.ConversationId ?? "";
-        var toolName          = data.Value<string>("toolName")          ?? "";
-        var serverLabel       = data.Value<string>("serverLabel")       ?? "";
-        var action            = data.Value<string>("action")            ?? "";
-        var approve           = action != "deny";
+        var approvalRequestId = data.Value<string>("approval_request_id") ?? data.Value<string>("approvalRequestId") ?? "";
+        var conversationId    = data.Value<string>("conversationId") ?? state.ConversationId ?? "";
+        var action            = data.Value<string>("action") ?? "";
+        var approve           = action == "mcp_approval" ? data.Value<bool?>("approve") ?? false : action != "deny";
 
-        if (action == "approve_always" && !string.IsNullOrEmpty(toolName))
+        if (!McpApproval.HasPending(state) || !string.Equals(state.PendingApprovalRequestId, approvalRequestId, StringComparison.Ordinal))
         {
-            state.AutoApproveMcpTools.Add($"{serverLabel}:{toolName}");
-            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
             await turnContext.SendActivityAsync(MessageFactory.Text(
-                $"🔁 **{toolName}** on **{serverLabel}** will be auto-approved from now on (clear with `/auto clear`)."), ct);
+                "I don't see that pending MCP approval anymore. Type your question to retry."), ct);
+            return;
         }
-        else
+        if (string.IsNullOrEmpty(conversationId))
         {
-            await turnContext.SendActivityAsync(MessageFactory.Text(approve ? "✅ Approved." : "❌ Denied."), ct);
+            McpApproval.Clear(state);
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+            await turnContext.SendActivityAsync(MessageFactory.Text("Conversation state lost — type your question to start over."), ct);
+            return;
         }
+
+        var previousResponseId = state.PendingApprovalResponseId!;
+        await turnContext.SendActivityAsync(MessageFactory.Text(approve ? "✅ Approved." : "❌ Denied."), ct);
 
         var routing = TurnRouting.From(_httpContext, _agents);
         var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(routing.ProjectEndpoint, ct)).Endpoint;
@@ -456,12 +466,14 @@ public class FoundryBot : TeamsActivityHandler
 
         using (auth.Scope)
         {
-            await PostConversationItemsAsync(foundry, conversationId, new[]
-            {
-                ResponseItem.CreateMcpApprovalResponseItem(approvalRequestId, approve)
-            }, ct);
+            var resumeOpts = McpApproval.BuildResumeOptions(conversationId, previousResponseId, approvalRequestId, approve);
 
-            await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+            var sw = Stopwatch.StartNew();
+            var streaming = new StreamingMessageHelper(turnContext);
+            var responses = foundry.OpenAI.GetResponsesClient();
+            var stop = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, resumeOpts, sw, ct);
+            if (!stop) await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+            try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
         }
     }
 
@@ -723,9 +735,11 @@ public class FoundryBot : TeamsActivityHandler
         CancellationToken ct)
     {
         var pendingFunctionCalls = new List<FunctionCallResponseItem>();
-        var pendingApprovals     = new List<McpToolCallApprovalRequestItem>();
+        var pendingApprovals     = new List<PendingMcpApproval>();
         var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
+        var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
+        var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
 
         await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
@@ -734,6 +748,13 @@ public class FoundryBot : TeamsActivityHandler
             {
                 case StreamingResponseCreatedUpdate created:
                     state.CurrentResponseId = created.Response?.Id;
+                    responseIdForResume = created.Response?.Id ?? responseIdForResume;
+                    if (clearsPendingApprovalOnStart && McpApproval.HasPending(state))
+                    {
+                        McpApproval.Clear(state);
+                        await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+                        clearsPendingApprovalOnStart = false;
+                    }
                     break;
 
                 case StreamingResponseOutputTextDeltaUpdate delta when !string.IsNullOrEmpty(delta.Delta):
@@ -743,7 +764,7 @@ public class FoundryBot : TeamsActivityHandler
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
-                        turnContext, state, streaming, done.Item,
+                        turnContext, state, streaming, done.Item, responseIdForResume,
                         pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, ct);
                     break;
 
@@ -751,6 +772,7 @@ public class FoundryBot : TeamsActivityHandler
                     if (completed.Response is { } resp)
                     {
                         state.CurrentResponseId = resp.Id;
+                        responseIdForResume = resp.Id;
                         if (resp.Usage is { } u)
                         {
                             state.LastPromptTokens      = u.InputTokenCount;
@@ -787,7 +809,11 @@ public class FoundryBot : TeamsActivityHandler
                     // care about (oauth_consent_requested, etc.); fall through
                     // to logging the raw payload otherwise so we can spot any
                     // new event types we should handle.
-                    if (TryExtractConsentEvent(update, out var streamConsent))
+                    if (TryExtractApprovalEvent(update, responseIdForResume, out var streamApproval))
+                    {
+                        pendingApprovals.Add(streamApproval);
+                    }
+                    else if (TryExtractConsentEvent(update, out var streamConsent))
                     {
                         pendingConsents.Add(streamConsent);
                     }
@@ -831,41 +857,23 @@ public class FoundryBot : TeamsActivityHandler
             return false;
         }
 
-        // 2) MCP approvals — auto-approve where the user said "always",
-        //    show cards for the rest and pause until the card submit handler resumes us.
+        // 2) MCP approvals — Foundry cannot continue until we send an
+        //    mcp_approval_response input item chained to the response that asked.
         if (pendingApprovals.Count > 0)
         {
             await streaming.FinalizeAsync(ct);
-            var autoItems = new List<ResponseItem>();
-            var needsUser = new List<McpToolCallApprovalRequestItem>();
-            foreach (var req in pendingApprovals)
-            {
-                if (state.AutoApproveMcpTools.Contains($"{req.ServerLabel}:{req.ToolName}"))
-                    autoItems.Add(ResponseItem.CreateMcpApprovalResponseItem(req.Id, true));
-                else
-                    needsUser.Add(req);
-            }
+            var req = pendingApprovals[0];
+            McpApproval.Store(state, req);
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-            if (autoItems.Count > 0 && needsUser.Count == 0)
-            {
-                var names = string.Join(", ", pendingApprovals.Select(r => $"`{r.ToolName}`"));
-                await turnContext.SendActivityAsync(MessageFactory.Text($"🔁 Auto-approved {names} ✓"), ct);
-                await PostConversationItemsAsync(foundry, state.ConversationId!, autoItems, ct);
-                return false;
-            }
-
-            if (autoItems.Count > 0)
-                await PostConversationItemsAsync(foundry, state.ConversationId!, autoItems, ct);
-
-            foreach (var req in needsUser)
-            {
-                var argsStr = req.ToolArguments?.ToString() ?? "{}";
-                await turnContext.SendActivityAsync(
-                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildApprovalCard(
-                        toolName: req.ToolName, serverLabel: req.ServerLabel, arguments: argsStr,
-                        approvalRequestId: req.Id, conversationId: state.ConversationId!)),
-                    ct);
-            }
+            await turnContext.SendActivityAsync(
+                MessageFactory.Attachment(AdaptiveCardBuilder.BuildApprovalCard(
+                    toolName: req.ToolName,
+                    serverLabel: req.ServerLabel,
+                    arguments: req.ArgumentsSummary,
+                    approvalRequestId: req.ApprovalRequestId,
+                    conversationId: state.ConversationId!)),
+                ct);
             return true; // pause for user
         }
 
@@ -909,8 +917,9 @@ public class FoundryBot : TeamsActivityHandler
         ConversationState state,
         StreamingMessageHelper streaming,
         ResponseItem item,
+        string? responseIdForResume,
         List<FunctionCallResponseItem> pendingFunctionCalls,
-        List<McpToolCallApprovalRequestItem> pendingApprovals,
+        List<PendingMcpApproval> pendingApprovals,
         List<PendingConsent> pendingConsents,
         HashSet<string> seenIds,
         CancellationToken ct)
@@ -924,7 +933,7 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             case McpToolCallApprovalRequestItem appr:
-                pendingApprovals.Add(appr);
+                pendingApprovals.Add(McpApproval.FromSdkItem(appr, responseIdForResume ?? state.CurrentResponseId ?? ""));
                 break;
 
             case McpToolCallItem mcp:
@@ -965,7 +974,11 @@ public class FoundryBot : TeamsActivityHandler
                 // the OpenAI SDK doesn't model (oauth_consent_request,
                 // azure_ai_search_call, …) or (b) something brand new. Parse
                 // raw JSON and handle the cases we know about; log the rest.
-                if (TryExtractConsentRequest(item, out var consent))
+                if (TryExtractApprovalRequest(item, responseIdForResume ?? state.CurrentResponseId, out var approval))
+                {
+                    pendingApprovals.Add(approval);
+                }
+                else if (TryExtractConsentRequest(item, out var consent))
                 {
                     pendingConsents.Add(consent);
                 }
@@ -977,6 +990,38 @@ public class FoundryBot : TeamsActivityHandler
 
             // MessageResponseItem and McpToolDefinitionListItem don't need cards;
             // their text is already streamed via output_text deltas.
+        }
+    }
+
+    private bool TryExtractApprovalRequest(ResponseItem item, string? previousResponseId, out PendingMcpApproval approval)
+    {
+        approval = null!;
+        if (string.IsNullOrEmpty(previousResponseId)) return false;
+        try
+        {
+            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(item);
+            using var doc = System.Text.Json.JsonDocument.Parse(bd);
+            return McpApproval.TryParseJson(doc.RootElement, previousResponseId!, out approval);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryExtractApprovalEvent(StreamingResponseUpdate update, string? previousResponseId, out PendingMcpApproval approval)
+    {
+        approval = null!;
+        if (string.IsNullOrEmpty(previousResponseId)) return false;
+        try
+        {
+            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(update);
+            using var doc = System.Text.Json.JsonDocument.Parse(bd);
+            return McpApproval.TryParseJson(doc.RootElement, previousResponseId!, out approval);
+        }
+        catch
+        {
+            return false;
         }
     }
 

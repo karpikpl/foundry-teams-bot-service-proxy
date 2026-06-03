@@ -783,9 +783,18 @@ public class FoundryBot : TeamsActivityHandler
 
                 default:
                     // Unknown / new event type the OpenAI SDK doesn't model yet.
-                    // Log the raw payload so we can spot Foundry adding new event
-                    // types we should handle (e.g. azure_ai_search, bing_grounding).
-                    LogUnknownStreamEvent(update);
+                    // First, try to recognize known Foundry-specific events we
+                    // care about (oauth_consent_requested, etc.); fall through
+                    // to logging the raw payload otherwise so we can spot any
+                    // new event types we should handle.
+                    if (TryExtractConsentEvent(update, out var streamConsent))
+                    {
+                        pendingConsents.Add(streamConsent);
+                    }
+                    else
+                    {
+                        LogUnknownStreamEvent(update);
+                    }
                     break;
             }
         }
@@ -992,6 +1001,40 @@ public class FoundryBot : TeamsActivityHandler
             if (string.IsNullOrEmpty(link)) return false;
 
             var id    = root.TryGetProperty("id",           out var i)  ? i.GetString()  : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+
+            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", link!);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Parse a streaming event the SDK didn't model and recognize Foundry's
+    /// <c>response.oauth_consent_requested</c> event. This is the event-level
+    /// signal (carries <c>item_id</c>, <c>server_label</c>, <c>consent_link</c>);
+    /// it's distinct from the item-level <c>oauth_consent_request</c> shape
+    /// that may appear inside <c>response.output_item.done</c>.
+    /// </summary>
+    private static bool TryExtractConsentEvent(StreamingResponseUpdate update, out PendingConsent consent)
+    {
+        consent = null!;
+        try
+        {
+            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(update);
+            using var doc = System.Text.Json.JsonDocument.Parse(bd);
+            var root = doc.RootElement;
+            var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (!string.Equals(type, "response.oauth_consent_requested", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var link = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
+            if (string.IsNullOrEmpty(link)) return false;
+
+            var id    = root.TryGetProperty("item_id",      out var i)  ? i.GetString()  : null;
             var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
 
             consent = new PendingConsent(id ?? "?", label ?? "(unknown)", link!);

@@ -194,12 +194,35 @@ public class AdaptiveCardBuilderTests
     }
 
     [Fact]
-    public void ConsentCard_has_open_url_action_with_the_consent_link()
+    public void ConsentCard_renders_markdown_link_when_consent_link_is_a_url()
     {
         var att = AdaptiveCardBuilder.BuildConsentCard("srv", "https://consent.example/login?data=abc", "conv_1");
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
-        var openUrl = actions.OfType<JObject>().First(a => a["type"]!.ToString() == "Action.OpenUrl");
-        openUrl["url"]!.ToString().Should().Be("https://consent.example/login?data=abc");
+        var text = string.Join("\n", AllText(att));
+        text.Should().Contain("[🔗 Open consent link](https://consent.example/login?data=abc)");
+    }
+
+    [Fact]
+    public void ConsentCard_extracts_url_from_prose_wrapped_consent_link()
+    {
+        // Foundry has been seen to return values like
+        // "OAuth consent required. Please visit: https://...". The card must
+        // extract the URL into a short clickable markdown link rather than
+        // dumping the 1000-char raw value verbatim.
+        var prose = "OAuth consent required. Please visit: https://consent.example/login?data=xyz";
+        var att = AdaptiveCardBuilder.BuildConsentCard("srv", prose, "conv_1");
+        var text = string.Join("\n", AllText(att));
+        text.Should().Contain("[🔗 Open consent link](https://consent.example/login?data=xyz)");
+        text.Should().NotContain("OAuth consent required. Please visit:");
+    }
+
+    [Fact]
+    public void ConsentCard_falls_back_to_raw_text_when_no_url_present()
+    {
+        // No URL to linkify — show the raw value so the user can at least see
+        // what Foundry sent. Bot must not throw.
+        var att = AdaptiveCardBuilder.BuildConsentCard("srv", "no url here, sorry", "conv_1");
+        att.Content.Should().NotBeNull();
+        AllText(att).Should().Contain(t => t.Contains("no url here"));
     }
 
     [Fact]

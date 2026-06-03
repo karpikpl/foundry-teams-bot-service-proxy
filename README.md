@@ -113,8 +113,35 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 | `BOTSERVICE_UAMI_CLIENTID` | ✅ | UMI client id the JWT middleware validates `aud` against |
 | `AZURE_CLIENT_ID` | optional | If set, `ManagedIdentityCredential` targets this specific UAMI |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | optional | App Insights wiring |
+| `AdminChatAuth__Enabled` | optional | Set `true` to require Entra ID sign-in for `/admin/chat` only |
+| `AdminChatAuth__TenantId` | optional | Tenant for browser chat sign-in; falls back to `TeamsSso__TenantId` |
+| `AdminChatAuth__ClientId` | optional | AAD app client ID; falls back to `TeamsSso__AadAppId` |
+| `AdminChatAuth__ClientSecret` | required when enabled | Client secret for the browser chat confidential client flow |
+| `AdminChatAuth__Instance` | optional | Authority instance; defaults to `https://login.microsoftonline.com/` |
 
 Cosmos is only used for per-conversation bot state. Manifest generation no longer stores bot ↔ agent registrations; operators paste the Bot Service app ID into the inline manifest form.
+
+### Optional: per-user identity for `/admin/chat`
+
+By default, the browser test harness at `/admin/chat` is anonymous and calls Foundry with the proxy's managed identity. In multi-user testing this is unsafe: Foundry does not see the browser user, so MCP OAuth can use whichever token was consented last (often the operator who set up the app). Enable `AdminChatAuth` to make only `/admin/chat` and its chat API endpoints require Microsoft Entra ID sign-in; `/admin`, manifests, `/admin/agents`, `/api/messages`, and `/health` remain anonymous.
+
+Setup:
+
+1. Reuse the Teams SSO AAD app when possible. If `TeamsSso__AadAppId` is already set, leave `AdminChatAuth__ClientId` unset so the app falls back to it.
+2. In the AAD app registration, add a **Web** platform redirect URI: `https://<host>/signin-oidc`.
+3. Ensure the app has delegated permission `https://ai.azure.com/user_impersonation` and grant/admin-consent it as appropriate.
+4. Create a client secret and set `AdminChatAuth__ClientSecret` from App Service settings or Key Vault.
+5. Enable the feature:
+
+```bash
+AdminChatAuth__Enabled=true
+AdminChatAuth__TenantId=<tenant-id>          # optional if TeamsSso__TenantId is set
+AdminChatAuth__ClientId=<aad-app-client-id> # optional if TeamsSso__AadAppId is set
+AdminChatAuth__ClientSecret=<secret>
+AdminChatAuth__Instance=https://login.microsoftonline.com/
+```
+
+When enabled, the signed-in user's token is acquired for `https://ai.azure.com/user_impersonation` on each chat request and sent to Foundry for that request. Workload Identity or managed-credential confidential-client auth could remove the client secret in a future version; v1 uses `ClientSecret` only.
 
 ### Default agent catalog vs. custom
 

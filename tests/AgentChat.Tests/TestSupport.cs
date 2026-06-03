@@ -58,6 +58,8 @@ internal sealed class RecordingFoundryHandler : HttpMessageHandler
 {
     private readonly Queue<Func<HttpRequestMessage, HttpResponseMessage>> _responders = new();
     public List<(string Method, string Url, string Body)> Requests { get; } = new();
+    public List<string?> ObservedUserAuthScopes { get; } = new();
+    public List<string?> AuthorizationHeaders { get; } = new();
 
     public void EnqueueJson(HttpStatusCode status, string json)
         => _responders.Enqueue(_ => new HttpResponseMessage(status)
@@ -90,6 +92,8 @@ internal sealed class RecordingFoundryHandler : HttpMessageHandler
     {
         var body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(cancellationToken);
         Requests.Add((request.Method.Method, request.RequestUri!.ToString(), body));
+        ObservedUserAuthScopes.Add(FoundryUserAuthScope.Current);
+        AuthorizationHeaders.Add(request.Headers.Authorization?.ToString());
         if (_responders.Count == 0)
         {
             return new HttpResponseMessage(HttpStatusCode.NotFound)
@@ -105,6 +109,7 @@ internal sealed class CatalogHandler : HttpMessageHandler
 {
     private readonly IReadOnlyList<string> _agentNames;
     public List<string> RequestedProjects { get; } = new();
+    public List<string?> ObservedUserAuthScopes { get; } = new();
 
     public CatalogHandler(params string[] agentNames)
     {
@@ -117,6 +122,7 @@ internal sealed class CatalogHandler : HttpMessageHandler
         var marker = "/agents?";
         var idx = url.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
         RequestedProjects.Add(idx < 0 ? url : url[..idx]);
+        ObservedUserAuthScopes.Add(FoundryUserAuthScope.Current);
 
         var data = string.Join(",", _agentNames.Select(name => $$"""
         {

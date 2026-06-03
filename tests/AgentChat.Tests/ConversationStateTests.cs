@@ -17,6 +17,7 @@ public class ConversationStateTests
         s.ConversationId.Should().BeNull();
         s.AgentEndpoint.Should().BeNull();
         s.CurrentResponseId.Should().BeNull();
+        s.PendingConsentResponseId.Should().BeNull();
         s.AutoApproveMcpTools.Should().NotBeNull().And.BeEmpty();
         s.ShowUsage.Should().BeFalse();
         s.ShowToolCalls.Should().BeFalse();

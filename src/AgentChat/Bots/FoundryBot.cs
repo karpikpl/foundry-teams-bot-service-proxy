@@ -334,12 +334,84 @@ public class FoundryBot : TeamsActivityHandler
             case "select_agent":
                 await HandleAgentSelectAsync(turnContext, state, data, ct);
                 break;
+            case "consent_continue":
+                await HandleConsentContinueAsync(turnContext, state, ct);
+                break;
+            case "consent_cancel":
+                state.PendingConsentResponseId = null;
+                await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    "❌ Sign-in cancelled. Type your question again to retry."), ct);
+                break;
             case "cancel":
                 await CancelCurrentRunAsync(turnContext, state, ct);
                 break;
             default:
                 _logger.LogWarning("Unknown card action: {Action}", action);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// User clicked "I've signed in" on a consent card. Re-stream the previously
+    /// paused response by passing <c>previous_response_id</c>; Foundry will
+    /// retry the MCP tool call using the now-cached user credential.
+    /// </summary>
+    private async Task HandleConsentContinueAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(state.PendingConsentResponseId))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "I don't see a pending sign-in for this conversation. Type your question to start over."), ct);
+            return;
+        }
+        if (string.IsNullOrEmpty(state.ConversationId))
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text("Conversation state lost — type your question to start over."), ct);
+            state.PendingConsentResponseId = null;
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+            return;
+        }
+
+        var routing  = TurnRouting.From(_httpContext, _agents);
+        var foundry  = _clientCache.For(state.AgentEndpoint ?? routing.AgentEndpoint);
+
+        // The streaming loop builds CreateResponseOptions per iteration; we need
+        // the first one to include PreviousResponseId. The simplest way is a
+        // one-shot override: drain the response with previous_response_id set,
+        // then resume the regular loop for any subsequent follow-ups.
+        var sw         = Stopwatch.StartNew();
+        var streaming  = new StreamingMessageHelper(turnContext);
+        await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = Microsoft.Bot.Schema.ActivityTypes.Typing }, ct);
+
+        try
+        {
+            var resumeOpts = new CreateResponseOptions
+            {
+                ConversationOptions = new ResponseConversationOptions(state.ConversationId!),
+                PreviousResponseId  = state.PendingConsentResponseId!,
+                StreamingEnabled    = true,
+            };
+
+            // Clear the pending marker BEFORE the call so a failed retry doesn't
+            // cause an infinite "I've signed in" loop.
+            state.PendingConsentResponseId = null;
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+
+            var responses = foundry.OpenAI.GetResponsesClient();
+            var stop = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, resumeOpts, sw, ct);
+            if (stop) return;
+
+            // If the agent has further tool calls / approvals queued after the
+            // resume, drop into the regular loop.
+            await StreamResponseLoopAsync(turnContext, state, foundry, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Resume-after-consent failed");
+            try { await streaming.FinalizeAsync(ct); } catch { /* swallow */ }
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "⚠️ Couldn't resume after sign-in: " + ex.Message), ct);
         }
     }
 
@@ -524,6 +596,9 @@ public class FoundryBot : TeamsActivityHandler
         }
     }
 
+    /// <summary>Pending OAuth consent request surfaced by Foundry's MCP passthrough.</summary>
+    private sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
+
     /// <returns>True when the loop should stop (success, error, or paused for user).</returns>
     private async Task<bool> ProcessStreamAsync(
         ITurnContext turnContext,
@@ -537,6 +612,7 @@ public class FoundryBot : TeamsActivityHandler
     {
         var pendingFunctionCalls = new List<FunctionCallResponseItem>();
         var pendingApprovals     = new List<McpToolCallApprovalRequestItem>();
+        var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
         bool hadError = false;
 
@@ -555,7 +631,8 @@ public class FoundryBot : TeamsActivityHandler
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
-                        turnContext, state, streaming, done.Item, pendingFunctionCalls, pendingApprovals, seenIds, ct);
+                        turnContext, state, streaming, done.Item,
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -671,6 +748,26 @@ public class FoundryBot : TeamsActivityHandler
             return true; // pause for user
         }
 
+        // 2b) OAuth consent — Foundry's MCP identity passthrough wants the user to
+        //     sign in to the MCP server. Show a card with the consent link;
+        //     resume via card submit (consent_continue), which retries this
+        //     same response with previous_response_id.
+        if (pendingConsents.Count > 0)
+        {
+            await streaming.FinalizeAsync(ct);
+            state.PendingConsentResponseId = state.CurrentResponseId;
+            await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+
+            foreach (var c in pendingConsents)
+            {
+                await turnContext.SendActivityAsync(
+                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildConsentCard(
+                        serverLabel: c.ServerLabel, consentLink: c.ConsentLink, conversationId: state.ConversationId!)),
+                    ct);
+            }
+            return true; // pause for user
+        }
+
         // 3) Done — emit usage card if enabled.
         await streaming.FinalizeAsync(ct);
         if (state.ShowUsage && state.LastTotalTokens > 0)
@@ -693,6 +790,7 @@ public class FoundryBot : TeamsActivityHandler
         ResponseItem item,
         List<FunctionCallResponseItem> pendingFunctionCalls,
         List<McpToolCallApprovalRequestItem> pendingApprovals,
+        List<PendingConsent> pendingConsents,
         HashSet<string> seenIds,
         CancellationToken ct)
     {
@@ -742,14 +840,54 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             default:
-                // Unknown item type — e.g. a Foundry-specific tool call the
-                // OpenAI SDK doesn't know yet (azure_ai_search_call, etc.).
-                // Log the raw payload so we can decide whether to render it.
-                LogUnknownItem(item);
+                // Unknown item type — could be (a) a Foundry-specific item kind
+                // the OpenAI SDK doesn't model (oauth_consent_request,
+                // azure_ai_search_call, …) or (b) something brand new. Parse
+                // raw JSON and handle the cases we know about; log the rest.
+                if (TryExtractConsentRequest(item, out var consent))
+                {
+                    pendingConsents.Add(consent);
+                }
+                else
+                {
+                    LogUnknownItem(item);
+                }
                 break;
 
             // MessageResponseItem and McpToolDefinitionListItem don't need cards;
             // their text is already streamed via output_text deltas.
+        }
+    }
+
+    /// <summary>
+    /// Parse a base ResponseItem the SDK didn't model and recognize the
+    /// Foundry-specific <c>oauth_consent_request</c> shape. Returns true and
+    /// fills <paramref name="consent"/> on match.
+    /// </summary>
+    private static bool TryExtractConsentRequest(ResponseItem item, out PendingConsent consent)
+    {
+        consent = null!;
+        try
+        {
+            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(item);
+            using var doc = System.Text.Json.JsonDocument.Parse(bd);
+            var root = doc.RootElement;
+            var type = root.TryGetProperty("type", out var t) ? t.GetString() : null;
+            if (!string.Equals(type, "oauth_consent_request", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            var link = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
+            if (string.IsNullOrEmpty(link)) return false;
+
+            var id    = root.TryGetProperty("id",           out var i)  ? i.GetString()  : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+
+            consent = new PendingConsent(id ?? "?", label ?? "(unknown)", link!);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 

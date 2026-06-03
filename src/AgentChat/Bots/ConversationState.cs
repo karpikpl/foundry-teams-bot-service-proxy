@@ -27,6 +27,10 @@ public class ConversationState : IStoreItem
     /// <summary>Response id currently executing — used for cancellation marker.</summary>
     public string? CurrentResponseId { get; set; }
 
+    /// <summary>Response id used for resuming after OAuth consent. Set when a
+    /// pending consent card was shown; cleared on the next user reply.</summary>
+    public string? PendingConsentResponseId { get; set; }
+
     // ---- token usage accumulators ----
     public long PromptTokensTotal     { get; set; }
     public long CompletionTokensTotal { get; set; }

@@ -5,6 +5,7 @@ using AgentChat.Foundry;
 using AgentChat.Services;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Teams;
+using Microsoft.Bot.Connector.Authentication;
 using Microsoft.Bot.Schema;
 using Newtonsoft.Json.Linq;
 using OpenAI.Responses;
@@ -75,7 +76,7 @@ public class FoundryBot : TeamsActivityHandler
         ITurnContext<IMessageActivity> turnContext,
         CancellationToken ct)
     {
-        if (turnContext.Activity.Value is not null)
+        if (turnContext.Activity.Value is not null && IsKnownCardSubmit(turnContext.Activity.Value))
         {
             await HandleCardSubmitAsync(turnContext, ct);
             return;
@@ -85,7 +86,14 @@ public class FoundryBot : TeamsActivityHandler
             turnContext.Activity.RemoveRecipientMention();
 
         var raw = (turnContext.Activity.Text ?? "").Trim();
-        if (string.IsNullOrEmpty(raw)) return;
+        if (string.IsNullOrEmpty(raw))
+        {
+            if (turnContext.Activity.Value is not null)
+            {
+                _logger.LogWarning("Ignoring message activity with non-card value payload and no text.");
+            }
+            return;
+        }
 
         var convId = turnContext.Activity.Conversation.Id;
         var state  = await _state.GetOrCreateAsync(convId, ct);
@@ -96,6 +104,8 @@ public class FoundryBot : TeamsActivityHandler
             await HandleCommandAsync(turnContext, state, raw, ct);
             return;
         }
+
+        await SendTypingAsync(turnContext, ct);
 
         if (McpApproval.HasPending(state))
         {
@@ -325,6 +335,26 @@ public class FoundryBot : TeamsActivityHandler
     }
 
     // ---------------------------------------------------------------- card submit
+
+    private static readonly HashSet<string> KnownCardActions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "mcp_approval", "approve", "deny", "approve_always",
+        "select_agent", "consent_continue", "consent_cancel", "cancel"
+    };
+
+    private static bool IsKnownCardSubmit(object value)
+    {
+        try
+        {
+            var data = value as JObject ?? JObject.FromObject(value);
+            var action = data.Value<string>("action");
+            return !string.IsNullOrWhiteSpace(action) && KnownCardActions.Contains(action);
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     private async Task HandleCardSubmitAsync(ITurnContext turnContext, CancellationToken ct)
     {
@@ -610,9 +640,16 @@ public class FoundryBot : TeamsActivityHandler
             ct);
     }
 
-    private async Task RunAgentTurnAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct)
+    protected virtual async Task RunAgentTurnAsync(
+        ITurnContext turnContext,
+        ConversationState state,
+        string userText,
+        CancellationToken ct,
+        string? userTokenOverride = null)
     {
-        var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct);
+        var auth = string.IsNullOrEmpty(userTokenOverride)
+            ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct)
+            : new UserAuth(FoundryUserAuthScope.Use(userTokenOverride), false);
         if (!auth.ShouldProceed) return;
 
         using (auth.Scope)
@@ -683,7 +720,6 @@ public class FoundryBot : TeamsActivityHandler
     {
         var sw         = Stopwatch.StartNew();
         var streaming  = new StreamingMessageHelper(turnContext);
-        await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = ActivityTypes.Typing }, ct);
 
         var responses = foundry.OpenAI.GetResponsesClient();
 
@@ -1147,6 +1183,9 @@ public class FoundryBot : TeamsActivityHandler
     /// we serialize each <see cref="ResponseItem"/> using its IJsonModel writer
     /// so all the discriminator + nested-shape work is handled by the SDK.
     /// </summary>
+    private static Task<ResourceResponse> SendTypingAsync(ITurnContext turnContext, CancellationToken ct)
+        => turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = ActivityTypes.Typing }, ct);
+
     private static async Task PostConversationItemsAsync(
         Foundry.FoundryClient foundry,
         string conversationId,
@@ -1178,29 +1217,60 @@ public class FoundryBot : TeamsActivityHandler
     /// <summary>
     /// Called by Bot Framework when an invoke activity with name
     /// <c>signin/verifyState</c> or <c>signin/tokenExchange</c> arrives —
-    /// Teams' SSO flow. We just confirm the token is now cached, then replay
-    /// the user's pending message (if we stored one) so the original turn
-    /// resumes seamlessly.
+    /// Teams' SSO flow. We complete token exchange when Teams supplied one,
+    /// then replay the user's pending message (if we stored one) so the
+    /// original turn resumes seamlessly.
     /// </summary>
+    private async Task<TokenResponse?> ResolveSignInTokenAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken ct)
+    {
+        if (string.Equals(turnContext.Activity.Name, "signin/tokenExchange", StringComparison.OrdinalIgnoreCase)
+            && turnContext.Activity.Value is not null)
+        {
+            try
+            {
+                var data = turnContext.Activity.Value as JObject ?? JObject.FromObject(turnContext.Activity.Value);
+                var request = data.ToObject<TokenExchangeRequest>();
+                if (request is not null)
+                {
+                    var exchanged = await _sso.ExchangeTokenAsync(turnContext, request, ct);
+                    if (exchanged is not null && !string.IsNullOrEmpty(exchanged.Token))
+                    {
+                        _logger.LogInformation("Teams signin/tokenExchange completed for user {UserId}.", turnContext.Activity.From?.Id);
+                        return exchanged;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to parse or complete Teams signin/tokenExchange invoke.");
+            }
+        }
+
+        return await _sso.TryGetUserTokenAsync(turnContext, ct);
+    }
+
     protected override async Task OnSignInInvokeAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
     {
         var state = await _state.GetOrCreateAsync(turnContext.Activity.Conversation.Id, cancellationToken);
         await _state.TouchAsync(turnContext.Activity.Conversation.Id, turnContext.Activity.GetConversationReference(), cancellationToken);
 
-        // Confirm the token is now cached server-side. If not, the user's
-        // sign-in didn't complete successfully.
-        var token = await _sso.TryGetUserTokenAsync(turnContext, cancellationToken);
+        _logger.LogInformation("Handling Teams sign-in invoke {InvokeName}; pending SSO message present: {HasPending}.",
+            turnContext.Activity.Name, !string.IsNullOrEmpty(state.PendingSsoMessage));
+
+        var token = await ResolveSignInTokenAsync(turnContext, cancellationToken);
         if (token is null || string.IsNullOrEmpty(token.Token))
         {
+            _logger.LogWarning("Teams sign-in invoke {InvokeName} did not produce a user token.", turnContext.Activity.Name);
             await turnContext.SendActivityAsync(MessageFactory.Text(
                 "⚠️ Sign-in didn't complete. Try again or contact your admin."), cancellationToken);
             return;
         }
 
-        // Replay the user's pending message, if we saved one.
         var pending = state.PendingSsoMessage;
         if (string.IsNullOrEmpty(pending))
         {
+            _logger.LogInformation("Teams sign-in completed but no pending SSO message was stored for conversation {ConversationId}.",
+                turnContext.Activity.Conversation.Id);
             await turnContext.SendActivityAsync(MessageFactory.Text(
                 "✅ Signed in. Send your message to start the conversation."), cancellationToken);
             return;
@@ -1209,9 +1279,9 @@ public class FoundryBot : TeamsActivityHandler
         state.PendingSsoMessage = null;
         await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, cancellationToken);
 
-        // We're inside an invoke turn — replay the message as if the user just
-        // typed it. The TryAcquireUserAuthAsync inside RunAgentTurnAsync will
-        // now succeed silently because the token is cached.
-        await RunAgentTurnAsync(turnContext, state, pending, cancellationToken);
+        _logger.LogInformation("Replaying pending Teams SSO message for conversation {ConversationId}.",
+            turnContext.Activity.Conversation.Id);
+        await SendTypingAsync(turnContext, cancellationToken);
+        await RunAgentTurnAsync(turnContext, state, pending, cancellationToken, userTokenOverride: token.Token);
     }
 }

@@ -29,7 +29,7 @@ namespace AgentChat.Services;
 /// When SSO is disabled or returns no token, callers fall back to whatever
 /// app-identity behavior they had before.
 /// </summary>
-public sealed class TeamsSsoService
+public class TeamsSsoService
 {
     private readonly ILogger<TeamsSsoService> _logger;
     private readonly string? _connectionName;
@@ -56,7 +56,7 @@ public sealed class TeamsSsoService
     /// user. Returns null when SSO is disabled, the bot hasn't been signed in
     /// yet, or the token service can't issue one (e.g. consent missing).
     /// </summary>
-    public async Task<TokenResponse?> TryGetUserTokenAsync(ITurnContext turnContext, CancellationToken ct = default)
+    public virtual async Task<TokenResponse?> TryGetUserTokenAsync(ITurnContext turnContext, CancellationToken ct = default)
     {
         if (!Enabled) return null;
 
@@ -90,7 +90,7 @@ public sealed class TeamsSsoService
     /// Called when <see cref="TryGetUserTokenAsync"/> returned null and we
     /// need to prompt the user to sign in.
     /// </summary>
-    public async Task<SignInResource?> GetSignInResourceAsync(ITurnContext turnContext, CancellationToken ct = default)
+    public virtual async Task<SignInResource?> GetSignInResourceAsync(ITurnContext turnContext, CancellationToken ct = default)
     {
         if (!Enabled) return null;
 
@@ -118,7 +118,7 @@ public sealed class TeamsSsoService
     /// exchange it for an OBO'd token via the Bot Service token service).
     /// Returns null when the exchange fails (caller surfaces an error).
     /// </summary>
-    public async Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
+    public virtual async Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
     {
         if (!Enabled) return null;
 
@@ -145,7 +145,7 @@ public sealed class TeamsSsoService
     /// Sign the user out of the bot's OAuth connection. Useful for a
     /// <c>/signout</c> command when consent needs to be re-requested.
     /// </summary>
-    public async Task SignOutAsync(ITurnContext turnContext, CancellationToken ct = default)
+    public virtual async Task SignOutAsync(ITurnContext turnContext, CancellationToken ct = default)
     {
         if (!Enabled) return;
         var userTokenClient = turnContext.TurnState.Get<UserTokenClient>();

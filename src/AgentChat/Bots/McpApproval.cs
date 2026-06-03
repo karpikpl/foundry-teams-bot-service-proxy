@@ -70,9 +70,15 @@ public static class McpApproval
 
     public static CreateResponseOptions BuildResumeOptions(string conversationId, string previousResponseId, string approvalRequestId, bool approve)
     {
+        // NOTE: Foundry rejects requests that set both `previous_response_id`
+        // and `conversation` ("Cannot provide both 'previous_response_id' and
+        // 'conversation' in the same request"). PreviousResponseId implicitly
+        // carries the bound conversation, so only set that here.
+        // conversationId is accepted for signature compatibility but
+        // intentionally not passed to the request.
+        _ = conversationId;
         var opts = new CreateResponseOptions
         {
-            ConversationOptions = new ResponseConversationOptions(conversationId),
             PreviousResponseId = previousResponseId,
             StreamingEnabled = true
         };

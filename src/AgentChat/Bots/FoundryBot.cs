@@ -1,6 +1,7 @@
 using System.ClientModel;
 using System.Diagnostics;
 using System.Text.Json;
+using AgentChat.Foundry;
 using AgentChat.Services;
 using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Teams;
@@ -126,15 +127,17 @@ public class FoundryBot : TeamsActivityHandler
 
             case "/agents":
             {
-                var forceRefresh = parts.Length > 1 && parts[1].Trim().Equals("refresh", StringComparison.OrdinalIgnoreCase);
-                var catalog      = await _agents.GetDescriptorsAsync(forceRefresh: forceRefresh, ct: ct);
+                var forceRefresh    = parts.Length > 1 && parts[1].Trim().Equals("refresh", StringComparison.OrdinalIgnoreCase);
+                var routing         = TurnRouting.From(_httpContext, _agents);
+                var projectEndpoint = ProjectEndpointForTurn(state, routing);
+                var catalog         = await _agents.GetDescriptorsAsync(projectEndpoint, forceRefresh: forceRefresh, ct: ct);
                 if (catalog.Count == 0)
                 {
                     await turnContext.SendActivityAsync(MessageFactory.Text(
-                        "No agents are available in the configured Foundry project. Create one in Foundry first, then `/agents refresh`."), ct);
+                        "No agents are available in this Foundry project. Create one in Foundry first, then `/agents refresh`."), ct);
                     break;
                 }
-                var currentKey = await _agents.FindKeyForEndpointAsync(state.AgentEndpoint, ct);
+                var currentKey = await _agents.FindKeyForEndpointAsync(state.AgentEndpoint, projectEndpoint, ct);
                 await turnContext.SendActivityAsync(
                     MessageFactory.Attachment(AdaptiveCardBuilder.BuildAgentPickerCard(catalog, currentKey)),
                     ct);
@@ -171,6 +174,12 @@ public class FoundryBot : TeamsActivityHandler
                 break;
         }
     }
+
+
+    private string ProjectEndpointForTurn(ConversationState state, TurnRouting routing)
+        => FoundryAgentsApi.ProjectEndpointFor(state.AgentEndpoint)
+           ?? routing.ProjectEndpoint
+           ?? _agents.DefaultProjectEndpoint;
 
     private async Task ResetConversationAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
     {
@@ -282,8 +291,10 @@ public class FoundryBot : TeamsActivityHandler
 
     private async Task HandleAgentInfoCommandAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
     {
-        var endpoint = state.AgentEndpoint ?? _agents.DefaultEndpoint;
-        var catalog  = await _agents.GetDescriptorsAsync(ct: ct);
+        var routing = TurnRouting.From(_httpContext, _agents);
+        var projectEndpoint = ProjectEndpointForTurn(state, routing);
+        var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(projectEndpoint, ct)).Endpoint;
+        var catalog  = await _agents.GetDescriptorsAsync(projectEndpoint, ct: ct);
         var desc     = catalog.FirstOrDefault(d => string.Equals(d.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase));
         var facts = new List<(string, string)>
         {
@@ -353,7 +364,8 @@ public class FoundryBot : TeamsActivityHandler
             await turnContext.SendActivityAsync(MessageFactory.Text(approve ? "✅ Approved." : "❌ Denied."), ct);
         }
 
-        var endpoint = state.AgentEndpoint ?? _agents.DefaultEndpoint;
+        var routing = TurnRouting.From(_httpContext, _agents);
+        var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(routing.ProjectEndpoint, ct)).Endpoint;
         var foundry  = _clientCache.For(endpoint);
 
         await PostConversationItemsAsync(foundry, conversationId, new[]
@@ -372,7 +384,9 @@ public class FoundryBot : TeamsActivityHandler
             await turnContext.SendActivityAsync(MessageFactory.Text("Pick an agent first."), ct);
             return;
         }
-        var agent = await _agents.FindByKeyAsync(key!, ct);
+        var routing = TurnRouting.From(_httpContext, _agents);
+        var projectEndpoint = ProjectEndpointForTurn(state, routing);
+        var agent = await _agents.FindByKeyAsync(key!, projectEndpoint, ct);
         if (agent is null)
         {
             await turnContext.SendActivityAsync(MessageFactory.Text(
@@ -414,7 +428,9 @@ public class FoundryBot : TeamsActivityHandler
     private async Task RunAgentTurnAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct)
     {
         var routing = TurnRouting.From(_httpContext, _agents);
-        var targetEndpoint = routing.AgentEndpoint;
+        var targetEndpoint = routing.IsRouted
+            ? routing.AgentEndpoint
+            : state.AgentEndpoint ?? (await _agents.DefaultAsync(routing.ProjectEndpoint, ct)).Endpoint;
 
         // Endpoint switch wipes the bound Foundry conversation.
         if (!string.Equals(state.AgentEndpoint, targetEndpoint, StringComparison.OrdinalIgnoreCase))

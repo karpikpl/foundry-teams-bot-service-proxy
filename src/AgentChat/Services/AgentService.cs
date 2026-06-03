@@ -1,92 +1,125 @@
+using System.Collections.Concurrent;
 using AgentChat.Foundry;
 using Azure.Core;
 
 namespace AgentChat.Services;
 
 /// <summary>
-/// Owns the Foundry project endpoint, the shared <see cref="TokenCredential"/>,
-/// and a 5-minute cached snapshot of the agents currently exposed by that
-/// project. The picker, /agents command, manifest UI, and default-agent
-/// selection all read from <see cref="GetDescriptorsAsync"/>.
+/// Per-request agent catalog provider.
 ///
-/// Two HTTP-cheap operations gate everything:
-///   - <see cref="FoundryAgentsApi.ListAgentsAsync"/> for the project
-///   - One token acquisition via the supplied credential
+/// AgentService no longer owns a single project — it caches a catalog per
+/// Foundry project endpoint. Every public method accepts an optional
+/// <c>projectEndpoint</c>; when omitted, the configured default
+/// (<see cref="DefaultProjectEndpoint"/>) is used. URL-routed turns pass the
+/// per-turn project endpoint resolved by
+/// <see cref="Bots.TurnRouting.ProjectEndpoint"/>.
 ///
-/// Backward-compat: the historical <c>Foundry:ProjectEndpoint</c> setting is
-/// kept; the agent catalog is no longer configured statically.
+/// Caches are keyed by project endpoint with a shared TTL configured via
+/// <c>Foundry:CatalogCacheSeconds</c> (default 300s).
 /// </summary>
 public class AgentService
 {
     private readonly ILogger<AgentService> _logger;
     private readonly TokenCredential _credential;
     private readonly IHttpClientFactory _httpFactory;
-    private readonly string _projectEndpoint;
+    private readonly string _defaultProjectEndpoint;
     private readonly TimeSpan _cacheTtl;
 
-    /// <summary>
-    /// One agent exposed to the bot. Identity = per-agent endpoint URL.
-    /// </summary>
-    /// <param name="Key">Short key used by /agents picker submits (auto-derived from name).</param>
-    /// <param name="Name">Agent name as it lives in Foundry.</param>
-    /// <param name="Description">User-facing description (from Foundry metadata).</param>
-    /// <param name="Endpoint">Per-agent endpoint URL the bot drives.</param>
     public record AgentDescriptor(string Key, string Name, string Description, string Endpoint);
 
-    // Snapshot cache. Refreshed lazily when expired or on /agents refresh.
-    private IReadOnlyList<AgentDescriptor> _cached = Array.Empty<AgentDescriptor>();
-    private DateTime _cachedAtUtc = DateTime.MinValue;
-    private readonly SemaphoreSlim _refreshLock = new(1, 1);
+    private sealed class CatalogEntry
+    {
+        public IReadOnlyList<AgentDescriptor> Descriptors { get; set; } = Array.Empty<AgentDescriptor>();
+        public DateTime CachedAtUtc { get; set; } = DateTime.MinValue;
+        public SemaphoreSlim Lock { get; } = new(1, 1);
+    }
 
-    public TokenCredential Credential => _credential;
-    public string ProjectEndpoint     => _projectEndpoint;
-    public string DefaultEndpoint     => _cached.FirstOrDefault()?.Endpoint
-                                        ?? FoundryAgentsApi.ComposeAgentEndpoint(_projectEndpoint, "default");
+    private readonly ConcurrentDictionary<string, CatalogEntry> _byProject =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public TokenCredential Credential        => _credential;
+    public string DefaultProjectEndpoint     => _defaultProjectEndpoint;
 
     public AgentService(ILogger<AgentService> logger, IConfiguration config, IHttpClientFactory httpFactory)
+        : this(logger, config, httpFactory, new Azure.Identity.DefaultAzureCredential(new Azure.Identity.DefaultAzureCredentialOptions
+        {
+            ManagedIdentityClientId = config["AZURE_CLIENT_ID"]
+        }))
+    {
+    }
+
+    public AgentService(ILogger<AgentService> logger, IConfiguration config, IHttpClientFactory httpFactory, TokenCredential credential)
     {
         _logger      = logger;
         _httpFactory = httpFactory;
+        _credential  = credential;
 
         var endpoint = config["Foundry:ProjectEndpoint"]
             ?? throw new InvalidOperationException("Foundry:ProjectEndpoint not configured");
-        _projectEndpoint = endpoint.TrimEnd('/');
+        _defaultProjectEndpoint = endpoint.TrimEnd('/');
 
         var ttlSeconds = config.GetValue("Foundry:CatalogCacheSeconds", 300);
         _cacheTtl = TimeSpan.FromSeconds(Math.Max(0, ttlSeconds));
-
-        _credential = new Azure.Identity.DefaultAzureCredential(new Azure.Identity.DefaultAzureCredentialOptions
-        {
-            ManagedIdentityClientId = config["AZURE_CLIENT_ID"]
-        });
     }
 
     /// <summary>
-    /// Return the current agent catalog (cached snapshot). Refreshes if the
-    /// cache is stale; <paramref name="forceRefresh"/> bypasses the TTL.
+    /// Resolve the project endpoint to use for a call: explicit argument if
+    /// non-empty, else the configured default. Normalized (trailing slash stripped).
+    /// </summary>
+    public string ResolveProject(string? projectEndpoint)
+        => string.IsNullOrEmpty(projectEndpoint)
+            ? _defaultProjectEndpoint
+            : projectEndpoint!.TrimEnd('/');
+
+    /// <summary>
+    /// Default per-agent endpoint, for callers that need a non-null URL before
+    /// the catalog is fetched (e.g. <c>/agent</c> info on first turn). Returns
+    /// a synthetic <c>/agents/default/...</c> URL — replaced by the real first
+    /// agent's endpoint once <see cref="GetDescriptorsAsync"/> populates.
+    /// </summary>
+    public string DefaultEndpoint
+    {
+        get
+        {
+            if (_byProject.TryGetValue(_defaultProjectEndpoint, out var cached)
+                && cached.Descriptors.Count > 0)
+            {
+                return cached.Descriptors[0].Endpoint;
+            }
+            return FoundryAgentsApi.ComposeAgentEndpoint(_defaultProjectEndpoint, "default");
+        }
+    }
+
+    /// <summary>
+    /// Return the agent catalog for a project. Uses the cached snapshot when
+    /// fresh; refreshes on TTL expiry or when <paramref name="forceRefresh"/>
+    /// is true. <paramref name="projectEndpoint"/> null = the configured default.
     /// </summary>
     public async Task<IReadOnlyList<AgentDescriptor>> GetDescriptorsAsync(
-        bool forceRefresh = false, CancellationToken ct = default)
+        string? projectEndpoint = null, bool forceRefresh = false, CancellationToken ct = default)
     {
+        var project = ResolveProject(projectEndpoint);
+        var entry   = _byProject.GetOrAdd(project, _ => new CatalogEntry());
+
         if (!forceRefresh
-            && _cached.Count > 0
-            && DateTime.UtcNow - _cachedAtUtc < _cacheTtl)
+            && entry.Descriptors.Count > 0
+            && DateTime.UtcNow - entry.CachedAtUtc < _cacheTtl)
         {
-            return _cached;
+            return entry.Descriptors;
         }
 
-        await _refreshLock.WaitAsync(ct);
+        await entry.Lock.WaitAsync(ct);
         try
         {
             if (!forceRefresh
-                && _cached.Count > 0
-                && DateTime.UtcNow - _cachedAtUtc < _cacheTtl)
+                && entry.Descriptors.Count > 0
+                && DateTime.UtcNow - entry.CachedAtUtc < _cacheTtl)
             {
-                return _cached;
+                return entry.Descriptors;
             }
 
             var http     = _httpFactory.CreateClient("foundry-agents");
-            var agents   = await FoundryAgentsApi.ListAgentsAsync(http, _projectEndpoint, _credential, ct);
+            var agents   = await FoundryAgentsApi.ListAgentsAsync(http, project, _credential, ct);
             var snapshot = agents
                 .Where(a => a.IsActive)
                 .Select(a => new AgentDescriptor(
@@ -95,52 +128,57 @@ public class AgentService
                     Description: string.IsNullOrWhiteSpace(a.Description)
                                 ? (a.Model is null ? "Foundry agent" : $"Foundry agent ({a.Model})")
                                 : a.Description,
-                    Endpoint:    FoundryAgentsApi.ComposeAgentEndpoint(_projectEndpoint, a.Name)))
+                    Endpoint:    FoundryAgentsApi.ComposeAgentEndpoint(project, a.Name)))
                 .ToList();
 
-            _cached      = snapshot;
-            _cachedAtUtc = DateTime.UtcNow;
-            _logger.LogInformation("Refreshed agent catalog: {Count} agent(s) from {Endpoint}", snapshot.Count, _projectEndpoint);
-            return _cached;
+            entry.Descriptors = snapshot;
+            entry.CachedAtUtc = DateTime.UtcNow;
+            _logger.LogInformation("Refreshed agent catalog: {Count} agent(s) from {Endpoint}", snapshot.Count, project);
+            return entry.Descriptors;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to refresh agent catalog from {Endpoint}", _projectEndpoint);
-            // Fall back to whatever we had cached (possibly empty) rather than throw —
-            // a stale list is better than a broken /agents command.
-            return _cached;
+            _logger.LogError(ex, "Failed to refresh agent catalog from {Endpoint}", project);
+            // Stale-on-error: a previous snapshot (possibly empty) is better than
+            // throwing the user out of a /agents command.
+            return entry.Descriptors;
         }
         finally
         {
-            _refreshLock.Release();
+            entry.Lock.Release();
         }
     }
 
-    public async Task<AgentDescriptor?> FindByKeyAsync(string key, CancellationToken ct = default)
+    public async Task<AgentDescriptor?> FindByKeyAsync(
+        string key, string? projectEndpoint = null, CancellationToken ct = default)
     {
-        var all = await GetDescriptorsAsync(ct: ct);
+        var all = await GetDescriptorsAsync(projectEndpoint, ct: ct);
         return all.FirstOrDefault(d => string.Equals(d.Key, key, StringComparison.OrdinalIgnoreCase));
     }
 
-    public async Task<AgentDescriptor?> FindByNameAsync(string name, CancellationToken ct = default)
+    public async Task<AgentDescriptor?> FindByNameAsync(
+        string name, string? projectEndpoint = null, CancellationToken ct = default)
     {
-        var all = await GetDescriptorsAsync(ct: ct);
+        var all = await GetDescriptorsAsync(projectEndpoint, ct: ct);
         return all.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
     }
 
-    public async Task<AgentDescriptor> DefaultAsync(CancellationToken ct = default)
+    public async Task<AgentDescriptor> DefaultAsync(
+        string? projectEndpoint = null, CancellationToken ct = default)
     {
-        var all = await GetDescriptorsAsync(ct: ct);
+        var all = await GetDescriptorsAsync(projectEndpoint, ct: ct);
         return all.FirstOrDefault()
             ?? throw new InvalidOperationException(
-                $"No active agents found in project {_projectEndpoint}. Create one in Foundry first.");
+                $"No active agents found in project {ResolveProject(projectEndpoint)}. Create one in Foundry first.");
     }
 
-    public async Task<string?> FindKeyForEndpointAsync(string? endpoint, CancellationToken ct = default)
+    public async Task<string?> FindKeyForEndpointAsync(
+        string? agentEndpoint, string? projectEndpoint = null, CancellationToken ct = default)
     {
-        if (string.IsNullOrEmpty(endpoint)) return null;
-        var all = await GetDescriptorsAsync(ct: ct);
-        return all.FirstOrDefault(d => string.Equals(d.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase))?.Key;
+        if (string.IsNullOrEmpty(agentEndpoint)) return null;
+        var project = ResolveProject(projectEndpoint ?? FoundryAgentsApi.ProjectEndpointFor(agentEndpoint));
+        var all = await GetDescriptorsAsync(project, ct: ct);
+        return all.FirstOrDefault(d => string.Equals(d.Endpoint, agentEndpoint, StringComparison.OrdinalIgnoreCase))?.Key;
     }
 
     /// <summary>

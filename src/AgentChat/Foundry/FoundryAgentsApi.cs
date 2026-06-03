@@ -98,6 +98,29 @@ public static class FoundryAgentsApi
     public static string ComposeAgentEndpoint(string projectEndpoint, string agentName)
         => $"{projectEndpoint.TrimEnd('/')}/agents/{agentName}/endpoint/protocols/openai/v1";
 
+    /// <summary>
+    /// Inverse of <see cref="ComposeAgentEndpoint"/>: strip the per-agent suffix
+    /// to recover the project endpoint. Returns null if the input doesn't look
+    /// like a per-agent URL we composed.
+    /// </summary>
+    public static string? ProjectEndpointFor(string? perAgentEndpoint)
+    {
+        if (string.IsNullOrEmpty(perAgentEndpoint)) return null;
+        const string Marker = "/agents/";
+        var idx = perAgentEndpoint.IndexOf(Marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        // Sanity check: the suffix must be exactly
+        // "/agents/{name}/endpoint/protocols/openai/v1".
+        const string TailSuffix = "/endpoint/protocols/openai/v1";
+        var tail = perAgentEndpoint.Substring(idx + Marker.Length);
+        if (!tail.EndsWith(TailSuffix, StringComparison.OrdinalIgnoreCase))
+            return null;
+        var agentName = tail.Substring(0, tail.Length - TailSuffix.Length);
+        if (string.IsNullOrWhiteSpace(agentName) || agentName.Contains('/'))
+            return null;
+        return perAgentEndpoint.Substring(0, idx);
+    }
+
     private static string Truncate(string s, int max)
         => s.Length > max ? s.Substring(0, max) + "…" : s;
 }

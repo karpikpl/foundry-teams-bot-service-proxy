@@ -75,7 +75,7 @@ public class ManifestController : ControllerBase
         var html = RenderIndex(
             agents:           catalog,
             downloadRoot:     "/admin/manifest",
-            sourceLabel:      _agents.ProjectEndpoint,
+            sourceLabel:      _agents.DefaultProjectEndpoint,
             isCustomRoute:    false);
         return new ContentResult { Content = html, ContentType = "text/html", StatusCode = 200 };
     }

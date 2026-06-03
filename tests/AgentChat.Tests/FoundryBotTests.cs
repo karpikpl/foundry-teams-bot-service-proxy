@@ -87,6 +87,92 @@ public class FoundryBotTests
     }
 
     [Fact]
+    public async Task OnSignInInvokeAsync_SurfacesError_When_TokenExchangeThrows()
+    {
+        var sso = new FakeSsoService(token: null, exchangeException: new InvalidOperationException("test failure"));
+        var bot = MakeBot(sso);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(adapter, "conv-sso-error", "signin/tokenExchange", JObject.FromObject(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        sso.ExchangeCalls.Should().Be(1);
+        var errorReply = adapter.GetNextReply().AsMessageActivity().Text;
+        errorReply.Should().Contain("Sign-in failed");
+        errorReply.Should().Contain("InvalidOperationException");
+        errorReply.Should().Contain("test failure");
+    }
+
+    [Fact]
+    public async Task Invoke_Name_Logging()
+    {
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(logger: logger);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(adapter, "conv-log", "signin/tokenExchange", JObject.FromObject(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Information
+            && m.Message.Contains("Invoke received: name=signin/tokenExchange"));
+    }
+
+    [Fact]
+    public async Task Token_exchange_invoke_returns_412_when_exchange_fails()
+    {
+        var sso = new FakeSsoService(token: null, exchangeException: new InvalidOperationException("test failure"));
+        var bot = MakeBot(sso);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(adapter, "conv-sso-412", "signin/tokenExchange", JObject.FromObject(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        adapter.GetNextReply().AsMessageActivity().Text.Should().Contain("Sign-in failed");
+        var invokeResponseActivity = adapter.GetNextReply();
+        invokeResponseActivity.Type.Should().Be(ActivityTypesEx.InvokeResponse);
+        var invokeResponse = ((Activity)invokeResponseActivity).Value.Should().BeOfType<InvokeResponse>().Subject;
+        invokeResponse.Status.Should().Be(412);
+        invokeResponse.Body.Should().BeOfType<TokenExchangeInvokeResponse>()
+            .Which.FailureDetail.Should().Contain("test failure");
+    }
+
+    [Fact]
+    public async Task Signin_verify_state_replays_cached_pending_sso_message()
+    {
+        var sso = new FakeSsoService(token: "foundry-user-token");
+        var bot = MakeBot(sso);
+        var adapter = new TestAdapter();
+        var convId = "conv-verify-state";
+        await bot.Store.SaveAsync(convId, new ConversationState { PendingSsoMessage = "pending verify" });
+
+        var turn = MakeInvokeTurn(adapter, convId, "signin/verifyState", JObject.FromObject(new { state = "123456" }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        sso.ExchangeCalls.Should().Be(0);
+        bot.AgentTurns.Should().ContainSingle().Which.Should().Be("pending verify");
+        bot.AgentTurnTokens.Should().ContainSingle().Which.Should().Be("foundry-user-token");
+        adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
+        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("agent:pending verify");
+    }
+
+    [Fact]
     public async Task Teams_message_sends_user_visible_error_when_foundry_stream_throws()
     {
         var catalog = new CatalogHandler("agent-a");
@@ -165,7 +251,7 @@ public class FoundryBotTests
     private static string ResponseCompleted(string id)
         => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";
 
-    private static SpyFoundryBot MakeBot(TeamsSsoService? sso = null)
+    private static SpyFoundryBot MakeBot(TeamsSsoService? sso = null, ILogger<FoundryBot>? logger = null)
     {
         var agents = TestServices.AgentService(new CatalogHandler("agent-a"));
         var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
@@ -176,7 +262,7 @@ public class FoundryBotTests
             new HttpContextAccessor(),
             new AgentClientCache(agents),
             sso ?? new FakeSsoService(token: null),
-            NullLogger<FoundryBot>.Instance);
+            logger ?? NullLogger<FoundryBot>.Instance);
     }
 
     private static ITurnContext MakeMessageTurn(TestAdapter adapter, string text, object? value = null, string convId = "conv-1")
@@ -259,14 +345,16 @@ public class FoundryBotTests
     private sealed class FakeSsoService : TeamsSsoService
     {
         private readonly string? _token;
+        private readonly Exception? _exchangeException;
         public int ExchangeCalls { get; private set; }
 
-        public FakeSsoService(string? token, bool enabled = true)
+        public FakeSsoService(string? token, bool enabled = true, Exception? exchangeException = null)
             : base(enabled
                 ? TestServices.Config(new KeyValuePair<string, string?>("TeamsSso:ConnectionName", "foundry-oauth"))
                 : TestServices.Config(), NullLogger<TeamsSsoService>.Instance)
         {
             _token = token;
+            _exchangeException = exchangeException;
         }
 
         public override Task<TokenResponse?> TryGetUserTokenAsync(ITurnContext turnContext, CancellationToken ct = default)
@@ -275,7 +363,31 @@ public class FoundryBotTests
         public override Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
         {
             ExchangeCalls++;
+            if (_exchangeException is not null)
+            {
+                return Task.FromException<TokenResponse?>(_exchangeException);
+            }
             return Task.FromResult<TokenResponse?>(_token is null ? null : new TokenResponse { Token = _token });
+        }
+    }
+
+    private sealed class ListLogger<T> : ILogger<T>
+    {
+        public List<(LogLevel Level, string Message, Exception? Exception)> Messages { get; } = new();
+
+        public IDisposable BeginScope<TState>(TState state) where TState : notnull => NullScope.Instance;
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter)
+        {
+            Messages.Add((logLevel, formatter(state, exception), exception));
+        }
+
+        private sealed class NullScope : IDisposable
+        {
+            public static readonly NullScope Instance = new();
+            public void Dispose() { }
         }
     }
 }

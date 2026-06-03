@@ -93,7 +93,7 @@
       userName.title = me.email || me.name || '';
       userChip.style.display = 'flex';
     }
-  } catch { }
+  } catch { /* User chip is optional; leave it hidden if whoami is unavailable. */ }
 
   const qs = new URLSearchParams(location.search);
   const foundryHost = qs.get('foundryHost') || '';

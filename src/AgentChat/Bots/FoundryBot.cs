@@ -1,5 +1,6 @@
 using System.ClientModel;
 using System.Diagnostics;
+using System.Net;
 using System.Text.Json;
 using AgentChat.Foundry;
 using AgentChat.Services;
@@ -1277,6 +1278,120 @@ public class FoundryBot : TeamsActivityHandler
 
     // ---------------------------------------------------------------- Teams SSO invoke
 
+    protected override async Task<InvokeResponse> OnInvokeActivityAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
+    {
+        var valueType = turnContext.Activity.Value?.GetType().FullName ?? "(null)";
+        _logger.LogInformation("Invoke received: name={Name}, valueType={ValueType}", turnContext.Activity.Name, valueType);
+
+        if (IsTeamsSignInInvoke(turnContext.Activity.Name))
+        {
+            var payload = TryReadTokenExchangePayload(turnContext.Activity.Value);
+            var result = await HandleTeamsSignInInvokeAsync(turnContext, payload, cancellationToken);
+            if (string.Equals(turnContext.Activity.Name, "signin/tokenExchange", StringComparison.OrdinalIgnoreCase))
+            {
+                return CreateTokenExchangeInvokeResponse(payload, result);
+            }
+
+            return result.Succeeded ? CreateInvokeResponse() : new InvokeResponse { Status = (int)HttpStatusCode.PreconditionFailed };
+        }
+
+        return await base.OnInvokeActivityAsync(turnContext, cancellationToken);
+    }
+
+    protected override async Task OnSignInInvokeAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
+    {
+        var payload = TryReadTokenExchangePayload(turnContext.Activity.Value);
+        await HandleTeamsSignInInvokeAsync(turnContext, payload, cancellationToken);
+    }
+
+    protected override async Task OnTeamsSigninVerifyStateAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
+    {
+        var payload = TryReadTokenExchangePayload(turnContext.Activity.Value);
+        await HandleTeamsSignInInvokeAsync(turnContext, payload, cancellationToken);
+    }
+
+    private static bool IsTeamsSignInInvoke(string? name)
+        => string.Equals(name, "signin/tokenExchange", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(name, "signin/verifyState", StringComparison.OrdinalIgnoreCase);
+
+    private static TokenExchangeInvokePayload TryReadTokenExchangePayload(object? value)
+    {
+        if (value is null) return new TokenExchangeInvokePayload(null, null, null);
+        try
+        {
+            var data = value as JObject ?? JObject.FromObject(value);
+            return new TokenExchangeInvokePayload(
+                data.ToObject<TokenExchangeRequest>(),
+                data.Value<string>("id"),
+                data.Value<string>("connectionName"));
+        }
+        catch
+        {
+            // Caller logs and surfaces a parse failure with invoke context.
+            return new TokenExchangeInvokePayload(null, null, null);
+        }
+    }
+
+    private static InvokeResponse CreateTokenExchangeInvokeResponse(TokenExchangeInvokePayload payload, TeamsSignInResult result)
+        => new()
+        {
+            Status = result.Succeeded ? (int)HttpStatusCode.OK : (int)HttpStatusCode.PreconditionFailed,
+            Body = new TokenExchangeInvokeResponse
+            {
+                Id = payload.Id,
+                ConnectionName = payload.ConnectionName,
+                FailureDetail = result.Succeeded ? null : result.FailureDetail
+            }
+        };
+
+    private sealed record TokenExchangeInvokePayload(TokenExchangeRequest? Request, string? Id, string? ConnectionName);
+    private sealed record TeamsSignInResult(bool Succeeded, string? FailureDetail = null);
+
+    private async Task<TeamsSignInResult> HandleTeamsSignInInvokeAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        TokenExchangeInvokePayload payload,
+        CancellationToken ct)
+    {
+        var convId = turnContext.Activity.Conversation.Id;
+        var state = await _state.GetOrCreateAsync(convId, ct);
+        await _state.TouchAsync(convId, turnContext.Activity.GetConversationReference(), ct);
+
+        _logger.LogInformation("Handling Teams sign-in invoke {InvokeName}; pending SSO message present: {HasPending}.",
+            turnContext.Activity.Name, !string.IsNullOrEmpty(state.PendingSsoMessage));
+
+        TokenResponse? token;
+        try
+        {
+            token = await ResolveSignInTokenAsync(turnContext, payload, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Token exchange threw an exception (conv={ConvId})", convId);
+            await turnContext.SendActivityAsync(MessageFactory.Text($"⚠️ Sign-in failed: {ex.GetType().Name}: {ex.Message}"), ct);
+            return new TeamsSignInResult(false, $"{ex.GetType().Name}: {ex.Message}");
+        }
+
+        if (token is null || string.IsNullOrEmpty(token.Token))
+        {
+            _logger.LogError("Teams sign-in invoke {InvokeName} did not produce a user token (conv={ConvId}).", turnContext.Activity.Name, convId);
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "⚠️ Sign-in didn't complete. Try again or contact your admin."), ct);
+            return new TeamsSignInResult(false, "Token exchange did not produce a user token.");
+        }
+
+        try
+        {
+            await RunPendingSsoMessageAsync(turnContext, state, token, ct);
+            return new TeamsSignInResult(true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Replay after sign-in failed (conv={ConvId})", convId);
+            await turnContext.SendActivityAsync(MessageFactory.Text($"⚠️ Replay after sign-in failed: {ex.GetType().Name}: {ex.Message}"), ct);
+            return new TeamsSignInResult(false, $"Replay failed: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Called by Bot Framework when an invoke activity with name
     /// <c>signin/verifyState</c> or <c>signin/tokenExchange</c> arrives —
@@ -1284,74 +1399,69 @@ public class FoundryBot : TeamsActivityHandler
     /// then replay the user's pending message (if we stored one) so the
     /// original turn resumes seamlessly.
     /// </summary>
-    private async Task<TokenResponse?> ResolveSignInTokenAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken ct)
+    private async Task<TokenResponse?> ResolveSignInTokenAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        TokenExchangeInvokePayload payload,
+        CancellationToken ct)
     {
-        if (string.Equals(turnContext.Activity.Name, "signin/tokenExchange", StringComparison.OrdinalIgnoreCase)
-            && turnContext.Activity.Value is not null)
+        var convId = turnContext.Activity.Conversation.Id;
+        if (string.Equals(turnContext.Activity.Name, "signin/tokenExchange", StringComparison.OrdinalIgnoreCase))
         {
-            try
+            _logger.LogInformation("signin/tokenExchange invoke received (conv={ConvId})", convId);
+            if (payload.Request is null)
             {
-                var data = turnContext.Activity.Value as JObject ?? JObject.FromObject(turnContext.Activity.Value);
-                var request = data.ToObject<TokenExchangeRequest>();
-                if (request is not null)
-                {
-                    _logger.LogInformation("Received signin/tokenExchange invoke for user {UserId}.",
-                        turnContext.Activity.From?.Id);
-                    var exchanged = await _sso.ExchangeTokenAsync(turnContext, request, ct);
-                    _logger.LogInformation("Teams signin/tokenExchange token exchange result: {TokenState}.",
-                        exchanged is not null && !string.IsNullOrEmpty(exchanged.Token) ? "present" : "absent");
-                    if (exchanged is not null && !string.IsNullOrEmpty(exchanged.Token))
-                    {
-                        _logger.LogInformation("Teams signin/tokenExchange completed for user {UserId}.", turnContext.Activity.From?.Id);
-                        return exchanged;
-                    }
-                }
+                throw new InvalidOperationException("signin/tokenExchange payload could not be parsed.");
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to parse or complete Teams signin/tokenExchange invoke.");
-            }
+
+            _logger.LogInformation(
+                "Exchanging Teams SSO token via UserTokenClient.ExchangeTokenAsync (connection={Conn}, channel={Channel})",
+                payload.ConnectionName ?? _sso.ConnectionName,
+                turnContext.Activity.ChannelId);
+            var exchanged = await _sso.ExchangeTokenAsync(turnContext, payload.Request, ct);
+            _logger.LogInformation("Token exchange returned: tokenLength={Len}, expiry={Exp}",
+                exchanged?.Token?.Length ?? 0, exchanged?.Expiration);
+            return exchanged;
         }
 
         var cached = await _sso.TryGetUserTokenAsync(turnContext, ct);
-        _logger.LogInformation("Teams sign-in invoke token fallback: {TokenState}.",
-            cached is not null && !string.IsNullOrEmpty(cached.Token) ? "present" : "absent");
+        _logger.LogInformation("Teams sign-in invoke cached token lookup: {TokenState} (length={Length}).",
+            cached is not null && !string.IsNullOrEmpty(cached.Token) ? "present" : "absent",
+            cached?.Token?.Length ?? 0);
         return cached;
     }
 
-    protected override async Task OnSignInInvokeAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
+    private async Task RunPendingSsoMessageAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        ConversationState state,
+        TokenResponse exchanged,
+        CancellationToken ct)
     {
-        var state = await _state.GetOrCreateAsync(turnContext.Activity.Conversation.Id, cancellationToken);
-        await _state.TouchAsync(turnContext.Activity.Conversation.Id, turnContext.Activity.GetConversationReference(), cancellationToken);
+        var convId = turnContext.Activity.Conversation.Id;
+        _logger.LogInformation("Invoked RunPendingSsoMessageAsync (conv={ConvId})", convId);
 
-        _logger.LogInformation("Handling Teams sign-in invoke {InvokeName}; pending SSO message present: {HasPending}.",
-            turnContext.Activity.Name, !string.IsNullOrEmpty(state.PendingSsoMessage));
+        var cached = await _sso.TryGetUserTokenAsync(turnContext, ct);
+        _logger.LogInformation("Cached token check after exchange: {TokenState} (length={Length})",
+            cached is not null && !string.IsNullOrEmpty(cached.Token) ? "present" : "absent",
+            cached?.Token?.Length ?? 0);
 
-        var token = await ResolveSignInTokenAsync(turnContext, cancellationToken);
-        if (token is null || string.IsNullOrEmpty(token.Token))
-        {
-            _logger.LogWarning("Teams sign-in invoke {InvokeName} did not produce a user token.", turnContext.Activity.Name);
-            await turnContext.SendActivityAsync(MessageFactory.Text(
-                "⚠️ Sign-in didn't complete. Try again or contact your admin."), cancellationToken);
-            return;
-        }
-
+        var userToken = !string.IsNullOrEmpty(cached?.Token) ? cached.Token : exchanged.Token;
         var pending = state.PendingSsoMessage;
+        _logger.LogInformation("PendingSsoMessage: present={Present}, length={Length}",
+            !string.IsNullOrEmpty(pending), pending?.Length ?? 0);
+
         if (string.IsNullOrEmpty(pending))
         {
-            _logger.LogInformation("Teams sign-in completed but no pending SSO message was stored for conversation {ConversationId}.",
-                turnContext.Activity.Conversation.Id);
+            _logger.LogInformation("Teams sign-in completed but no pending SSO message was stored for conversation {ConversationId}.", convId);
             await turnContext.SendActivityAsync(MessageFactory.Text(
-                "✅ Signed in. Send your message to start the conversation."), cancellationToken);
+                "✅ Signed in. Send your message to start the conversation."), ct);
             return;
         }
 
         state.PendingSsoMessage = null;
-        await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, cancellationToken);
+        await _state.SaveAsync(convId, state, ct);
 
-        _logger.LogInformation("Replaying pending Teams SSO message for conversation {ConversationId}.",
-            turnContext.Activity.Conversation.Id);
-        await SendTypingAsync(turnContext, cancellationToken);
-        await RunAgentTurnAsync(turnContext, state, pending, cancellationToken, userTokenOverride: token.Token);
+        _logger.LogInformation("Calling RunAgentTurnAsync with replayed message of length {Length}", pending.Length);
+        await SendTypingAsync(turnContext, ct);
+        await RunAgentTurnAsync(turnContext, state, pending, ct, userTokenOverride: userToken);
     }
 }

@@ -65,7 +65,7 @@ public class TeamsSsoService
         {
             // CloudAdapter normally provides this. If it's missing, we're likely
             // running under TestAdapter / unit tests without auth wired up.
-            _logger.LogDebug("UserTokenClient not available in turn state — SSO disabled for this turn.");
+            _logger.LogInformation("UserTokenClient not available in turn state — SSO disabled for this turn.");
             return null;
         }
 
@@ -120,24 +120,51 @@ public class TeamsSsoService
     /// </summary>
     public virtual async Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
     {
-        if (!Enabled) return null;
+        if (!Enabled)
+        {
+            _logger.LogInformation("ExchangeTokenAsync skipped because Teams SSO is not configured.");
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(request.Token))
+        {
+            _logger.LogError("Teams token exchange failed: token claim missing (connection={Connection}, requestUri={RequestUri}, channel={Channel}).",
+                _connectionName, request.Uri, turnContext.Activity.ChannelId);
+            throw new InvalidOperationException("Teams token-exchange request did not include a token.");
+        }
 
         var userTokenClient = turnContext.TurnState.Get<UserTokenClient>();
-        if (userTokenClient is null) return null;
+        if (userTokenClient is null)
+        {
+            _logger.LogError("Teams token exchange failed: UserTokenClient missing from turn state (connection={Connection}, channel={Channel}).",
+                _connectionName, turnContext.Activity.ChannelId);
+            throw new InvalidOperationException("Bot Framework UserTokenClient is not available for this turn.");
+        }
 
         try
         {
-            return await userTokenClient.ExchangeTokenAsync(
+            var response = await userTokenClient.ExchangeTokenAsync(
                 userId:         turnContext.Activity.From.Id,
                 connectionName: _connectionName!,
                 channelId:      turnContext.Activity.ChannelId,
                 exchangeRequest: request,
                 cancellationToken: ct);
+
+            if (response is null || string.IsNullOrEmpty(response.Token))
+            {
+                _logger.LogError(
+                    "Teams token exchange returned no token. Possible causes: user not consented, wrong audience, or OAuth connection misconfigured (connection={Connection}, requestUri={RequestUri}, channel={Channel}).",
+                    _connectionName, request.Uri, turnContext.Activity.ChannelId);
+            }
+
+            return response;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "ExchangeTokenAsync failed for user {UserId}", turnContext.Activity.From.Id);
-            return null;
+            _logger.LogError(ex,
+                "Teams token exchange failed via UserTokenClient.ExchangeTokenAsync. Possible causes: user not consented, wrong audience, or OAuth connection misconfigured (connection={Connection}, requestUri={RequestUri}, channel={Channel}).",
+                _connectionName, request.Uri, turnContext.Activity.ChannelId);
+            throw;
         }
     }
 

@@ -62,16 +62,18 @@ public class ChatTestController : ControllerBase
 
     // ====================================================== Conversation lifecycle
 
-    public sealed record CreateConvRequest(string AgentKey);
+    public sealed record CreateConvRequest(string AgentKey, string? FoundryHost = null, string? Project = null);
     public sealed record CreateConvResponse(string ConversationId, string AgentName, string Endpoint);
 
     [HttpPost("conversations")]
     public async Task<IActionResult> CreateConversation([FromBody] CreateConvRequest body, CancellationToken ct)
     {
         if (string.IsNullOrEmpty(body?.AgentKey)) return BadRequest(new { error = "agentKey is required" });
+        if (!TryProjectEndpoint(body.FoundryHost, body.Project, out var projectEndpoint, out var projectError))
+            return BadRequest(new { error = projectError });
 
-        var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint: null, ct);
-        if (agent is null) return NotFound(new { error = $"agent '{body.AgentKey}' not found in configured project" });
+        var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint, ct);
+        if (agent is null) return NotFound(new { error = $"agent '{body.AgentKey}' not found" });
 
         var foundry = _clientCache.For(agent.Endpoint);
         var convClient = foundry.OpenAI.GetConversationClient();
@@ -83,9 +85,17 @@ public class ChatTestController : ControllerBase
     }
 
     [HttpDelete("conversations/{conversationId}")]
-    public async Task<IActionResult> DeleteConversation(string conversationId, [FromQuery] string agentKey, CancellationToken ct)
+    public async Task<IActionResult> DeleteConversation(
+        string conversationId,
+        [FromQuery] string agentKey,
+        [FromQuery] string? foundryHost,
+        [FromQuery] string? project,
+        CancellationToken ct)
     {
-        var agent = await _agents.FindByKeyAsync(agentKey, projectEndpoint: null, ct);
+        if (!TryProjectEndpoint(foundryHost, project, out var projectEndpoint, out var projectError))
+            return BadRequest(new { error = projectError });
+
+        var agent = await _agents.FindByKeyAsync(agentKey, projectEndpoint, ct);
         if (agent is null) return NotFound(new { error = $"agent '{agentKey}' not found" });
 
         var foundry = _clientCache.For(agent.Endpoint);
@@ -102,7 +112,7 @@ public class ChatTestController : ControllerBase
 
     // ====================================================== Streaming chat
 
-    public sealed record MessageRequest(string AgentKey, string ConversationId, string Message);
+    public sealed record MessageRequest(string AgentKey, string ConversationId, string Message, string? FoundryHost = null, string? Project = null);
 
     /// <summary>
     /// POST the user's message and stream the response back as Server-Sent
@@ -129,7 +139,13 @@ public class ChatTestController : ControllerBase
             return;
         }
 
-        var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint: null, ct);
+        if (!TryProjectEndpoint(body.FoundryHost, body.Project, out var projectEndpoint, out var projectError))
+        {
+            await WriteSseAsync("error", projectError, ct);
+            return;
+        }
+
+        var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint, ct);
         if (agent is null)
         {
             await WriteSseAsync("error", $"agent '{body.AgentKey}' not found", ct);
@@ -303,6 +319,25 @@ public class ChatTestController : ControllerBase
             return true;
         }
         catch { return false; }
+    }
+
+    private static bool TryProjectEndpoint(string? foundryHost, string? project, out string? projectEndpoint, out string error)
+    {
+        var hasHost = !string.IsNullOrWhiteSpace(foundryHost);
+        var hasProject = !string.IsNullOrWhiteSpace(project);
+
+        projectEndpoint = null;
+        error = "";
+
+        if (!hasHost && !hasProject) return true;
+        if (!hasHost || !hasProject)
+        {
+            error = "foundryHost and project must be provided together";
+            return false;
+        }
+
+        projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost!.Trim(), project!.Trim());
+        return true;
     }
 
     private async Task WriteSseAsync(string eventName, string data, CancellationToken ct)

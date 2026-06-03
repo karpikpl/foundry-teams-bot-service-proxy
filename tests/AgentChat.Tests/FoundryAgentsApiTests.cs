@@ -7,6 +7,13 @@ namespace AgentChat.Tests;
 public class FoundryAgentsApiTests
 {
     [Fact]
+    public void ComposeProjectEndpoint_builds_services_project_url()
+    {
+        FoundryAgentsApi.ComposeProjectEndpoint("acct", "project-a")
+            .Should().Be("https://acct.services.ai.azure.com/api/projects/project-a");
+    }
+
+    [Fact]
     public void ProjectEndpointFor_round_trips_composed_agent_endpoint()
     {
         var project = "https://acct.services.ai.azure.com/api/projects/project-a";

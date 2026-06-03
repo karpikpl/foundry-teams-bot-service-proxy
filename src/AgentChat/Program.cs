@@ -17,8 +17,6 @@ builder.Services.AddHealthChecks();
 builder.Services.AddSingleton<AgentService>();
 builder.Services.AddSingleton<AgentClientCache>();
 builder.Services.AddSingleton<TeamsSsoService>();
-builder.Services.AddSingleton<BotRegistrationStore>();
-
 // IStorage — Cosmos serverless via AAD (no keys).
 builder.Services.AddSingleton<IStorage>(sp =>
 {

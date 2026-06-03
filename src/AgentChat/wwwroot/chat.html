@@ -10,6 +10,8 @@
   .app{display:flex;flex-direction:column;height:100%;max-width:880px;margin:0 auto;background:#fff;border-left:1px solid #d0d7de;border-right:1px solid #d0d7de}
   header{background:#0d1117;color:#fff;padding:14px 20px;display:flex;align-items:center;gap:12px;flex-shrink:0}
   header h1{margin:0;font-size:16px;font-weight:600;flex:1}
+  .scope-badges{display:flex;gap:6px;flex-wrap:wrap}
+  .scope-badge{display:none;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:999px;padding:4px 8px;font:11px ui-monospace,Consolas,monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   header select{padding:6px 10px;border-radius:6px;border:0;font-size:13px;background:#21262d;color:#fff}
   header button{background:#21262d;color:#fff;border:0;padding:6px 12px;border-radius:6px;font-size:13px;cursor:pointer}
   header button:hover{background:#30363d}
@@ -44,6 +46,10 @@
 <div class="app">
   <header>
     <h1>🧪 Agent test chat</h1>
+    <div class="scope-badges" id="scopeBadges">
+      <span class="scope-badge" id="foundryBadge"></span>
+      <span class="scope-badge" id="projectBadge"></span>
+    </div>
     <select id="agentPicker">
       <option value="">Loading…</option>
     </select>
@@ -68,10 +74,27 @@
   const sendBtn  = document.getElementById('sendBtn');
   const resetBtn = document.getElementById('resetBtn');
 
-  // Load agents from the configured default project.
+  const qs = new URLSearchParams(location.search);
+  const foundryHost = qs.get('foundryHost') || '';
+  const project = qs.get('project') || '';
+  const scoped = Boolean(foundryHost && project);
+  if (scoped) {
+    const foundryBadge = document.getElementById('foundryBadge');
+    const projectBadge = document.getElementById('projectBadge');
+    foundryBadge.textContent = `host: ${foundryHost}`;
+    projectBadge.textContent = `project: ${project}`;
+    foundryBadge.style.display = projectBadge.style.display = 'inline-block';
+  }
+  const scopePayload = scoped ? { foundryHost, project } : {};
+  const scopeQuery = scoped ? `?foundryHost=${encodeURIComponent(foundryHost)}&project=${encodeURIComponent(project)}` : '';
+  const agentsUrl = scoped
+    ? `/admin/${encodeURIComponent(foundryHost)}/${encodeURIComponent(project)}/agents`
+    : '/admin/agents';
+
+  // Load agents from the active project.
   let agents = [];
   try {
-    const r = await fetch('/admin/agents');
+    const r = await fetch(agentsUrl);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     agents = await r.json();
   } catch (e) {
@@ -95,7 +118,7 @@
   function resetConversation() {
     if (convState.conversationId) {
       // Best-effort delete (server cleans up Foundry-side).
-      fetch(`/admin/chat/conversations/${encodeURIComponent(convState.conversationId)}?agentKey=${encodeURIComponent(convState.agentKey)}`, {
+      fetch(`/admin/chat/conversations/${encodeURIComponent(convState.conversationId)}?agentKey=${encodeURIComponent(convState.agentKey)}${scopeQuery ? '&' + scopeQuery.slice(1) : ''}`, {
         method: 'DELETE'
       }).catch(() => {});
     }
@@ -109,7 +132,7 @@
     const r = await fetch('/admin/chat/conversations', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ agentKey })
+      body: JSON.stringify({ agentKey, ...scopePayload })
     });
     if (!r.ok) throw new Error(`Create conversation: ${await r.text()}`);
     const data = await r.json();
@@ -137,7 +160,7 @@
       const r = await fetch('/admin/chat/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ agentKey, conversationId: convState.conversationId, message: text })
+        body: JSON.stringify({ agentKey, conversationId: convState.conversationId, message: text, ...scopePayload })
       });
 
       if (!r.ok || !r.body) {

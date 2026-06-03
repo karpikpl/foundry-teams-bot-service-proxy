@@ -1,12 +1,20 @@
 using System.Net;
+using System.Security.Claims;
 using System.Text;
+using AgentChat.Auth;
 using AgentChat.Controllers;
+using AgentChat.Foundry;
 using AgentChat.Services;
 using FluentAssertions;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Controllers;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Identity.Web;
 using Moq;
 using Xunit;
 
@@ -147,11 +155,95 @@ public class ChatTestControllerTests
         sse.Should().Contain("bad foundry request");
     }
 
+    [Fact]
+    public async Task Admin_chat_auth_filter_allows_anonymous_when_disabled()
+    {
+        var context = MakeAuthorizationContext(new ClaimsPrincipal(new ClaimsIdentity()));
+        var filter = new AdminChatAuthFilter(new AdminChatAuthOptions { Enabled = false });
+
+        await filter.OnAuthorizationAsync(context);
+
+        context.Result.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task Admin_chat_auth_filter_challenges_anonymous_when_enabled()
+    {
+        var context = MakeAuthorizationContext(new ClaimsPrincipal(new ClaimsIdentity()));
+        var filter = new AdminChatAuthFilter(new AdminChatAuthOptions { Enabled = true });
+
+        await filter.OnAuthorizationAsync(context);
+
+        var challenge = context.Result.Should().BeOfType<ChallengeResult>().Subject;
+        challenge.AuthenticationSchemes.Should().Contain(OpenIdConnectDefaults.AuthenticationScheme);
+    }
+
+    [Fact]
+    public async Task CreateConversation_with_admin_chat_auth_uses_user_foundry_token()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv-user\"}");
+        var tokenAcquisition = MockTokenAcquisition("user-foundry-token");
+        var controller = MakeController(
+            catalog,
+            withHttpContext: true,
+            clientCache: foundry.ToClientCache(service),
+            service: service,
+            adminChatAuth: new AdminChatAuthOptions { Enabled = true },
+            tokenAcquisition: tokenAcquisition.Object);
+        controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, "Tester") }, "Test"));
+
+        var result = await controller.CreateConversation(new ChatTestController.CreateConvRequest("agent-a"), CancellationToken.None);
+
+        result.Should().BeOfType<OkObjectResult>();
+        VerifyUserTokenAcquired(tokenAcquisition);
+        foundry.AuthorizationHeaders.Should().Contain("Bearer user-foundry-token");
+        FoundryUserAuthScope.Current.Should().BeNull();
+    }
+
+    [Fact]
+    public async Task StreamMessage_with_admin_chat_auth_uses_user_foundry_token()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueSse(ResponseCreated("resp_user"), TextDelta("hello user"), ResponseCompleted("resp_user"));
+        var tokenAcquisition = MockTokenAcquisition("stream-user-token");
+        var controller = MakeController(
+            catalog,
+            withHttpContext: true,
+            clientCache: foundry.ToClientCache(service),
+            service: service,
+            adminChatAuth: new AdminChatAuthOptions { Enabled = true },
+            tokenAcquisition: tokenAcquisition.Object);
+        controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, "Tester") }, "Test"));
+
+        await controller.StreamMessage(new ChatTestController.MessageRequest("agent-a", "conv-user", "hi"), CancellationToken.None);
+
+        VerifyUserTokenAcquired(tokenAcquisition);
+        foundry.AuthorizationHeaders.Should().Contain("Bearer stream-user-token");
+        (await ReadResponseAsync(controller)).Should().Contain("hello user");
+        FoundryUserAuthScope.Current.Should().BeNull();
+    }
+
+    [Fact]
+    public void Only_chat_test_controller_has_admin_chat_auth_filter()
+    {
+        typeof(ChatTestController).GetCustomAttributes(typeof(ServiceFilterAttribute), inherit: true)
+            .Should().Contain(a => ((ServiceFilterAttribute)a).ServiceType == typeof(AdminChatAuthFilter));
+        typeof(ManifestController).GetCustomAttributes(typeof(ServiceFilterAttribute), inherit: true)
+            .Should().BeEmpty();
+    }
+
     private static ChatTestController MakeController(
         CatalogHandler handler,
         bool withHttpContext = false,
         AgentClientCache? clientCache = null,
-        AgentService? service = null)
+        AgentService? service = null,
+        AdminChatAuthOptions? adminChatAuth = null,
+        ITokenAcquisition? tokenAcquisition = null)
     {
         service ??= TestServices.AgentService(handler);
         var env = new Mock<IWebHostEnvironment>();
@@ -160,7 +252,9 @@ public class ChatTestControllerTests
             service,
             clientCache ?? new AgentClientCache(service),
             env.Object,
-            NullLogger<ChatTestController>.Instance);
+            NullLogger<ChatTestController>.Instance,
+            adminChatAuth,
+            tokenAcquisition);
 
         if (withHttpContext)
         {
@@ -169,6 +263,37 @@ public class ChatTestControllerTests
         }
 
         return controller;
+    }
+
+    private static AuthorizationFilterContext MakeAuthorizationContext(ClaimsPrincipal user)
+    {
+        var httpContext = new DefaultHttpContext { User = user };
+        return new AuthorizationFilterContext(
+            new ActionContext(httpContext, new RouteData(), new ControllerActionDescriptor()),
+            new List<IFilterMetadata>());
+    }
+
+    private static Mock<ITokenAcquisition> MockTokenAcquisition(string token)
+    {
+        var mock = new Mock<ITokenAcquisition>();
+        mock.Setup(t => t.GetAccessTokenForUserAsync(
+                It.IsAny<IEnumerable<string>>(),
+                It.IsAny<string?>(),
+                It.IsAny<string?>(),
+                It.IsAny<ClaimsPrincipal?>(),
+                It.IsAny<TokenAcquisitionOptions?>()))
+            .ReturnsAsync(token);
+        return mock;
+    }
+
+    private static void VerifyUserTokenAcquired(Mock<ITokenAcquisition> tokenAcquisition)
+    {
+        tokenAcquisition.Verify(t => t.GetAccessTokenForUserAsync(
+            It.Is<IEnumerable<string>>(s => s.SequenceEqual(new[] { AdminChatAuthOptions.FoundryScope })),
+            null,
+            null,
+            It.IsAny<ClaimsPrincipal>(),
+            null), Times.Once);
     }
 
     private static async Task<string> ReadResponseAsync(ChatTestController controller)

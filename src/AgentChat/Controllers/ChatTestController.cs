@@ -1,11 +1,17 @@
 using System.ClientModel;
 using System.Collections.Concurrent;
+using System.Security.Claims;
 using System.Text;
 using System.Text.Json;
+using AgentChat.Auth;
 using AgentChat.Bots;
 using AgentChat.Foundry;
 using AgentChat.Services;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Identity.Web;
 using OpenAI.Responses;
 
 namespace AgentChat.Controllers;
@@ -17,10 +23,9 @@ namespace AgentChat.Controllers;
 /// response — but renders to a plain web page over SSE instead of Bot
 /// Framework activities.
 ///
-/// Auth: uses the App Service UMI (same as the bot's catalog calls today).
-/// Per-user OBO isn't wired in here because the browser context doesn't carry
-/// Teams SSO; for end-to-end user-identity testing, use the actual Teams bot
-/// instead.
+/// Auth: by default, uses the App Service UMI (same as the bot's catalog calls
+/// today). When AdminChatAuth is enabled, this browser harness requires Entra ID
+/// sign-in and forwards the signed-in user's Foundry token per request.
 ///
 /// Routes:
 ///   <c>GET  /admin/chat</c>                              HTML page
@@ -30,6 +35,8 @@ namespace AgentChat.Controllers;
 /// </summary>
 [ApiController]
 [Route("admin/chat")]
+[ServiceFilter(typeof(AdminChatAuthFilter))]
+[AuthorizeForScopes(Scopes = new[] { AdminChatAuthOptions.FoundryScope })]
 public class ChatTestController : ControllerBase
 {
     private static readonly ConcurrentDictionary<string, PendingMcpApproval> PendingApprovals = new(StringComparer.Ordinal);
@@ -39,17 +46,23 @@ public class ChatTestController : ControllerBase
     private readonly AgentClientCache _clientCache;
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<ChatTestController> _logger;
+    private readonly AdminChatAuthOptions _adminChatAuth;
+    private readonly ITokenAcquisition? _tokenAcquisition;
 
     public ChatTestController(
         AgentService agents,
         AgentClientCache clientCache,
         IWebHostEnvironment env,
-        ILogger<ChatTestController> logger)
+        ILogger<ChatTestController> logger,
+        AdminChatAuthOptions? adminChatAuth = null,
+        ITokenAcquisition? tokenAcquisition = null)
     {
-        _agents      = agents;
-        _clientCache = clientCache;
-        _env         = env;
-        _logger      = logger;
+        _agents           = agents;
+        _clientCache      = clientCache;
+        _env              = env;
+        _logger           = logger;
+        _adminChatAuth    = adminChatAuth ?? new AdminChatAuthOptions();
+        _tokenAcquisition = tokenAcquisition;
     }
 
     // ====================================================== HTML page
@@ -64,6 +77,37 @@ public class ChatTestController : ControllerBase
         return PhysicalFile(path, "text/html");
     }
 
+    [HttpGet("whoami")]
+    public IActionResult WhoAmI()
+    {
+        var name = User.FindFirst("name")?.Value
+            ?? User.FindFirst(ClaimTypes.Name)?.Value
+            ?? User.Identity?.Name;
+        var email = User.FindFirst("preferred_username")?.Value
+            ?? User.FindFirst(ClaimTypes.Email)?.Value
+            ?? User.FindFirst("email")?.Value;
+
+        return Ok(new
+        {
+            enabled = _adminChatAuth.Enabled,
+            authenticated = User.Identity?.IsAuthenticated == true,
+            name,
+            email
+        });
+    }
+
+    [HttpGet("signout")]
+    public IActionResult SignOutOfAdminChat()
+    {
+        if (!_adminChatAuth.Enabled)
+            return Redirect("/admin/chat");
+
+        return SignOut(
+            new AuthenticationProperties { RedirectUri = "/admin/chat" },
+            OpenIdConnectDefaults.AuthenticationScheme,
+            CookieAuthenticationDefaults.AuthenticationScheme);
+    }
+
     // ====================================================== Conversation lifecycle
 
     public sealed record CreateConvRequest(string AgentKey, string? FoundryHost = null, string? Project = null);
@@ -76,6 +120,7 @@ public class ChatTestController : ControllerBase
         if (!TryProjectEndpoint(body.FoundryHost, body.Project, out var projectEndpoint, out var projectError))
             return BadRequest(new { error = projectError });
 
+        using var userAuth = BeginFoundryUserAuthScope(await GetFoundryUserTokenAsync());
         var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint, ct);
         if (agent is null) return NotFound(new { error = $"agent '{body.AgentKey}' not found" });
 
@@ -99,6 +144,7 @@ public class ChatTestController : ControllerBase
         if (!TryProjectEndpoint(foundryHost, project, out var projectEndpoint, out var projectError))
             return BadRequest(new { error = projectError });
 
+        using var userAuth = BeginFoundryUserAuthScope(await GetFoundryUserTokenAsync());
         var agent = await _agents.FindByKeyAsync(agentKey, projectEndpoint, ct);
         if (agent is null) return NotFound(new { error = $"agent '{agentKey}' not found" });
 
@@ -160,6 +206,7 @@ public class ChatTestController : ControllerBase
             return;
         }
 
+        using var userAuth = BeginFoundryUserAuthScope(await GetFoundryUserTokenAsync());
         var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint, ct);
         if (agent is null)
         {
@@ -471,6 +518,27 @@ public class ChatTestController : ControllerBase
             return true;
         }
         catch { return false; }
+    }
+
+    private async Task<string?> GetFoundryUserTokenAsync()
+    {
+        if (!_adminChatAuth.Enabled)
+            return null;
+        if (_tokenAcquisition is null)
+            throw new InvalidOperationException("Admin chat authentication is enabled but token acquisition is not configured.");
+
+        return await _tokenAcquisition.GetAccessTokenForUserAsync(
+            new[] { AdminChatAuthOptions.FoundryScope },
+            user: User);
+    }
+
+    private static IDisposable BeginFoundryUserAuthScope(string? token)
+        => string.IsNullOrEmpty(token) ? NoopDisposable.Instance : FoundryUserAuthScope.Use(token);
+
+    private sealed class NoopDisposable : IDisposable
+    {
+        public static readonly NoopDisposable Instance = new();
+        public void Dispose() { }
     }
 
     private static bool TryProjectEndpoint(string? foundryHost, string? project, out string? projectEndpoint, out string error)

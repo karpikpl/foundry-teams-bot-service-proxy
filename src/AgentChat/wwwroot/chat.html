@@ -12,6 +12,10 @@
   header h1{margin:0;font-size:16px;font-weight:600;flex:1}
   .scope-badges{display:flex;gap:6px;flex-wrap:wrap}
   .scope-badge{display:none;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:999px;padding:4px 8px;font:11px ui-monospace,Consolas,monospace;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .user-chip{display:none;align-items:center;gap:8px;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:999px;padding:4px 9px;font-size:12px;max-width:260px}
+  .user-chip span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .user-chip a{color:#58a6ff;text-decoration:none;font-weight:600}
+  .user-chip a:hover{text-decoration:underline}
   header select{padding:6px 10px;border-radius:6px;border:0;font-size:13px;background:#21262d;color:#fff}
   header button{background:#21262d;color:#fff;border:0;padding:6px 12px;border-radius:6px;font-size:13px;cursor:pointer}
   header button:hover{background:#30363d}
@@ -55,6 +59,7 @@
       <span class="scope-badge" id="foundryBadge"></span>
       <span class="scope-badge" id="projectBadge"></span>
     </div>
+    <div class="user-chip" id="userChip"><span id="userName"></span><a href="/admin/chat/signout">Sign out</a></div>
     <select id="agentPicker">
       <option value="">Loading…</option>
     </select>
@@ -78,6 +83,17 @@
   const input    = document.getElementById('input');
   const sendBtn  = document.getElementById('sendBtn');
   const resetBtn = document.getElementById('resetBtn');
+  const userChip = document.getElementById('userChip');
+  const userName = document.getElementById('userName');
+
+  try {
+    const me = await fetch('/admin/chat/whoami', { credentials: 'same-origin' }).then(r => r.ok ? r.json() : null);
+    if (me?.enabled && me?.authenticated) {
+      userName.textContent = me.name || me.email || 'Signed in';
+      userName.title = me.email || me.name || '';
+      userChip.style.display = 'flex';
+    }
+  } catch { }
 
   const qs = new URLSearchParams(location.search);
   const foundryHost = qs.get('foundryHost') || '';

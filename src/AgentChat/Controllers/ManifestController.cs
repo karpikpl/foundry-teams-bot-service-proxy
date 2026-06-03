@@ -67,7 +67,8 @@ public class ManifestController : ControllerBase
         var defaultEndpoint = _agents.DefaultProjectEndpoint;
         TryDeriveFoundryHostAndProject(defaultEndpoint, out var defaultFoundryHost, out var defaultProject);
         var agents = await _agents.GetDescriptorsAsync(forceRefresh: false, ct: ct);
-        return HtmlResult(RenderLanding(defaultEndpoint, defaultFoundryHost, defaultProject, agents));
+        var adminChatAuthEnabled = _config.GetValue<bool?>("AdminChatAuth:Enabled") ?? false;
+        return HtmlResult(RenderLanding(defaultEndpoint, defaultFoundryHost, defaultProject, agents, adminChatAuthEnabled));
     }
 
     // ====================================================== Manifest forms + downloads
@@ -287,18 +288,22 @@ public class ManifestController : ControllerBase
         string defaultEndpoint,
         string defaultFoundryHost,
         string defaultProject,
-        IReadOnlyList<AgentService.AgentDescriptor> agents)
+        IReadOnlyList<AgentService.AgentDescriptor> agents,
+        bool adminChatAuthEnabled)
     {
         var agentItems = agents.Count == 0
             ? "<li>No active agents discovered in the configured default project.</li>"
             : string.Join("", agents.OrderBy(a => a.Name).Select(a => $"<li><strong>{Html(a.Name)}</strong><span>{Html(a.Description)}</span></li>"));
+        var chatAuthNote = adminChatAuthEnabled
+            ? "<p class=\"note\">Browser chat requires sign-in; clicking the button will redirect you to Microsoft sign-in.</p>"
+            : "";
 
         return $$"""
 <!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Foundry Agent Bot Admin</title>
 <style>
-  *{box-sizing:border-box} body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f3f4f6;color:#1f2328;min-height:100vh} header{background:#0d1117;color:#fff;padding:22px 24px} header h1{margin:0;font-size:22px} header p{margin:8px 0 0;color:#c9d1d9;font-family:ui-monospace,Consolas,monospace;font-size:13px;word-break:break-all} main{max-width:920px;margin:0 auto;padding:24px}.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:18px;margin-bottom:16px}.actions{display:flex;gap:12px;flex-wrap:wrap}.btn{background:#0969da;color:#fff;border:0;padding:11px 16px;border-radius:7px;font-weight:700;cursor:pointer;text-decoration:none}.btn:hover{background:#0550ae} ul{margin:8px 0 0;padding-left:20px} li{margin:8px 0} li span{display:block;color:#656d76;font-size:13px}.meta{display:grid;grid-template-columns:max-content 1fr;gap:6px 12px;font-size:14px}.meta code{font-family:ui-monospace,Consolas,monospace;background:#f6f8fa;padding:2px 6px;border-radius:4px;word-break:break-all} dialog{border:0;border-radius:10px;padding:0;box-shadow:0 12px 32px rgba(0,0,0,.22);max-width:520px;width:92%} dialog::backdrop{background:rgba(0,0,0,.45)} .modal{padding:20px}.modal h2{margin:0 0 8px;font-size:18px}.modal p{margin:0 0 14px;color:#656d76}.modal label{display:block;font-size:13px;font-weight:600;margin:12px 0 4px}.modal input[type=text]{width:100%;padding:9px;border:1px solid #d0d7de;border-radius:6px;font:14px ui-monospace,Consolas,monospace}.check{display:flex;gap:8px;align-items:center;margin-top:12px;color:#57606a}.row{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.secondary{background:#fff;color:#0969da;border:1px solid #0969da}.secondary:hover{background:#ddf4ff}
+  *{box-sizing:border-box} body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f3f4f6;color:#1f2328;min-height:100vh} header{background:#0d1117;color:#fff;padding:22px 24px} header h1{margin:0;font-size:22px} header p{margin:8px 0 0;color:#c9d1d9;font-family:ui-monospace,Consolas,monospace;font-size:13px;word-break:break-all} main{max-width:920px;margin:0 auto;padding:24px}.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:18px;margin-bottom:16px}.actions{display:flex;gap:12px;flex-wrap:wrap}.btn{background:#0969da;color:#fff;border:0;padding:11px 16px;border-radius:7px;font-weight:700;cursor:pointer;text-decoration:none}.btn:hover{background:#0550ae}.note{margin:12px 0 0;color:#57606a;font-size:13px} ul{margin:8px 0 0;padding-left:20px} li{margin:8px 0} li span{display:block;color:#656d76;font-size:13px}.meta{display:grid;grid-template-columns:max-content 1fr;gap:6px 12px;font-size:14px}.meta code{font-family:ui-monospace,Consolas,monospace;background:#f6f8fa;padding:2px 6px;border-radius:4px;word-break:break-all} dialog{border:0;border-radius:10px;padding:0;box-shadow:0 12px 32px rgba(0,0,0,.22);max-width:520px;width:92%} dialog::backdrop{background:rgba(0,0,0,.45)} .modal{padding:20px}.modal h2{margin:0 0 8px;font-size:18px}.modal p{margin:0 0 14px;color:#656d76}.modal label{display:block;font-size:13px;font-weight:600;margin:12px 0 4px}.modal input[type=text]{width:100%;padding:9px;border:1px solid #d0d7de;border-radius:6px;font:14px ui-monospace,Consolas,monospace}.check{display:flex;gap:8px;align-items:center;margin-top:12px;color:#57606a}.row{display:flex;justify-content:flex-end;gap:8px;margin-top:18px}.secondary{background:#fff;color:#0969da;border:1px solid #0969da}.secondary:hover{background:#ddf4ff}
 </style></head><body>
 <header><h1>🤖 Foundry Agent Bot</h1><p>{{Html(defaultEndpoint)}}</p></header>
 <main>
@@ -309,6 +314,7 @@ public class ManifestController : ControllerBase
       <button class="btn" data-action="chat">Open Browser Chat</button>
       <button class="btn" data-action="manifest">Generate Teams Manifest</button>
     </div>
+    {{chatAuthNote}}
   </section>
   <section class="card">
     <h2>Configured default</h2>

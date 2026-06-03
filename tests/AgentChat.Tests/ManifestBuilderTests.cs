@@ -128,6 +128,33 @@ public class ManifestBuilderTests
     }
 
     [Fact]
+    public void Build_does_not_emit_webApplicationInfo_by_default()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId);
+        m["webApplicationInfo"].Should().BeNull();
+    }
+
+    [Fact]
+    public void Build_emits_webApplicationInfo_when_sso_app_id_provided()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId,
+            ssoAadAppId: "00000000-0000-0000-0000-deadbeef0001",
+            ssoResource: "api://my-bot-app/access_as_user");
+        var wai = m["webApplicationInfo"]!;
+        wai["id"]!.ToString().Should().Be("00000000-0000-0000-0000-deadbeef0001");
+        wai["resource"]!.ToString().Should().Be("api://my-bot-app/access_as_user");
+    }
+
+    [Fact]
+    public void Build_omits_webApplicationInfo_resource_when_only_app_id_given()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId, ssoAadAppId: "00000000-0000-0000-0000-deadbeef0001");
+        var wai = m["webApplicationInfo"]!;
+        wai["id"].Should().NotBeNull();
+        wai["resource"].Should().BeNull();
+    }
+
+    [Fact]
     public void Build_does_not_emit_botEndpointPath_when_omitted_or_default()
     {
         var m1 = ManifestBuilder.Build("Agent", "Desc", BotId);

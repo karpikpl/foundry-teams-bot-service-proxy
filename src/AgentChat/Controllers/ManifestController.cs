@@ -203,7 +203,17 @@ public class ManifestController : ControllerBase
     private async Task<byte[]> BuildManifestZipAsync(
         string agentName, string agentDescription, string botId, string? botEndpointPath, CancellationToken ct)
     {
-        var manifest = ManifestBuilder.Build(agentName, agentDescription, botId, botEndpointPath);
+        // When Teams SSO is configured for the bot, embed webApplicationInfo
+        // so Teams attempts silent SSO instead of showing an interactive
+        // OAuthCard. The AAD app id may differ from the bot UAMI's client id
+        // — TeamsSso:AadAppId overrides it.
+        var ssoAppId   = _config["TeamsSso:AadAppId"];
+        var ssoResource = _config["TeamsSso:Resource"];
+        var manifest   = ManifestBuilder.Build(
+            agentName, agentDescription, botId,
+            botEndpointPath: botEndpointPath,
+            ssoAadAppId: ssoAppId,
+            ssoResource: ssoResource);
 
         var colorPath   = Path.Combine(_env.WebRootPath, "color.png");
         var outlinePath = Path.Combine(_env.WebRootPath, "outline.png");

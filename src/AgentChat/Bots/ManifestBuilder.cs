@@ -32,7 +32,14 @@ public static class ManifestBuilder
         ("/help",    "List commands")
     };
 
-    public static JObject Build(string agentName, string agentDescription, string botId, string? botEndpointPath = null, Guid? manifestId = null)
+    public static JObject Build(
+        string agentName,
+        string agentDescription,
+        string botId,
+        string? botEndpointPath = null,
+        Guid? manifestId = null,
+        string? ssoAadAppId = null,
+        string? ssoResource = null)
     {
         if (string.IsNullOrWhiteSpace(agentName))
             throw new ArgumentException("agentName is required", nameof(agentName));
@@ -90,7 +97,7 @@ public static class ManifestBuilder
             botBlock["x-foundryBotEndpointPath"] = botEndpointPath;
         }
 
-        return new JObject
+        var manifest = new JObject
         {
             ["$schema"]         = SchemaUrl,
             ["manifestVersion"] = ManifestVersion,
@@ -110,6 +117,19 @@ public static class ManifestBuilder
             ["bots"]        = new JArray { botBlock },
             ["validDomains"] = new JArray()
         };
+
+        // Teams SSO wiring — Teams uses webApplicationInfo to attempt silent
+        // SSO against the bot's AAD app. Required for OAuth identity
+        // passthrough to MCP servers without an extra sign-in click.
+        if (!string.IsNullOrEmpty(ssoAadAppId))
+        {
+            var webAppInfo = new JObject { ["id"] = ssoAadAppId };
+            if (!string.IsNullOrEmpty(ssoResource))
+                webAppInfo["resource"] = ssoResource;
+            manifest["webApplicationInfo"] = webAppInfo;
+        }
+
+        return manifest;
     }
 
     /// <summary>

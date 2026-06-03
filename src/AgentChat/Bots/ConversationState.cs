@@ -31,6 +31,11 @@ public class ConversationState : IStoreItem
     /// pending consent card was shown; cleared on the next user reply.</summary>
     public string? PendingConsentResponseId { get; set; }
 
+    /// <summary>User's pending message when an SSO sign-in card was shown.
+    /// Replayed automatically after the user completes Teams SSO via the
+    /// <c>signin/tokenExchange</c> invoke handler.</summary>
+    public string? PendingSsoMessage { get; set; }
+
     // ---- token usage accumulators ----
     public long PromptTokensTotal     { get; set; }
     public long CompletionTokensTotal { get; set; }

@@ -129,6 +129,97 @@ public class FoundryBotTests
     }
 
     [Fact]
+    public async Task Signin_failure_surfaces_full_body_and_logs_error()
+    {
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(logger: logger);
+        var adapter = new TestAdapter();
+        var value = JObject.FromObject(new
+        {
+            code = "invokeerror",
+            message = "Invoke error occurred",
+            details = "full diagnostic body"
+        });
+        var turn = MakeInvokeTurn(adapter, "conv-signin-failure", "signin/failure", value);
+
+        await bot.InvokeSignInAsync(turn);
+
+        var reply = adapter.GetNextReply().AsMessageActivity().Text;
+        reply.Should().Contain("Teams silent SSO failed");
+        reply.Should().Contain("```\n{\"code\":\"invokeerror\",\"message\":\"Invoke error occurred\",\"details\":\"full diagnostic body\"}\n```");
+        reply.Should().Contain("Common causes");
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Error
+            && m.Message.Contains("Teams SSO signin/failure received")
+            && m.Message.Contains("full diagnostic body"));
+    }
+
+    [Fact]
+    public async Task Sign_in_card_logs_token_exchange_resource_details()
+    {
+        var logger = new ListLogger<FoundryBot>();
+        var sso = new FakeSsoService(
+            token: null,
+            signInResource: new SignInResource
+            {
+                SignInLink = "https://login.example/signin",
+                TokenExchangeResource = new TokenExchangeResource
+                {
+                    Uri = "api://bot-app/access_as_user",
+                    Id = "exchange-id",
+                    ProviderId = "aad-v2"
+                }
+            });
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(),
+            new HttpContextAccessor(),
+            new AgentClientCache(agents),
+            sso,
+            logger);
+        var adapter = new TestAdapter();
+        var turn = MakeMessageTurn(adapter, "hello", convId: "conv-signin-card");
+
+        await bot.InvokeAsync(turn);
+
+        adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
+        adapter.GetNextReply().Type.Should().Be(ActivityTypes.Message);
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Information
+            && m.Message.Contains("Sending OAuthCard for Teams SSO")
+            && m.Message.Contains("connection=foundry-oauth")
+            && m.Message.Contains("tokenExchangeResourceUri=api://bot-app/access_as_user")
+            && m.Message.Contains("tokenExchangeResourceId=exchange-id")
+            && m.Message.Contains("tokenExchangeResourceProviderId=aad-v2"));
+    }
+
+    [Fact]
+    public async Task LoggingMiddleware_logs_incoming_and_outgoing_activity_types()
+    {
+        var logger = new ListLogger<LoggingMiddleware>();
+        var middleware = new LoggingMiddleware(logger);
+        var adapter = new TestAdapter();
+        var turn = MakeMessageTurn(adapter, "hello", convId: "conv-middleware");
+
+        await middleware.OnTurnAsync(turn, async ct =>
+        {
+            await turn.SendActivityAsync(MessageFactory.Text("reply"), ct);
+        }, CancellationToken.None);
+
+        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("reply");
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Information
+            && m.Message.Contains("Incoming activity: type=message"));
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Information
+            && m.Message.Contains("Outgoing activity: type=message"));
+    }
+
+    [Fact]
     public async Task Token_exchange_invoke_returns_412_when_exchange_fails()
     {
         var sso = new FakeSsoService(token: null, exchangeException: new InvalidOperationException("test failure"));
@@ -346,19 +437,24 @@ public class FoundryBotTests
     {
         private readonly string? _token;
         private readonly Exception? _exchangeException;
+        private readonly SignInResource? _signInResource;
         public int ExchangeCalls { get; private set; }
 
-        public FakeSsoService(string? token, bool enabled = true, Exception? exchangeException = null)
+        public FakeSsoService(string? token, bool enabled = true, Exception? exchangeException = null, SignInResource? signInResource = null)
             : base(enabled
                 ? TestServices.Config(new KeyValuePair<string, string?>("TeamsSso:ConnectionName", "foundry-oauth"))
                 : TestServices.Config(), NullLogger<TeamsSsoService>.Instance)
         {
             _token = token;
             _exchangeException = exchangeException;
+            _signInResource = signInResource;
         }
 
         public override Task<TokenResponse?> TryGetUserTokenAsync(ITurnContext turnContext, CancellationToken ct = default)
             => Task.FromResult<TokenResponse?>(_token is null ? null : new TokenResponse { Token = _token });
+
+        public override Task<SignInResource?> GetSignInResourceAsync(ITurnContext turnContext, CancellationToken ct = default)
+            => Task.FromResult(_signInResource);
 
         public override Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
         {

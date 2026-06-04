@@ -11,7 +11,8 @@ public class AdapterWithErrorHandler : CloudAdapter
         BotFrameworkAuthentication auth,
         IStorage storage,
         IConfiguration configuration,
-        ILogger<IBotFrameworkHttpAdapter> logger)
+        ILogger<IBotFrameworkHttpAdapter> logger,
+        ILogger<LoggingMiddleware> activityLogger)
         : base(auth, logger)
     {
         // Dedup signin/tokenExchange invokes across Teams clients. Without this,
@@ -24,6 +25,7 @@ public class AdapterWithErrorHandler : CloudAdapter
         {
             base.Use(new TeamsSSOTokenExchangeMiddleware(storage, connectionName));
         }
+        base.Use(new LoggingMiddleware(activityLogger));
 
         OnTurnError = async (turnContext, exception) =>
         {

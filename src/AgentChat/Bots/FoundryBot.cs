@@ -135,6 +135,7 @@ public class FoundryBot : TeamsActivityHandler
                         ("/usage on|off",  "Toggle the per-run usage footer"),
                         ("/tools on|off",  "Show or hide tool-call cards (off by default)"),
                         ("/auto list|clear", "Manage auto-approved MCP tools"),
+                        ("/signout",       "Sign out (clears cached Teams SSO token)"),
                         ("/reset",         "Start a new conversation (loses memory)"),
                         ("/stop",          "Cancel the running agent turn"),
                         ("/help",          "Show this card")
@@ -187,6 +188,25 @@ public class FoundryBot : TeamsActivityHandler
             case "/agent":
             case "/info":
                 await HandleAgentInfoCommandAsync(turnContext, state, ct);
+                break;
+
+            case "/signout":
+            case "/logout":
+                if (!_sso.Enabled)
+                {
+                    await turnContext.SendActivityAsync(MessageFactory.Text("Sign-out is unavailable: Teams SSO is not enabled on this bot."), ct);
+                    break;
+                }
+                try
+                {
+                    await _sso.SignOutAsync(turnContext, ct);
+                    await turnContext.SendActivityAsync(MessageFactory.Text("👋 Signed out. Send another message to sign in again."), ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Sign-out failed");
+                    await turnContext.SendActivityAsync(MessageFactory.Text($"⚠️ Sign-out failed: {ex.Message}"), ct);
+                }
                 break;
 
             default:

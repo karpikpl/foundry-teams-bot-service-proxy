@@ -1283,6 +1283,27 @@ public class FoundryBot : TeamsActivityHandler
         var valueType = turnContext.Activity.Value?.GetType().FullName ?? "(null)";
         _logger.LogInformation("Invoke received: name={Name}, valueType={ValueType}", turnContext.Activity.Name, valueType);
 
+        // Teams emits signin/failure when its silent SSO attempt fails before
+        // reaching token exchange. The body is the actual diagnostic - log it
+        // verbatim and surface a short reason to the user so misconfiguration
+        // (wrong tokenExchangeResource, missing preAuthorizedApplications,
+        // unconsented scope, etc.) is visible without log diving.
+        if (string.Equals(turnContext.Activity.Name, "signin/failure", StringComparison.OrdinalIgnoreCase))
+        {
+            string body;
+            try { body = turnContext.Activity.Value?.ToString() ?? "(empty)"; }
+            catch (Exception ex) { body = $"(serialize failed: {ex.Message})"; }
+            _logger.LogError("Teams SSO signin/failure received. Body: {Body}", body);
+            try
+            {
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    $"⚠️ Teams silent SSO failed before reaching the bot. Diagnostic:\n```\n{body}\n```\nCommon causes: wrong `tokenExchangeResource` on the OAuthCard, missing `preAuthorizedApplications` in the AAD app, user hasn't consented to `access_as_user`, or the bot's OAuth Connection in Bot Service is misconfigured."),
+                    cancellationToken);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "Could not surface signin/failure to user"); }
+            return new InvokeResponse { Status = (int)HttpStatusCode.OK };
+        }
+
         if (IsTeamsSignInInvoke(turnContext.Activity.Name))
         {
             var payload = TryReadTokenExchangePayload(turnContext.Activity.Value);

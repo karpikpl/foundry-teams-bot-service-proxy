@@ -92,7 +92,6 @@ public class ManifestController : ControllerBase
         var agents = await LoadAgentsAsync(foundryHost, project, ct);
         if (agents.ErrorHtml is not null) return HtmlResult(agents.ErrorHtml, 502);
 
-        var serverHasSso = ServerHasSsoConfig();
         var html = RenderManifestForm(
             foundryHost,
             project,
@@ -100,9 +99,6 @@ public class ManifestController : ControllerBase
             agents.Agents!,
             selectedAgent: null,
             botId: "",
-            includeSso: serverHasSso,
-            serverHasSso: serverHasSso,
-            ssoAppId: _config["TeamsSso:AadAppId"],
             error: null);
         return HtmlResult(html);
     }
@@ -113,16 +109,14 @@ public class ManifestController : ControllerBase
         string project,
         [FromForm] string? agentName,
         [FromForm] string? botId,
-        CancellationToken ct,
-        [FromForm] bool? includeSso = null)
+        CancellationToken ct)
     {
-        var effectiveIncludeSso = includeSso ?? ServerHasSsoConfig();
         if (string.IsNullOrWhiteSpace(agentName))
         {
-            return await ManifestFormError(foundryHost, project, null, botId, effectiveIncludeSso, "Choose an agent.", ct);
+            return await ManifestFormError(foundryHost, project, null, botId, "Choose an agent.", ct);
         }
 
-        return await ManifestDownload(foundryHost, project, agentName!, botId, effectiveIncludeSso, ct);
+        return await ManifestDownload(foundryHost, project, agentName!, botId, ct);
     }
 
     [HttpGet("{foundryHost}/{project}/manifest/{agentName}")]
@@ -137,7 +131,6 @@ public class ManifestController : ControllerBase
             return HtmlResult($"<html><body><h1>Agent not found</h1><p>{Html(agentName)} was not found in {Html(FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project))}.</p></body></html>", 404);
         }
 
-        var serverHasSso = ServerHasSsoConfig();
         var html = RenderManifestForm(
             foundryHost,
             project,
@@ -145,9 +138,6 @@ public class ManifestController : ControllerBase
             agents.Agents!,
             selectedAgent: agentName,
             botId: "",
-            includeSso: serverHasSso,
-            serverHasSso: serverHasSso,
-            ssoAppId: _config["TeamsSso:AadAppId"],
             error: null);
         return HtmlResult(html);
     }
@@ -158,26 +148,19 @@ public class ManifestController : ControllerBase
         string project,
         string agentName,
         [FromForm] string? botId,
-        CancellationToken ct,
-        [FromForm] bool? includeSso = null)
-        => await ManifestDownload(foundryHost, project, agentName, botId, includeSso ?? ServerHasSsoConfig(), ct);
+        CancellationToken ct)
+        => await ManifestDownload(foundryHost, project, agentName, botId, ct);
 
     private async Task<IActionResult> ManifestDownload(
         string foundryHost,
         string project,
         string agentName,
         string? botId,
-        bool includeSso,
         CancellationToken ct)
     {
         if (!Guid.TryParse(botId, out _))
         {
-            return await ManifestFormError(foundryHost, project, agentName, botId, includeSso, "Bot ID must be a valid GUID.", ct);
-        }
-
-        if (includeSso && !ServerHasSsoConfig())
-        {
-            return await ManifestFormError(foundryHost, project, agentName, botId, includeSso, "SSO requested but server is not configured. Set TeamsSso__AadAppId and TeamsSso__Resource on the proxy, then retry.", ct);
+            return await ManifestFormError(foundryHost, project, agentName, botId, "Bot ID must be a valid GUID.", ct);
         }
 
         var agents = await LoadAgentsAsync(foundryHost, project, ct);
@@ -190,7 +173,7 @@ public class ManifestController : ControllerBase
             ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
             : agent.Description;
 
-        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId!, includeSso, ct);
+        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId!, ct);
         return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}.zip");
     }
 
@@ -199,7 +182,6 @@ public class ManifestController : ControllerBase
         string project,
         string? selectedAgent,
         string? botId,
-        bool includeSso,
         string error,
         CancellationToken ct)
     {
@@ -211,9 +193,6 @@ public class ManifestController : ControllerBase
             agents.Agents!,
             selectedAgent,
             botId ?? "",
-            includeSso,
-            serverHasSso: ServerHasSsoConfig(),
-            ssoAppId: _config["TeamsSso:AadAppId"],
             error);
         return HtmlResult(html, 400);
     }
@@ -261,10 +240,10 @@ public class ManifestController : ControllerBase
     }
 
     private async Task<byte[]> BuildManifestZipAsync(
-        string agentName, string agentDescription, string botId, bool includeSso, CancellationToken ct)
+        string agentName, string agentDescription, string botId, CancellationToken ct)
     {
-        var ssoAppId    = includeSso ? _config["TeamsSso:AadAppId"] : null;
-        var ssoResource = includeSso ? _config["TeamsSso:Resource"] : null;
+        var ssoAppId    = _config["TeamsSso:AadAppId"];
+        var ssoResource = _config["TeamsSso:Resource"];
         var manifest = ManifestBuilder.Build(
             agentName, agentDescription, botId,
             ssoAadAppId: ssoAppId,
@@ -299,17 +278,6 @@ public class ManifestController : ControllerBase
 
     private static ContentResult HtmlResult(string html, int statusCode = 200)
         => new() { Content = html, ContentType = "text/html; charset=utf-8", StatusCode = statusCode };
-
-    private bool ServerHasSsoConfig()
-        => !string.IsNullOrWhiteSpace(_config["TeamsSso:AadAppId"])
-           && !string.IsNullOrWhiteSpace(_config["TeamsSso:Resource"]);
-
-    private static string AbbreviateAppId(string? appId)
-    {
-        if (string.IsNullOrWhiteSpace(appId)) return "unknown";
-        var trimmed = appId.Trim();
-        return trimmed.Length <= 13 ? trimmed : $"{trimmed[..8]}…{trimmed[^4..]}";
-    }
 
     private static string Sanitize(string s) => ManifestBuilder.SanitizeForFilename(s);
     private static string Html(string? s)    => System.Net.WebUtility.HtmlEncode(s ?? "");
@@ -405,9 +373,6 @@ public class ManifestController : ControllerBase
         IReadOnlyList<FoundryAgentsApi.AgentSummary> agents,
         string? selectedAgent,
         string botId,
-        bool includeSso,
-        bool serverHasSso,
-        string? ssoAppId,
         string? error)
     {
         var agentOptions = string.Join("", agents.Select(a =>
@@ -419,10 +384,6 @@ public class ManifestController : ControllerBase
             ? $"/admin/{Uri.EscapeDataString(foundryHost)}/{Uri.EscapeDataString(project)}/manifest"
             : $"/admin/{Uri.EscapeDataString(foundryHost)}/{Uri.EscapeDataString(project)}/manifest/{Uri.EscapeDataString(selectedAgent)}";
         var errorHtml = string.IsNullOrEmpty(error) ? "" : $"<div class=\"error\">{Html(error)}</div>";
-        var ssoChecked = includeSso ? " checked" : "";
-        var ssoHelp = serverHasSso
-            ? $"Server SSO config detected (AAD app {Html(AbbreviateAppId(ssoAppId))}). Uncheck to generate a plain manifest without SSO."
-            : "SSO is not configured on this proxy (TeamsSso__AadAppId not set). Check this box only after configuring the server.";
         var agentField = selectedAgent is null
             ? $"<label>Agent<select name=\"AgentName\" required><option value=\"\">Choose an agent…</option>{agentOptions}</select></label>"
             : $"<input type=\"hidden\" name=\"AgentName\" value=\"{Html(selectedAgent)}\"/><div class=\"agent\"><strong>Agent</strong><span>{Html(selectedAgent)}</span></div>";
@@ -432,7 +393,7 @@ public class ManifestController : ControllerBase
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Generate Teams Manifest</title>
 <style>
-  *{box-sizing:border-box} body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f3f4f6;color:#1f2328;min-height:100vh} header{background:#0d1117;color:#fff;padding:18px 24px} header h1{margin:0;font-size:20px} header p{margin:6px 0 0;color:#c9d1d9;font:13px ui-monospace,Consolas,monospace;word-break:break-all} main{max-width:760px;margin:0 auto;padding:24px}.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:20px}.help{background:#ddf4ff;border:1px solid #54aeff;border-radius:8px;padding:14px;margin:14px 0;line-height:1.55}.help code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px} label{display:block;font-weight:700;margin:14px 0 6px} input,select{width:100%;padding:10px;border:1px solid #d0d7de;border-radius:7px;font:14px ui-monospace,Consolas,monospace}.sso{margin:16px 0 0}.sso label{display:flex;gap:8px;align-items:flex-start;margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif}.sso input[type=checkbox]{width:auto;margin-top:3px}.sso .hint{margin:4px 0 0 24px;color:#57606a;font-size:13px;line-height:1.4}.btn{margin-top:16px;background:#0969da;color:#fff;border:0;padding:11px 16px;border-radius:7px;font-weight:700;cursor:pointer}.btn:hover{background:#0550ae}.error{background:#ffebe9;border:1px solid #ff8182;color:#cf222e;border-radius:7px;padding:10px 12px;margin-bottom:12px}.agent{display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;background:#f6f8fa;border:1px solid #d0d7de;border-radius:7px;padding:10px}.agent span{font-family:ui-monospace,Consolas,monospace}
+  *{box-sizing:border-box} body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f3f4f6;color:#1f2328;min-height:100vh} header{background:#0d1117;color:#fff;padding:18px 24px} header h1{margin:0;font-size:20px} header p{margin:6px 0 0;color:#c9d1d9;font:13px ui-monospace,Consolas,monospace;word-break:break-all} main{max-width:760px;margin:0 auto;padding:24px}.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:20px}.help{background:#ddf4ff;border:1px solid #54aeff;border-radius:8px;padding:14px;margin:14px 0;line-height:1.55}.help code{background:rgba(0,0,0,.08);padding:1px 5px;border-radius:4px} label{display:block;font-weight:700;margin:14px 0 6px} input,select{width:100%;padding:10px;border:1px solid #d0d7de;border-radius:7px;font:14px ui-monospace,Consolas,monospace}.btn{margin-top:16px;background:#0969da;color:#fff;border:0;padding:11px 16px;border-radius:7px;font-weight:700;cursor:pointer}.btn:hover{background:#0550ae}.error{background:#ffebe9;border:1px solid #ff8182;color:#cf222e;border-radius:7px;padding:10px 12px;margin-bottom:12px}.agent{display:grid;grid-template-columns:max-content 1fr;gap:8px 12px;background:#f6f8fa;border:1px solid #d0d7de;border-radius:7px;padding:10px}.agent span{font-family:ui-monospace,Consolas,monospace}
 </style></head><body>
 <header><h1>Generate Teams Manifest</h1><p>{{Html(projectEndpoint)}}</p></header>
 <main><section class="card">
@@ -442,11 +403,6 @@ public class ManifestController : ControllerBase
   <form method="post" action="{{Html(action)}}">
     {{agentField}}
     <label>Bot ID<input name="BotId" value="{{Html(botId)}}" placeholder="00000000-0000-0000-0000-000000000000" required/></label>
-    <div class="sso">
-      <label><input name="includeSso" type="checkbox" value="true"{{ssoChecked}}/> Include Teams SSO (webApplicationInfo + validDomains + permissions)</label>
-      <input name="includeSso" type="hidden" value="false"/>
-      <p class="hint">{{ssoHelp}}</p>
-    </div>
     <button class="btn" type="submit">Download manifest zip</button>
   </form>
 </section></main></body></html>

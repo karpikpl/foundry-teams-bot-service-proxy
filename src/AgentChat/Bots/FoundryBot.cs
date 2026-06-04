@@ -8,6 +8,7 @@ using Microsoft.Bot.Builder;
 using Microsoft.Bot.Builder.Teams;
 using Microsoft.Bot.Connector.Authentication;
 using Microsoft.Bot.Schema;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Responses;
 
@@ -653,6 +654,13 @@ public class FoundryBot : TeamsActivityHandler
             }
         };
 
+        _logger.LogInformation(
+            "Sending OAuthCard for Teams SSO: connection={ConnectionName}, tokenExchangeResourceUri={Uri}, tokenExchangeResourceId={Id}, tokenExchangeResourceProviderId={ProviderId}",
+            _sso.ConnectionName,
+            oauthCard.TokenExchangeResource?.Uri,
+            oauthCard.TokenExchangeResource?.Id,
+            oauthCard.TokenExchangeResource?.ProviderId);
+
         await turnContext.SendActivityAsync(
             MessageFactory.Attachment(new Attachment
             {
@@ -669,6 +677,9 @@ public class FoundryBot : TeamsActivityHandler
         CancellationToken ct,
         string? userTokenOverride = null)
     {
+        var activityId = EnsureActivityId(turnContext);
+        using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
+
         var auth = string.IsNullOrEmpty(userTokenOverride)
             ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct)
             : new UserAuth(FoundryUserAuthScope.Use(userTokenOverride), false);
@@ -682,6 +693,9 @@ public class FoundryBot : TeamsActivityHandler
 
     private async Task RunAgentTurnInnerAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct)
     {
+        var activityId = EnsureActivityId(turnContext);
+        using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
+
         var routing = TurnRouting.From(_httpContext, _agents);
         var targetEndpoint = routing.IsRouted
             ? routing.AgentEndpoint
@@ -1298,10 +1312,38 @@ public class FoundryBot : TeamsActivityHandler
 
     // ---------------------------------------------------------------- Teams SSO invoke
 
+    private static string EnsureActivityId(ITurnContext turnContext)
+    {
+        if (string.IsNullOrWhiteSpace(turnContext.Activity.Id))
+        {
+            turnContext.Activity.Id = Guid.NewGuid().ToString("N");
+        }
+
+        return turnContext.Activity.Id;
+    }
+
+    private static string SerializeActivityValue(object? value, int maxChars)
+    {
+        if (value is null) return "(empty)";
+
+        string body;
+        try
+        {
+            body = JsonConvert.SerializeObject(value, Formatting.None) ?? "(empty)";
+        }
+        catch (Exception ex)
+        {
+            body = $"(serialize failed: {ex.Message})";
+        }
+
+        return body.Length <= maxChars ? body : body.Substring(0, maxChars);
+    }
+
     protected override async Task<InvokeResponse> OnInvokeActivityAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
     {
         var valueType = turnContext.Activity.Value?.GetType().FullName ?? "(null)";
-        _logger.LogInformation("Invoke received: name={Name}, valueType={ValueType}", turnContext.Activity.Name, valueType);
+        var valueJson = SerializeActivityValue(turnContext.Activity.Value, 2000);
+        _logger.LogInformation("Invoke received: name={Name}, valueType={ValueType}, value={Value}", turnContext.Activity.Name, valueType, valueJson);
 
         // Teams emits signin/failure when its silent SSO attempt fails before
         // reaching token exchange. The body is the actual diagnostic - log it
@@ -1310,9 +1352,7 @@ public class FoundryBot : TeamsActivityHandler
         // unconsented scope, etc.) is visible without log diving.
         if (string.Equals(turnContext.Activity.Name, "signin/failure", StringComparison.OrdinalIgnoreCase))
         {
-            string body;
-            try { body = turnContext.Activity.Value?.ToString() ?? "(empty)"; }
-            catch (Exception ex) { body = $"(serialize failed: {ex.Message})"; }
+            var body = SerializeActivityValue(turnContext.Activity.Value, 1500);
             _logger.LogError("Teams SSO signin/failure received. Body: {Body}", body);
             try
             {

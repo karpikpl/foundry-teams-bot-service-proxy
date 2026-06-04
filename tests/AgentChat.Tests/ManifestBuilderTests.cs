@@ -155,6 +155,30 @@ public class ManifestBuilderTests
     }
 
     [Fact]
+    public void Build_emits_validDomains_when_sso_app_id_provided()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId, ssoAadAppId: "00000000-0000-0000-0000-deadbeef0001");
+        var validDomains = ((JArray)m["validDomains"]!).Select(d => d.ToString()).ToArray();
+        validDomains.Should().BeEquivalentTo(new[] { "token.botframework.com", "*.botframework.com" });
+    }
+
+    [Fact]
+    public void Build_emits_permissions_when_sso_app_id_provided()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId, ssoAadAppId: "00000000-0000-0000-0000-deadbeef0001");
+        var permissions = ((JArray)m["permissions"]!).Select(p => p.ToString()).ToArray();
+        permissions.Should().BeEquivalentTo(new[] { "identity", "messageTeamMembers" });
+    }
+
+    [Fact]
+    public void Build_leaves_validDomains_empty_and_permissions_absent_when_sso_disabled()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId);
+        ((JArray)m["validDomains"]!).Should().BeEmpty();
+        m["permissions"].Should().BeNull();
+    }
+
+    [Fact]
     public void Build_does_not_emit_botEndpointPath_when_omitted_or_default()
     {
         // x-foundryBotEndpointPath was removed entirely — Teams' manifest

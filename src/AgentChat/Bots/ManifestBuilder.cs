@@ -114,6 +114,8 @@ public static class ManifestBuilder
             if (!string.IsNullOrEmpty(ssoResource))
                 webAppInfo["resource"] = ssoResource;
             manifest["webApplicationInfo"] = webAppInfo;
+            manifest["validDomains"] = new JArray("token.botframework.com", "*.botframework.com");
+            manifest["permissions"] = new JArray("identity", "messageTeamMembers");
         }
 
         return manifest;

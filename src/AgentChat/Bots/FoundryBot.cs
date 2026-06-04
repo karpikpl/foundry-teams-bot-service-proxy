@@ -633,6 +633,17 @@ public class FoundryBot : TeamsActivityHandler
             }
         };
 
+        // Diagnostic log for resourcematchfailed troubleshooting: emit the
+        // exact TokenExchangeResource we are about to send so it can be
+        // compared verbatim against the Teams manifest's
+        // webApplicationInfo.resource and the AAD app's identifierUris.
+        _logger.LogInformation(
+            "OAuthCard TokenExchangeResource: Uri={Uri}, Id={Id}, ProviderId={Provider}; ConnectionName={Conn}",
+            resource.TokenExchangeResource?.Uri,
+            resource.TokenExchangeResource?.Id,
+            resource.TokenExchangeResource?.ProviderId,
+            _sso.ConnectionName);
+
         await turnContext.SendActivityAsync(
             MessageFactory.Attachment(new Attachment
             {

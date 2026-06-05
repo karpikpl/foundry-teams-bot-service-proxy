@@ -903,9 +903,6 @@ public class FoundryBot : TeamsActivityHandler
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
-        bool sawMcpToolCall = false;
-        bool sawTextDelta = false;
-        bool startedFromApprovalResponse = clearsPendingApprovalOnStart;
 
         await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
         {
@@ -927,16 +924,11 @@ public class FoundryBot : TeamsActivityHandler
                     break;
 
                 case StreamingResponseOutputTextDeltaUpdate delta when !string.IsNullOrEmpty(delta.Delta):
-                    sawTextDelta = true;
                     streaming.AppendDelta(delta.Delta!);
                     await streaming.MaybeFlushAsync(ct);
                     break;
 
                 case StreamingResponseOutputItemDoneUpdate done:
-                    if (done.Item is McpToolCallItem)
-                    {
-                        sawMcpToolCall = true;
-                    }
                     await HandleCompletedItemAsync(
                         turnContext, state, streaming, done.Item, responseIdForResume,
                         pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, ct);
@@ -1071,12 +1063,15 @@ public class FoundryBot : TeamsActivityHandler
             return new StreamStep(true); // pause for user
         }
 
-        if (sawMcpToolCall || (startedFromApprovalResponse && !sawTextDelta))
-        {
-            _logger.LogInformation("Continuing Foundry response after MCP approval/tool hop using previous_response_id={ResponseId}.", state.CurrentResponseId ?? "(none)");
-            await streaming.FinalizeAsync(ct);
-            return new StreamStep(false);
-        }
+        // Foundry's MCP passthrough runs the tool server-side within the same
+        // streaming response — the model's tool call, the tool's result, and
+        // its narration all stream as deltas in ONE response. When we see
+        // StreamingResponseCompletedUpdate, the model is genuinely done; there
+        // is no "just keep going" continuation (the /responses API requires a
+        // non-empty `input` on every POST and would reject input_items=0 with
+        // HTTP 400 missing_required_parameter). Legitimate continuations are
+        // handled above: function-tool outputs (returns NextInputItems) and
+        // MCP approvals (returns Stop=true to pause for user).
 
         // 3) Done — emit usage card if enabled.
         await streaming.FinalizeAsync(ct);

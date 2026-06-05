@@ -40,10 +40,26 @@ public static class FoundryAgentsApi
     {
         var url = projectEndpoint.TrimEnd('/') + $"/agents?api-version={DefaultApiVersion}";
 
-        var token = await credential.GetTokenAsync(new TokenRequestContext(new[] { TokenScope }), ct);
+        // Honor the per-request OBO scope — when a user token is in scope we
+        // call Foundry as that user. Without a scope we fall back to the
+        // injected workload credential (UAMI). This is what lets us drop the
+        // "Azure AI User" RBAC from the UAMI: every call from /admin and from
+        // bot turns runs in a user scope, and only edge cases (unauthenticated
+        // background refreshes) ever fall back to the credential.
+        string token;
+        var userToken = FoundryUserAuthScope.Current;
+        if (!string.IsNullOrEmpty(userToken))
+        {
+            token = userToken!;
+        }
+        else
+        {
+            var tokenResult = await credential.GetTokenAsync(new TokenRequestContext(new[] { TokenScope }), ct);
+            token = tokenResult.Token;
+        }
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token.Token);
+        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
 
         using var resp = await http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)

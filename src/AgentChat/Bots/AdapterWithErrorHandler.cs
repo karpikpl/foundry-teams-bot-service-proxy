@@ -20,7 +20,7 @@ public class AdapterWithErrorHandler : CloudAdapter
         // the same invoke; the first wins, the rest fail and Teams reports the
         // failure as signin/failure with the generic invokeerror code.
         // The middleware uses IStorage (Cosmos here) for cross-replica dedup.
-        var connectionName = configuration["TeamsSso:ConnectionName"];
+        var connectionName = configuration["TeamsApp:SsoConnectionName"] ?? configuration["TeamsSso:ConnectionName"];
         if (!string.IsNullOrEmpty(connectionName))
         {
             base.Use(new TeamsSSOTokenExchangeMiddleware(storage, connectionName));

@@ -1,5 +1,7 @@
 using System.IO.Compression;
 using System.Text;
+using System.Text.Json;
+using AgentChat.Auth;
 using AgentChat.Bots;
 using AgentChat.Foundry;
 using AgentChat.Services;
@@ -14,6 +16,7 @@ namespace AgentChat.Controllers;
 /// </summary>
 [ApiController]
 [Route("admin")]
+[ServiceFilter(typeof(AdminChatAuthFilter))]
 public class ManifestController : ControllerBase
 {
     private readonly AgentService _agents;
@@ -21,30 +24,104 @@ public class ManifestController : ControllerBase
     private readonly IConfiguration _config;
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<ManifestController> _logger;
+    private readonly Microsoft.Identity.Web.ITokenAcquisition? _tokenAcquisition;
+    // Parsed Bots:Routes — keyed by agent name. Populated once at startup from
+    // the JSON injected by bicep. Lets the UI render Direct + Proxy buttons
+    // per agent without the operator having to copy bot IDs from the portal.
+    private readonly IReadOnlyDictionary<string, BotRoute> _routes;
 
     public ManifestController(
         AgentService agents,
         IHttpClientFactory httpFactory,
         IConfiguration config,
         IWebHostEnvironment env,
-        ILogger<ManifestController> logger)
+        ILogger<ManifestController> logger,
+        Microsoft.Identity.Web.ITokenAcquisition? tokenAcquisition = null)
     {
         _agents      = agents;
         _httpFactory = httpFactory;
         _config      = config;
         _env         = env;
         _logger      = logger;
+        _tokenAcquisition = tokenAcquisition;
+        _routes      = ParseRoutes(config["Bots:Routes"], logger);
+    }
+
+    private static IReadOnlyDictionary<string, BotRoute> ParseRoutes(string? json, ILogger logger)
+    {
+        var map = new Dictionary<string, BotRoute>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(json)) return map;
+        try
+        {
+            var entries = System.Text.Json.JsonSerializer.Deserialize<List<BotRouteEntry>>(json)
+                          ?? new List<BotRouteEntry>();
+            foreach (var e in entries)
+            {
+                if (string.IsNullOrEmpty(e.AgentName)) continue;
+                var proxy = !string.IsNullOrEmpty(e.ProxyAppId) ? e.ProxyAppId : e.AppId;
+                map[e.AgentName] = new BotRoute(e.AgentName, proxy, e.DirectAppId);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Bots:Routes could not be parsed; manifest UI will only show manual flow.");
+        }
+        return map;
+    }
+
+    private sealed record BotRoute(string AgentName, string? ProxyAppId, string? DirectAppId);
+
+    private sealed class BotRouteEntry
+    {
+        public string? AgentName { get; set; }
+        public string? ProxyAppId { get; set; }
+        public string? DirectAppId { get; set; }
+        public string? AppId { get; set; }
+    }
+
+    /// <summary>
+    /// Acquire an OBO-derived Foundry token for the signed-in admin and push
+    /// it onto the async-local FoundryUserAuthScope, so any FoundryAgentsApi
+    /// call inside the returned scope authenticates as that user. Returns a
+    /// no-op disposable when AdminChatAuth isn't enabled (preserves previous
+    /// UAMI fallback behavior for dev).
+    /// </summary>
+    private async Task<IDisposable> BeginFoundryUserScopeAsync()
+    {
+        if (_tokenAcquisition is null) return NoopDisposable.Instance;
+        if (!(User?.Identity?.IsAuthenticated ?? false)) return NoopDisposable.Instance;
+        try
+        {
+            var token = await _tokenAcquisition.GetAccessTokenForUserAsync(
+                new[] { AdminChatAuthOptions.FoundryScope });
+            return string.IsNullOrEmpty(token) ? NoopDisposable.Instance : FoundryUserAuthScope.Use(token);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "OBO token acquisition for /admin failed; falling back to UAMI credential.");
+            return NoopDisposable.Instance;
+        }
+    }
+
+    private sealed class NoopDisposable : IDisposable
+    {
+        public static readonly NoopDisposable Instance = new();
+        public void Dispose() { }
     }
 
     // ====================================================== JSON: agents
 
     [HttpGet("agents")]
     public async Task<IActionResult> ListDefaultAgents(CancellationToken ct)
-        => Ok((await _agents.GetDescriptorsAsync(forceRefresh: false, ct: ct)).Select(ToDto));
+    {
+        using var scope = await BeginFoundryUserScopeAsync();
+        return Ok((await _agents.GetDescriptorsAsync(forceRefresh: false, ct: ct)).Select(ToDto));
+    }
 
     [HttpGet("{foundryHost}/{project}/agents")]
     public async Task<IActionResult> ListScopedAgents(string foundryHost, string project, CancellationToken ct)
     {
+        using var scope = await BeginFoundryUserScopeAsync();
         var projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project);
         var catalog = await _agents.GetDescriptorsAsync(projectEndpoint, forceRefresh: false, ct: ct);
         return Ok(catalog.Select(ToDto));
@@ -64,6 +141,7 @@ public class ManifestController : ControllerBase
     [Produces("text/html")]
     public async Task<ContentResult> Landing(CancellationToken ct)
     {
+        using var scope = await BeginFoundryUserScopeAsync();
         var defaultEndpoint = _agents.DefaultProjectEndpoint;
         TryDeriveFoundryHostAndProject(defaultEndpoint, out var defaultFoundryHost, out var defaultProject);
         var agents = await _agents.GetDescriptorsAsync(forceRefresh: false, ct: ct);
@@ -77,12 +155,12 @@ public class ManifestController : ControllerBase
     [Produces("text/html")]
     public async Task<ContentResult> DefaultManifestForm(CancellationToken ct)
     {
-        if (!TryDeriveFoundryHostAndProject(_agents.DefaultProjectEndpoint, out var foundryHost, out var project))
+        var defaultEndpoint = _config["Foundry:ProjectEndpoint"] ?? "";
+        if (!TryDeriveFoundryHostAndProject(defaultEndpoint, out var fh, out var pj))
         {
-            return HtmlResult($"<html><body><h1>Cannot derive default Foundry route</h1><p>Visit <code>/admin/{{foundryHost}}/{{project}}/manifest</code> directly.</p><pre>{Html(_agents.DefaultProjectEndpoint)}</pre></body></html>", 400);
+            return HtmlResult("<html><body><h1>Default project endpoint is not configured.</h1></body></html>", 500);
         }
-
-        return await ProjectManifestForm(foundryHost, project, ct);
+        return await ProjectManifestForm(fh, pj, ct);
     }
 
     [HttpGet("{foundryHost}/{project}/manifest")]
@@ -91,6 +169,20 @@ public class ManifestController : ControllerBase
     {
         var agents = await LoadAgentsAsync(foundryHost, project, ct);
         if (agents.ErrorHtml is not null) return HtmlResult(agents.ErrorHtml, 502);
+
+        // Default project + populated Bots:Routes => render the auto-list
+        // (two buttons per agent, no manual BotId). Anything else falls back
+        // to the legacy manual-entry form.
+        var defaultEndpoint = _config["Foundry:ProjectEndpoint"] ?? "";
+        TryDeriveFoundryHostAndProject(defaultEndpoint, out var defaultHost, out var defaultProject);
+        var isDefaultProject = _routes.Count > 0
+            && string.Equals(foundryHost, defaultHost, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(project, defaultProject, StringComparison.OrdinalIgnoreCase);
+
+        if (isDefaultProject)
+        {
+            return HtmlResult(RenderManifestList(foundryHost, project, agents.Agents!));
+        }
 
         var html = RenderManifestForm(
             foundryHost,
@@ -116,7 +208,7 @@ public class ManifestController : ControllerBase
             return await ManifestFormError(foundryHost, project, null, botId, "Choose an agent.", ct);
         }
 
-        return await ManifestDownload(foundryHost, project, agentName!, botId, ct);
+        return await ManifestDownloadManual(foundryHost, project, agentName!, botId, ct);
     }
 
     [HttpGet("{foundryHost}/{project}/manifest/{agentName}")]
@@ -149,9 +241,73 @@ public class ManifestController : ControllerBase
         string agentName,
         [FromForm] string? botId,
         CancellationToken ct)
-        => await ManifestDownload(foundryHost, project, agentName, botId, ct);
+        => await ManifestDownloadManual(foundryHost, project, agentName, botId, ct);
 
-    private async Task<IActionResult> ManifestDownload(
+    /// <summary>
+    /// Auto-resolved download for default-project agents. variant must be
+    /// "direct" or "proxy"; the matching appId + SSO settings are looked up
+    /// from Bots:Routes (proxy) and the agent's own appId (direct).
+    /// </summary>
+    [HttpGet("{foundryHost}/{project}/manifest/{agentName}/{variant}")]
+    public async Task<IActionResult> AgentManifestVariantDownload(
+        string foundryHost,
+        string project,
+        string agentName,
+        string variant,
+        CancellationToken ct)
+    {
+        if (!IsKnownVariant(variant))
+            return BadRequest($"variant must be 'direct' or 'proxy'; got '{variant}'.");
+
+        if (!_routes.TryGetValue(agentName, out var route))
+            return NotFound($"Agent '{agentName}' is not in Bots:Routes; use the manual form instead.");
+
+        var botId = variant.Equals("direct", StringComparison.OrdinalIgnoreCase)
+            ? route.DirectAppId
+            : route.ProxyAppId;
+        if (string.IsNullOrEmpty(botId))
+            return NotFound($"No {variant} bot id known for agent '{agentName}'.");
+
+        return await BuildVariantDownloadAsync(foundryHost, project, agentName, variant, botId!, ct);
+    }
+
+    private static bool IsKnownVariant(string v) =>
+        string.Equals(v, "direct", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(v, "proxy", StringComparison.OrdinalIgnoreCase);
+
+    private async Task<IActionResult> BuildVariantDownloadAsync(
+        string foundryHost, string project, string agentName, string variant, string botId, CancellationToken ct)
+    {
+        var agents = await LoadAgentsAsync(foundryHost, project, ct);
+        if (agents.ErrorHtml is not null) return HtmlResult(agents.ErrorHtml, 502);
+
+        var agent = agents.Agents!.FirstOrDefault(a => string.Equals(a.Name, agentName, StringComparison.OrdinalIgnoreCase));
+        if (agent is null) return NotFound($"Agent '{agentName}' not found in project {FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project)}.");
+
+        var description = string.IsNullOrWhiteSpace(agent.Description)
+            ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
+            : agent.Description;
+
+        // Direct manifest does silent SSO against the agent's own app reg
+        // (resource = https://ai.azure.com). Proxy manifest does silent SSO
+        // against the shared backend reg (resource = api://<backendId>).
+        string? ssoAppId; string? ssoResource;
+        if (variant.Equals("direct", StringComparison.OrdinalIgnoreCase))
+        {
+            ssoAppId    = botId;
+            ssoResource = "https://ai.azure.com";
+        }
+        else
+        {
+            ssoAppId    = _config["TeamsApp:BackendAppId"]  ?? _config["TeamsSso:AadAppId"];
+            ssoResource = _config["TeamsApp:IdentifierUri"] ?? _config["TeamsSso:Resource"];
+        }
+
+        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId, ssoAppId, ssoResource, ct);
+        return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}-{variant.ToLowerInvariant()}.zip");
+    }
+
+    private async Task<IActionResult> ManifestDownloadManual(
         string foundryHost,
         string project,
         string agentName,
@@ -173,7 +329,12 @@ public class ManifestController : ControllerBase
             ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
             : agent.Description;
 
-        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId!, ct);
+        // Manual flow defaults to the proxy-variant SSO wiring (shared
+        // backend reg) since that's the original behavior.
+        var ssoAppId    = _config["TeamsApp:BackendAppId"]  ?? _config["TeamsSso:AadAppId"];
+        var ssoResource = _config["TeamsApp:IdentifierUri"] ?? _config["TeamsSso:Resource"];
+
+        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId!, ssoAppId, ssoResource, ct);
         return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}.zip");
     }
 
@@ -203,6 +364,7 @@ public class ManifestController : ControllerBase
 
     private async Task<AgentLoadResult> LoadAgentsAsync(string foundryHost, string project, CancellationToken ct)
     {
+        using var scope = await BeginFoundryUserScopeAsync();
         var projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project);
         var http = _httpFactory.CreateClient("foundry-agents");
         try
@@ -240,10 +402,9 @@ public class ManifestController : ControllerBase
     }
 
     private async Task<byte[]> BuildManifestZipAsync(
-        string agentName, string agentDescription, string botId, CancellationToken ct)
+        string agentName, string agentDescription, string botId,
+        string? ssoAppId, string? ssoResource, CancellationToken ct)
     {
-        var ssoAppId    = _config["TeamsSso:AadAppId"];
-        var ssoResource = _config["TeamsSso:Resource"];
         var manifest = ManifestBuilder.Build(
             agentName, agentDescription, botId,
             ssoAadAppId: ssoAppId,
@@ -363,6 +524,55 @@ public class ManifestController : ControllerBase
   });
 })();
 </script></body></html>
+""";
+    }
+
+    /// <summary>
+    /// Auto-list manifest UI: one row per agent with Direct and Proxy
+    /// download buttons. Bot IDs come from Bots:Routes so the operator
+    /// never has to paste them. Used for the default project only;
+    /// other projects fall back to <see cref="RenderManifestForm"/>.
+    /// </summary>
+    private string RenderManifestList(
+        string foundryHost,
+        string project,
+        IReadOnlyList<FoundryAgentsApi.AgentSummary> agents)
+    {
+        var projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project);
+        var hostSeg = Uri.EscapeDataString(foundryHost);
+        var projSeg = Uri.EscapeDataString(project);
+
+        var rows = string.Join("", agents.Select(a =>
+        {
+            var nameSeg = Uri.EscapeDataString(a.Name);
+            _routes.TryGetValue(a.Name, out var route);
+            var direct = !string.IsNullOrEmpty(route?.DirectAppId)
+                ? $"<a class=\"btn\" href=\"/admin/{hostSeg}/{projSeg}/manifest/{nameSeg}/direct\">Direct ({Html(route!.DirectAppId)})</a>"
+                : "<span class=\"muted\">direct: no bot</span>";
+            var proxy = !string.IsNullOrEmpty(route?.ProxyAppId)
+                ? $"<a class=\"btn secondary\" href=\"/admin/{hostSeg}/{projSeg}/manifest/{nameSeg}/proxy\">Proxy ({Html(route!.ProxyAppId)})</a>"
+                : "<span class=\"muted\">proxy: no bot</span>";
+            var desc = string.IsNullOrWhiteSpace(a.Description) ? "" : $"<div class=\"desc\">{Html(a.Description)}</div>";
+            return $"<tr><td><strong>{Html(a.Name)}</strong>{desc}</td><td class=\"actions\">{direct} {proxy}</td></tr>";
+        }));
+        if (string.IsNullOrEmpty(rows))
+            rows = "<tr><td colspan=\"2\">No active agents in this project.</td></tr>";
+
+        return $$"""
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Generate Teams Manifest</title>
+<style>
+  *{box-sizing:border-box} body{margin:0;font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#f3f4f6;color:#1f2328;min-height:100vh} header{background:#0d1117;color:#fff;padding:18px 24px} header h1{margin:0;font-size:20px} header p{margin:6px 0 0;color:#c9d1d9;font:13px ui-monospace,Consolas,monospace;word-break:break-all} main{max-width:980px;margin:0 auto;padding:24px}.card{background:#fff;border:1px solid #d0d7de;border-radius:10px;padding:18px} table{width:100%;border-collapse:collapse} td{padding:14px 8px;border-top:1px solid #eaeef2;vertical-align:top} td:first-child{width:38%} .desc{color:#656d76;font-size:13px;margin-top:4px} .actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end} .btn{background:#0969da;color:#fff;border:0;padding:9px 13px;border-radius:7px;font-weight:700;cursor:pointer;text-decoration:none;font-size:13px} .btn:hover{background:#0550ae} .secondary{background:#fff;color:#0969da;border:1px solid #0969da} .secondary:hover{background:#ddf4ff} .muted{color:#8c959f;font-size:13px;font-style:italic} .help{background:#ddf4ff;border:1px solid #54aeff;border-radius:8px;padding:12px;margin-bottom:14px;line-height:1.55;font-size:14px}
+</style></head><body>
+<header><h1>Teams Manifests</h1><p>{{Html(projectEndpoint)}}</p></header>
+<main><section class="card">
+  <div class="help"><strong>Direct</strong> = manifest for the Foundry-hosted bot (activityprotocol; bypasses this proxy). <strong>Proxy</strong> = manifest for the proxy bot that goes through this container with Teams SSO + OBO. Each agent has both — pick whichever you want to sideload.</div>
+  <table>
+    <thead><tr><th style="text-align:left">Agent</th><th></th></tr></thead>
+    <tbody>{{rows}}</tbody>
+  </table>
+</section></main></body></html>
 """;
     }
 

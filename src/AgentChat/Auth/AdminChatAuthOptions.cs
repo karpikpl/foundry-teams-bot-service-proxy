@@ -21,17 +21,17 @@ public sealed class AdminChatAuthOptions
         {
             Enabled = section.GetValue<bool?>("Enabled") ?? false,
             Instance = section["Instance"] ?? "https://login.microsoftonline.com/",
-            TenantId = section["TenantId"] ?? config["TeamsSso:TenantId"],
-            ClientId = section["ClientId"] ?? config["TeamsSso:AadAppId"],
-            ClientSecret = section["ClientSecret"]
+            TenantId = section["TenantId"] ?? config["TeamsApp:TenantId"] ?? config["TeamsSso:TenantId"] ?? config["AZURE_TENANT_ID"],
+            ClientId = section["ClientId"] ?? config["TeamsApp:BackendAppId"] ?? config["TeamsSso:AadAppId"],
+            ClientSecret = section["ClientSecret"] ?? config["TeamsApp:BackendSecret"]
         };
     }
 
     public void ValidateIfEnabled()
     {
         if (!Enabled) return;
-        if (string.IsNullOrWhiteSpace(TenantId)) throw new InvalidOperationException("AdminChatAuth:TenantId or TeamsSso:TenantId is required when AdminChatAuth is enabled.");
-        if (string.IsNullOrWhiteSpace(ClientId)) throw new InvalidOperationException("AdminChatAuth:ClientId or TeamsSso:AadAppId is required when AdminChatAuth is enabled.");
-        if (string.IsNullOrWhiteSpace(ClientSecret)) throw new InvalidOperationException("AdminChatAuth:ClientSecret is required when AdminChatAuth is enabled.");
+        if (string.IsNullOrWhiteSpace(TenantId)) throw new InvalidOperationException("AdminChatAuth:TenantId, TeamsApp:TenantId, or AZURE_TENANT_ID is required when AdminChatAuth is enabled.");
+        if (string.IsNullOrWhiteSpace(ClientId)) throw new InvalidOperationException("AdminChatAuth:ClientId or TeamsApp:BackendAppId is required when AdminChatAuth is enabled.");
+        if (string.IsNullOrWhiteSpace(ClientSecret)) throw new InvalidOperationException("AdminChatAuth:ClientSecret or TeamsApp:BackendSecret is required when AdminChatAuth is enabled.");
     }
 }

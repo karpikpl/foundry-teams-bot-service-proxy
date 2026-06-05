@@ -43,7 +43,7 @@ public class TeamsSsoService
     public TeamsSsoService(IConfiguration config, ILogger<TeamsSsoService> logger)
     {
         _logger         = logger;
-        _connectionName = config["TeamsSso:ConnectionName"];
+        _connectionName = config["TeamsApp:SsoConnectionName"] ?? config["TeamsSso:ConnectionName"];
 
         if (Enabled)
         {

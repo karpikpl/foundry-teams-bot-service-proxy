@@ -68,6 +68,11 @@ builder.Services.AddSingleton<IStorage>(sp =>
 
 builder.Services.AddSingleton<ConversationStore>();
 
+// Multi-bot outbound auth via Federated Identity Credentials (no per-bot secrets).
+// The factory mints a Bot Framework token per-bot using the container UAMI as
+// a federated client assertion. Registering the factory in DI causes
+// ConfigurationBotFrameworkAuthentication to use it for outbound replies.
+builder.Services.AddSingleton<ServiceClientCredentialsFactory, FicServiceClientCredentialsFactory>();
 builder.Services.AddSingleton<BotFrameworkAuthentication, ConfigurationBotFrameworkAuthentication>();
 builder.Services.AddSingleton<IBotFrameworkHttpAdapter, AdapterWithErrorHandler>();
 builder.Services.AddTransient<IBot, FoundryBot>();

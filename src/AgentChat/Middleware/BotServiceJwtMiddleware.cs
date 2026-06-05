@@ -142,17 +142,22 @@ public class BotServiceJwtMiddleware
             return;
         }
 
-        // Issuer must be the customer's tenant (SingleTenant bots only).
-        // Accept BOTH v1 (sts.windows.net) and v2 (login.microsoftonline.com)
-        // forms — the same bot can issue either depending on the token
-        // version negotiated by the channel.
+        // Issuer must be the customer's tenant or Bot Framework itself.
+        // ABS→bot tokens for SingleTenant bots can come signed by:
+        //   - https://sts.windows.net/{tid}/             (v1 AAD)
+        //   - https://login.microsoftonline.com/{tid}/v2.0  (v2 AAD)
+        //   - https://api.botframework.com               (Bot Framework signing key)
+        // The real security boundary is the audience check below
+        // (aud == route's expected appId).
         var iss = jwt.Claims.FirstOrDefault(c => c.Type == "iss")?.Value;
         var v1 = $"https://sts.windows.net/{_tenantId}/";
         var v2 = $"https://login.microsoftonline.com/{_tenantId}/v2.0";
+        const string bf = "https://api.botframework.com";
         if (!string.Equals(iss, v1, StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(iss, v2, StringComparison.OrdinalIgnoreCase))
+            && !string.Equals(iss, v2, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(iss, bf, StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogWarning("Rejected JWT with unexpected issuer {Issuer}; expected {V1} or {V2}", iss, v1, v2);
+            _logger.LogWarning("Rejected JWT with unexpected issuer {Issuer}; expected {V1}, {V2} or {BF}", iss, v1, v2, bf);
             ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
             return;
         }

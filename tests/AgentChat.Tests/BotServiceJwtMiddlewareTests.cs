@@ -95,6 +95,21 @@ public class BotServiceJwtMiddlewareTests
     }
 
     [Fact]
+    public async Task Accepts_bot_framework_issuer()
+    {
+        // Azure Bot Service signs ABS→bot tokens with iss=https://api.botframework.com
+        // even for SingleTenant bots; the aud check is the real boundary.
+        var jwt = BuildToken(iss: "https://api.botframework.com", aud: ExpectedAud);
+        var nextCalled = false;
+        var ctx = MakeContext(MessagesPath, authHeader: "Bearer " + jwt);
+        var m = MakeMiddleware(ExpectedAud, next: c => { nextCalled = true; return Task.CompletedTask; });
+
+        await m.InvokeAsync(ctx);
+
+        nextCalled.Should().BeTrue();
+    }
+
+    [Fact]
     public async Task Audience_check_is_case_insensitive()
     {
         var jwt = BuildToken(iss: $"https://login.microsoftonline.com/{TenantId}/v2.0", aud: ExpectedAud.ToUpperInvariant());

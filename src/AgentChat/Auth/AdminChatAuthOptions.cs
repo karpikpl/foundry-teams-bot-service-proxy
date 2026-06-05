@@ -4,7 +4,7 @@ namespace AgentChat.Auth;
 
 public sealed class AdminChatAuthOptions
 {
-    public const string FoundryScope = "https://ai.azure.com/user_impersonation";
+    public const string FoundryScope = "https://ai.azure.com/.default";
     public const string OpenIdConnectCallbackPath = "/signin-oidc";
     public const string SignedOutCallbackPath = "/signout-oidc-callback";
 

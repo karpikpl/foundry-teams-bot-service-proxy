@@ -7,15 +7,9 @@ namespace AgentChat.Services;
 /// <summary>
 /// Per-request agent catalog provider.
 ///
-/// AgentService no longer owns a single project — it caches a catalog per
-/// Foundry project endpoint. Every public method accepts an optional
-/// <c>projectEndpoint</c>; when omitted, the configured default
-/// (<see cref="DefaultProjectEndpoint"/>) is used. URL-routed turns pass the
-/// per-turn project endpoint resolved by
-/// <see cref="Bots.TurnRouting.ProjectEndpoint"/>.
-///
-/// Caches are keyed by project endpoint with a shared TTL configured via
-/// <c>Foundry:CatalogCacheSeconds</c> (default 300s).
+/// Agent catalogs are fetched on demand using the signed-in user's Foundry OBO
+/// token and cached per (user object id, project endpoint). The container's
+/// workload identity is intentionally not used for catalog discovery.
 /// </summary>
 public class AgentService
 {
@@ -34,7 +28,7 @@ public class AgentService
         public SemaphoreSlim Lock { get; } = new(1, 1);
     }
 
-    private readonly ConcurrentDictionary<string, CatalogEntry> _byProject =
+    private readonly ConcurrentDictionary<string, CatalogEntry> _catalogs =
         new(StringComparer.OrdinalIgnoreCase);
 
     public TokenCredential Credential        => _credential;
@@ -73,33 +67,31 @@ public class AgentService
 
     /// <summary>
     /// Default per-agent endpoint, for callers that need a non-null URL before
-    /// the catalog is fetched (e.g. <c>/agent</c> info on first turn). Returns
-    /// a synthetic <c>/agents/default/...</c> URL — replaced by the real first
-    /// agent's endpoint once <see cref="GetDescriptorsAsync"/> populates.
+    /// a user-scoped catalog is fetched (e.g. routing defaults).
     /// </summary>
-    public string DefaultEndpoint
-    {
-        get
-        {
-            if (_byProject.TryGetValue(_defaultProjectEndpoint, out var cached)
-                && cached.Descriptors.Count > 0)
-            {
-                return cached.Descriptors[0].Endpoint;
-            }
-            return FoundryAgentsApi.ComposeAgentEndpoint(_defaultProjectEndpoint, "default");
-        }
-    }
+    public string DefaultEndpoint => FoundryAgentsApi.ComposeAgentEndpoint(_defaultProjectEndpoint, "default");
 
     /// <summary>
-    /// Return the agent catalog for a project. Uses the cached snapshot when
-    /// fresh; refreshes on TTL expiry or when <paramref name="forceRefresh"/>
+    /// Return the signed-in user's agent catalog for a project. Uses the cached
+    /// snapshot when fresh; refreshes on TTL expiry or when <paramref name="forceRefresh"/>
     /// is true. <paramref name="projectEndpoint"/> null = the configured default.
     /// </summary>
     public async Task<IReadOnlyList<AgentDescriptor>> GetDescriptorsAsync(
-        string? projectEndpoint = null, bool forceRefresh = false, CancellationToken ct = default)
+        string? userObjectId,
+        string? userToken,
+        string? projectEndpoint = null,
+        bool forceRefresh = false,
+        CancellationToken ct = default)
     {
+        if (string.IsNullOrWhiteSpace(userObjectId) || string.IsNullOrWhiteSpace(userToken))
+        {
+            _logger.LogWarning("Agent catalog requested without a user OBO token; returning an empty catalog.");
+            return Array.Empty<AgentDescriptor>();
+        }
+
         var project = ResolveProject(projectEndpoint);
-        var entry   = _byProject.GetOrAdd(project, _ => new CatalogEntry());
+        var cacheKey = CatalogCacheKey(userObjectId, project);
+        var entry = _catalogs.GetOrAdd(cacheKey, _ => new CatalogEntry());
 
         if (!forceRefresh
             && entry.Descriptors.Count > 0
@@ -118,8 +110,8 @@ public class AgentService
                 return entry.Descriptors;
             }
 
-            var http     = _httpFactory.CreateClient("foundry-agents");
-            var agents   = await FoundryAgentsApi.ListAgentsAsync(http, project, _credential, ct);
+            var http = _httpFactory.CreateClient("foundry-agents");
+            var agents = await FoundryAgentsApi.ListAgentsAsync(http, project, userToken!, ct);
             var snapshot = agents
                 .Where(a => a.IsActive)
                 .Select(a => new AgentDescriptor(
@@ -133,14 +125,12 @@ public class AgentService
 
             entry.Descriptors = snapshot;
             entry.CachedAtUtc = DateTime.UtcNow;
-            _logger.LogInformation("Refreshed agent catalog: {Count} agent(s) from {Endpoint}", snapshot.Count, project);
+            _logger.LogInformation("Refreshed user-scoped agent catalog: {Count} agent(s) from {Endpoint} for user {UserObjectId}", snapshot.Count, project, userObjectId);
             return entry.Descriptors;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to refresh agent catalog from {Endpoint}", project);
-            // Stale-on-error: a previous snapshot (possibly empty) is better than
-            // throwing the user out of a /agents command.
+            _logger.LogError(ex, "Failed to refresh user-scoped agent catalog from {Endpoint} for user {UserObjectId}", project, userObjectId);
             return entry.Descriptors;
         }
         finally
@@ -150,36 +140,39 @@ public class AgentService
     }
 
     public async Task<AgentDescriptor?> FindByKeyAsync(
-        string key, string? projectEndpoint = null, CancellationToken ct = default)
+        string key, string? userObjectId, string? userToken, string? projectEndpoint = null, CancellationToken ct = default)
     {
-        var all = await GetDescriptorsAsync(projectEndpoint, ct: ct);
+        var all = await GetDescriptorsAsync(userObjectId, userToken, projectEndpoint, ct: ct);
         return all.FirstOrDefault(d => string.Equals(d.Key, key, StringComparison.OrdinalIgnoreCase));
     }
 
     public async Task<AgentDescriptor?> FindByNameAsync(
-        string name, string? projectEndpoint = null, CancellationToken ct = default)
+        string name, string? userObjectId, string? userToken, string? projectEndpoint = null, CancellationToken ct = default)
     {
-        var all = await GetDescriptorsAsync(projectEndpoint, ct: ct);
+        var all = await GetDescriptorsAsync(userObjectId, userToken, projectEndpoint, ct: ct);
         return all.FirstOrDefault(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
     }
 
     public async Task<AgentDescriptor> DefaultAsync(
-        string? projectEndpoint = null, CancellationToken ct = default)
+        string? userObjectId, string? userToken, string? projectEndpoint = null, CancellationToken ct = default)
     {
-        var all = await GetDescriptorsAsync(projectEndpoint, ct: ct);
+        var all = await GetDescriptorsAsync(userObjectId, userToken, projectEndpoint, ct: ct);
         return all.FirstOrDefault()
             ?? throw new InvalidOperationException(
-                $"No active agents found in project {ResolveProject(projectEndpoint)}. Create one in Foundry first.");
+                $"No active agents found in project {ResolveProject(projectEndpoint)} for the signed-in user.");
     }
 
     public async Task<string?> FindKeyForEndpointAsync(
-        string? agentEndpoint, string? projectEndpoint = null, CancellationToken ct = default)
+        string? agentEndpoint, string? userObjectId, string? userToken, string? projectEndpoint = null, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(agentEndpoint)) return null;
         var project = ResolveProject(projectEndpoint ?? FoundryAgentsApi.ProjectEndpointFor(agentEndpoint));
-        var all = await GetDescriptorsAsync(project, ct: ct);
+        var all = await GetDescriptorsAsync(userObjectId, userToken, project, ct: ct);
         return all.FirstOrDefault(d => string.Equals(d.Endpoint, agentEndpoint, StringComparison.OrdinalIgnoreCase))?.Key;
     }
+
+    public static string CatalogCacheKey(string userObjectId, string projectEndpoint)
+        => $"agents:{userObjectId}:{projectEndpoint.TrimEnd('/')}";
 
     /// <summary>
     /// Derive a stable, lowercase, URL-safe key from an agent name. The picker

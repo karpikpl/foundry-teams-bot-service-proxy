@@ -1,6 +1,5 @@
 using System.ClientModel.Primitives;
 using System.Text.Json;
-using Azure.Core;
 
 namespace AgentChat.Foundry;
 
@@ -9,13 +8,11 @@ namespace AgentChat.Foundry;
 ///
 /// The OpenAI SDK we use for the per-agent endpoint doesn't model the
 /// project's <c>/agents</c> endpoint, so we call it ourselves with a
-/// vanilla <see cref="HttpClient"/>. Same AAD scope as the rest of the bot
-/// (<c>https://ai.azure.com/.default</c>).
+/// vanilla <see cref="HttpClient"/> with the signed-in user's OBO token.
 /// </summary>
 public static class FoundryAgentsApi
 {
     private const string DefaultApiVersion = "2025-05-15-preview";
-    private const string TokenScope        = "https://ai.azure.com/.default";
 
     public sealed record AgentSummary(
         string Name,
@@ -35,31 +32,16 @@ public static class FoundryAgentsApi
     public static async Task<IReadOnlyList<AgentSummary>> ListAgentsAsync(
         HttpClient http,
         string projectEndpoint,
-        TokenCredential credential,
+        string userToken,
         CancellationToken ct = default)
     {
+        if (string.IsNullOrWhiteSpace(userToken))
+            throw new ArgumentException("A user OBO token is required to list Foundry agents.", nameof(userToken));
+
         var url = projectEndpoint.TrimEnd('/') + $"/agents?api-version={DefaultApiVersion}";
 
-        // Honor the per-request OBO scope — when a user token is in scope we
-        // call Foundry as that user. Without a scope we fall back to the
-        // injected workload credential (UAMI). This is what lets us drop the
-        // "Azure AI User" RBAC from the UAMI: every call from /admin and from
-        // bot turns runs in a user scope, and only edge cases (unauthenticated
-        // background refreshes) ever fall back to the credential.
-        string token;
-        var userToken = FoundryUserAuthScope.Current;
-        if (!string.IsNullOrEmpty(userToken))
-        {
-            token = userToken!;
-        }
-        else
-        {
-            var tokenResult = await credential.GetTokenAsync(new TokenRequestContext(new[] { TokenScope }), ct);
-            token = tokenResult.Token;
-        }
-
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", userToken);
 
         using var resp = await http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)

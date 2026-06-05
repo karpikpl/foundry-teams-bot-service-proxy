@@ -1,9 +1,12 @@
 using System.IO.Compression;
+using System.Security.Claims;
 using System.Text;
 using AgentChat.Controllers;
 using FluentAssertions;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Identity.Web;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Newtonsoft.Json.Linq;
@@ -75,12 +78,29 @@ public class ManifestControllerTests
         var env = new Mock<IWebHostEnvironment>();
         env.SetupGet(e => e.WebRootPath).Returns(TestServices.WebRootPath());
 
-        return new ManifestController(
+        var tokenAcquisition = new Mock<ITokenAcquisition>();
+        tokenAcquisition.Setup(t => t.GetAccessTokenForUserAsync(
+                It.IsAny<IEnumerable<string>>(),
+                It.IsAny<string?>(),
+                It.IsAny<string?>(),
+                It.IsAny<ClaimsPrincipal?>(),
+                It.IsAny<TokenAcquisitionOptions?>()))
+            .ReturnsAsync("manifest-user-token");
+
+        var controller = new ManifestController(
             TestServices.AgentService(handler),
             new HandlerHttpClientFactory(handler),
             TestServices.Config(),
             env.Object,
-            NullLogger<ManifestController>.Instance);
+            NullLogger<ManifestController>.Instance,
+            tokenAcquisition.Object);
+        controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() };
+        controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity(new[]
+        {
+            new Claim(ClaimTypes.Name, "Tester"),
+            new Claim("oid", "manifest-user-oid")
+        }, "Test"));
+        return controller;
     }
 
     private static JObject ReadManifest(byte[] zipBytes)

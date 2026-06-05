@@ -193,7 +193,7 @@ public class ChatTestControllerTests
             service: service,
             adminChatAuth: new AdminChatAuthOptions { Enabled = true },
             tokenAcquisition: tokenAcquisition.Object);
-        controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, "Tester") }, "Test"));
+        controller.HttpContext.User = TestUser();
 
         var result = await controller.CreateConversation(new ChatTestController.CreateConvRequest("agent-a"), CancellationToken.None);
 
@@ -218,7 +218,7 @@ public class ChatTestControllerTests
             service: service,
             adminChatAuth: new AdminChatAuthOptions { Enabled = true },
             tokenAcquisition: tokenAcquisition.Object);
-        controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim(ClaimTypes.Name, "Tester") }, "Test"));
+        controller.HttpContext.User = TestUser();
 
         await controller.StreamMessage(new ChatTestController.MessageRequest("agent-a", "conv-user", "hi"), CancellationToken.None);
 
@@ -256,14 +256,12 @@ public class ChatTestControllerTests
             clientCache ?? new AgentClientCache(service),
             env.Object,
             NullLogger<ChatTestController>.Instance,
-            adminChatAuth,
-            tokenAcquisition);
+            adminChatAuth ?? new AdminChatAuthOptions { Enabled = true },
+            tokenAcquisition ?? MockTokenAcquisition("catalog-user-token").Object);
 
-        if (withHttpContext)
-        {
-            controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() };
-            controller.Response.Body = new MemoryStream();
-        }
+        controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() };
+        controller.Response.Body = new MemoryStream();
+        controller.HttpContext.User = TestUser();
 
         return controller;
     }
@@ -275,6 +273,13 @@ public class ChatTestControllerTests
             new ActionContext(httpContext, new RouteData(), new ControllerActionDescriptor()),
             new List<IFilterMetadata>());
     }
+
+    private static ClaimsPrincipal TestUser()
+        => new(new ClaimsIdentity(new[]
+        {
+            new Claim(ClaimTypes.Name, "Tester"),
+            new Claim("oid", "user-oid-1")
+        }, "Test"));
 
     private static Mock<ITokenAcquisition> MockTokenAcquisition(string token)
     {

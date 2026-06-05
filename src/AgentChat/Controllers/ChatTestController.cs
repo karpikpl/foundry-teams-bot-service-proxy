@@ -23,9 +23,9 @@ namespace AgentChat.Controllers;
 /// response — but renders to a plain web page over SSE instead of Bot
 /// Framework activities.
 ///
-/// Auth: by default, uses the App Service UMI (same as the bot's catalog calls
-/// today). When AdminChatAuth is enabled, this browser harness requires Entra ID
-/// sign-in and forwards the signed-in user's Foundry token per request.
+/// Auth: when AdminChatAuth is enabled, this browser harness requires Entra ID
+/// sign-in and forwards the signed-in user's Foundry token per request. Agent
+/// catalog lookup does not fall back to the App Service UMI.
 ///
 /// Routes:
 ///   <c>GET  /admin/chat</c>                              HTML page
@@ -120,8 +120,9 @@ public class ChatTestController : ControllerBase
         if (!TryProjectEndpoint(body.FoundryHost, body.Project, out var projectEndpoint, out var projectError))
             return BadRequest(new { error = projectError });
 
-        using var userAuth = BeginFoundryUserAuthScope(await GetFoundryUserTokenAsync());
-        var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint, ct);
+        var user = await GetFoundryUserContextAsync();
+        using var userAuth = BeginFoundryUserAuthScope(user?.Token);
+        var agent = await _agents.FindByKeyAsync(body.AgentKey, user?.ObjectId, user?.Token, projectEndpoint, ct);
         if (agent is null) return NotFound(new { error = $"agent '{body.AgentKey}' not found" });
 
         var foundry = _clientCache.For(agent.Endpoint);
@@ -144,8 +145,9 @@ public class ChatTestController : ControllerBase
         if (!TryProjectEndpoint(foundryHost, project, out var projectEndpoint, out var projectError))
             return BadRequest(new { error = projectError });
 
-        using var userAuth = BeginFoundryUserAuthScope(await GetFoundryUserTokenAsync());
-        var agent = await _agents.FindByKeyAsync(agentKey, projectEndpoint, ct);
+        var user = await GetFoundryUserContextAsync();
+        using var userAuth = BeginFoundryUserAuthScope(user?.Token);
+        var agent = await _agents.FindByKeyAsync(agentKey, user?.ObjectId, user?.Token, projectEndpoint, ct);
         if (agent is null) return NotFound(new { error = $"agent '{agentKey}' not found" });
 
         PendingApprovals.TryRemove(PendingKey(agentKey, conversationId), out _);
@@ -206,8 +208,9 @@ public class ChatTestController : ControllerBase
             return;
         }
 
-        using var userAuth = BeginFoundryUserAuthScope(await GetFoundryUserTokenAsync());
-        var agent = await _agents.FindByKeyAsync(body.AgentKey, projectEndpoint, ct);
+        var user = await GetFoundryUserContextAsync();
+        using var userAuth = BeginFoundryUserAuthScope(user?.Token);
+        var agent = await _agents.FindByKeyAsync(body.AgentKey, user?.ObjectId, user?.Token, projectEndpoint, ct);
         if (agent is null)
         {
             await WriteSseAsync("error", $"agent '{body.AgentKey}' not found", ct);
@@ -520,16 +523,25 @@ public class ChatTestController : ControllerBase
         catch { return false; }
     }
 
-    private async Task<string?> GetFoundryUserTokenAsync()
+    private sealed record FoundryUserContext(string ObjectId, string Token);
+
+    private async Task<FoundryUserContext?> GetFoundryUserContextAsync()
     {
         if (!_adminChatAuth.Enabled)
             return null;
         if (_tokenAcquisition is null)
             throw new InvalidOperationException("Admin chat authentication is enabled but token acquisition is not configured.");
 
-        return await _tokenAcquisition.GetAccessTokenForUserAsync(
+        var objectId = User.FindFirst("oid")?.Value
+            ?? User.FindFirst("http://schemas.microsoft.com/identity/claims/objectidentifier")?.Value
+            ?? User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrWhiteSpace(objectId))
+            throw new InvalidOperationException("Signed-in user object id claim is missing.");
+
+        var token = await _tokenAcquisition.GetAccessTokenForUserAsync(
             new[] { AdminChatAuthOptions.FoundryScope },
             user: User);
+        return string.IsNullOrEmpty(token) ? null : new FoundryUserContext(objectId, token);
     }
 
     private static IDisposable BeginFoundryUserAuthScope(string? token)

@@ -12,12 +12,12 @@ namespace AgentChat.Services;
 ///   1. Register an AAD app for the bot ("expose an API" scope, e.g.
 ///      <c>api://&lt;bot-app-id&gt;/access_as_user</c>; Teams listed as a known
 ///      client application). The app also needs delegated permission for the
-///      Foundry resource (<c>https://ai.azure.com/user_impersonation</c>).
+///      Foundry resource (<c>https://ai.azure.com/.default</c>).
 ///   2. On the Bot Service registration, add an OAuth Connection Setting:
 ///      - Service Provider: Azure Active Directory v2
 ///      - Client id / client secret (or FIC) from the AAD app above
 ///      - Token Exchange URL: <c>api://&lt;bot-app-id&gt;</c>
-///      - Scopes: <c>https://ai.azure.com/user_impersonation offline_access</c>
+///      - Scopes: <c>https://ai.azure.com/.default offline_access</c>
 ///   3. Update the Teams manifest <c>webApplicationInfo</c> with the bot AAD
 ///      app id + resource (handled by <see cref="Bots.ManifestBuilder"/>).
 ///   4. Set <c>TeamsSso__ConnectionName=&lt;OAuth connection name&gt;</c>.
@@ -26,8 +26,8 @@ namespace AgentChat.Services;
 /// At runtime this service just calls <c>UserTokenClient.GetUserTokenAsync</c>;
 /// Bot Service handles the SSO + OBO dance internally (cached, refreshed).
 ///
-/// When SSO is disabled or returns no token, callers fall back to whatever
-/// app-identity behavior they had before.
+/// When SSO is disabled or returns no token, callers must not fall back to
+/// app identity for Foundry catalog/chat calls.
 /// </summary>
 public class TeamsSsoService
 {

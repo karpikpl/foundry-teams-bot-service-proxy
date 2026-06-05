@@ -18,11 +18,15 @@ namespace AgentChat.Tests;
 public class BotServiceJwtMiddlewareTests
 {
     private const string ExpectedAud = "dfdde025-5b67-4429-a986-dc32af044450";
+    private const string TenantId = "11111111-2222-3333-4444-555555555555";
+    private const string MessagesPath = "/api/messages/foundryA/proj1/agent1";
+    private static readonly string RoutesJson =
+        $"[{{\"AgentName\":\"agent1\",\"ProxyAppId\":\"{ExpectedAud}\",\"DirectAppId\":\"{ExpectedAud}\"}}]";
 
     [Fact]
     public async Task Rejects_request_missing_authorization_header()
     {
-        var ctx = MakeContext("/api/messages", authHeader: null);
+        var ctx = MakeContext(MessagesPath, authHeader: null);
         var m = MakeMiddleware(ExpectedAud);
 
         await m.InvokeAsync(ctx);
@@ -33,7 +37,7 @@ public class BotServiceJwtMiddlewareTests
     [Fact]
     public async Task Rejects_request_with_non_bearer_authorization_header()
     {
-        var ctx = MakeContext("/api/messages", authHeader: "Basic abc==");
+        var ctx = MakeContext(MessagesPath, authHeader: "Basic abc==");
         var m = MakeMiddleware(ExpectedAud);
 
         await m.InvokeAsync(ctx);
@@ -44,7 +48,7 @@ public class BotServiceJwtMiddlewareTests
     [Fact]
     public async Task Rejects_malformed_jwt()
     {
-        var ctx = MakeContext("/api/messages", authHeader: "Bearer not.a.jwt");
+        var ctx = MakeContext(MessagesPath, authHeader: "Bearer not.a.jwt");
         var m = MakeMiddleware(ExpectedAud);
 
         await m.InvokeAsync(ctx);
@@ -56,7 +60,7 @@ public class BotServiceJwtMiddlewareTests
     public async Task Rejects_jwt_with_wrong_issuer()
     {
         var jwt = BuildToken(iss: "https://attacker.example.com", aud: ExpectedAud);
-        var ctx = MakeContext("/api/messages", authHeader: "Bearer " + jwt);
+        var ctx = MakeContext(MessagesPath, authHeader: "Bearer " + jwt);
         var m = MakeMiddleware(ExpectedAud);
 
         await m.InvokeAsync(ctx);
@@ -67,8 +71,8 @@ public class BotServiceJwtMiddlewareTests
     [Fact]
     public async Task Rejects_jwt_with_wrong_audience()
     {
-        var jwt = BuildToken(iss: "https://api.botframework.com", aud: "attacker-app-id");
-        var ctx = MakeContext("/api/messages", authHeader: "Bearer " + jwt);
+        var jwt = BuildToken(iss: $"https://login.microsoftonline.com/{TenantId}/v2.0", aud: "attacker-app-id");
+        var ctx = MakeContext(MessagesPath, authHeader: "Bearer " + jwt);
         var m = MakeMiddleware(ExpectedAud);
 
         await m.InvokeAsync(ctx);
@@ -79,9 +83,9 @@ public class BotServiceJwtMiddlewareTests
     [Fact]
     public async Task Accepts_jwt_with_correct_issuer_and_audience()
     {
-        var jwt = BuildToken(iss: "https://api.botframework.com", aud: ExpectedAud);
+        var jwt = BuildToken(iss: $"https://login.microsoftonline.com/{TenantId}/v2.0", aud: ExpectedAud);
         var nextCalled = false;
-        var ctx = MakeContext("/api/messages", authHeader: "Bearer " + jwt);
+        var ctx = MakeContext(MessagesPath, authHeader: "Bearer " + jwt);
         var m = MakeMiddleware(ExpectedAud, next: c => { nextCalled = true; return Task.CompletedTask; });
 
         await m.InvokeAsync(ctx);
@@ -93,9 +97,9 @@ public class BotServiceJwtMiddlewareTests
     [Fact]
     public async Task Audience_check_is_case_insensitive()
     {
-        var jwt = BuildToken(iss: "https://api.botframework.com", aud: ExpectedAud.ToUpperInvariant());
+        var jwt = BuildToken(iss: $"https://login.microsoftonline.com/{TenantId}/v2.0", aud: ExpectedAud.ToUpperInvariant());
         var nextCalled = false;
-        var ctx = MakeContext("/api/messages", authHeader: "Bearer " + jwt);
+        var ctx = MakeContext(MessagesPath, authHeader: "Bearer " + jwt);
         var m = MakeMiddleware(ExpectedAud, next: c => { nextCalled = true; return Task.CompletedTask; });
 
         await m.InvokeAsync(ctx);
@@ -106,7 +110,7 @@ public class BotServiceJwtMiddlewareTests
     [Fact]
     public async Task Routed_path_is_also_protected()
     {
-        var ctx = MakeContext("/api/messages/foundryA/proj1/agentX", authHeader: null);
+        var ctx = MakeContext(MessagesPath, authHeader: null);
         var m = MakeMiddleware(ExpectedAud);
 
         await m.InvokeAsync(ctx);
@@ -130,7 +134,7 @@ public class BotServiceJwtMiddlewareTests
     public async Task Disabled_when_expected_aud_not_configured()
     {
         var nextCalled = false;
-        var ctx = MakeContext("/api/messages", authHeader: null);
+        var ctx = MakeContext(MessagesPath, authHeader: null);
         var m = MakeMiddleware(expectedAud: null, next: c => { nextCalled = true; return Task.CompletedTask; });
 
         await m.InvokeAsync(ctx);
@@ -142,8 +146,11 @@ public class BotServiceJwtMiddlewareTests
 
     private static BotServiceJwtMiddleware MakeMiddleware(string? expectedAud, RequestDelegate? next = null)
     {
-        var settings = new Dictionary<string, string?>();
-        if (expectedAud != null) settings["BOTSERVICE_UAMI_CLIENTID"] = expectedAud;
+        var settings = new Dictionary<string, string?>
+        {
+            ["MicrosoftAppTenantId"] = TenantId,
+        };
+        if (expectedAud != null) settings["Bots:Routes"] = RoutesJson;
         var cfg = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
 
         return new BotServiceJwtMiddleware(

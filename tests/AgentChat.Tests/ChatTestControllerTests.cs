@@ -229,12 +229,15 @@ public class ChatTestControllerTests
     }
 
     [Fact]
-    public void Only_chat_test_controller_has_admin_chat_auth_filter()
+    public void Admin_chat_auth_filter_protects_admin_controllers()
     {
+        // Both ChatTestController and ManifestController are reachable under
+        // /admin and call Foundry via OBO, so both carry the filter — this
+        // is what lets us drop "Azure AI User" RBAC from the container UAMI.
         typeof(ChatTestController).GetCustomAttributes(typeof(ServiceFilterAttribute), inherit: true)
             .Should().Contain(a => ((ServiceFilterAttribute)a).ServiceType == typeof(AdminChatAuthFilter));
         typeof(ManifestController).GetCustomAttributes(typeof(ServiceFilterAttribute), inherit: true)
-            .Should().BeEmpty();
+            .Should().Contain(a => ((ServiceFilterAttribute)a).ServiceType == typeof(AdminChatAuthFilter));
     }
 
     private static ChatTestController MakeController(

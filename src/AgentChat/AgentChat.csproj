@@ -5,7 +5,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>AgentChat</RootNamespace>
-    <Version>0.9.1-diag</Version>
+    <Version>0.9.1-rc1</Version>
     <!-- NU1701: Microsoft.Bot.Builder.Azure transitively brings the very old
          Microsoft.Azure.KeyVault.Core 1.0.0 which only ships net4x assemblies.
          Bot Framework never actually loads it for our scenarios — Cosmos works fine. -->

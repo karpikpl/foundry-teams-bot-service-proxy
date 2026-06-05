@@ -128,16 +128,22 @@ Notable tests:
 
 ## Release Workflow
 
-- Current infra-pinned version: `0.8.1`.
-- Tag `vX.Y.Z` in this repo to trigger `.github/workflows/release.yml`.
-- Release CI runs tests, builds a multi-arch image, and pushes:
-  - `ghcr.io/karpikpl/foundry-teams-bot-service-proxy:X.Y.Z`
-  - `ghcr.io/karpikpl/foundry-teams-bot-service-proxy:X.Y`
-  - `ghcr.io/karpikpl/foundry-teams-bot-service-proxy:X`
-  - `ghcr.io/karpikpl/foundry-teams-bot-service-proxy:latest`
-  - plus `sha-<short>`.
-- Prerelease tags like `vX.Y.Z-rc.1` do not get floating tags.
-- The infra repo pins the consumed image in `options-infra/foundry-byo-vnet-teams/main.bicep` as `existingImage` passed to `modules/aca/container-app.bicep`.
+- Current infra-pinned version: `0.9.1`.
+- Tag `vX.Y.Z` (or prerelease `vX.Y.Z-rc.N`, `vX.Y.Z-diag.N`) in this repo to trigger `.github/workflows/release.yml`.
+- Release CI runs tests, builds a multi-arch image, pushes to GHCR, signs with cosign (stable tags only), and **creates a GitHub Release**.
+  - Stable `vX.Y.Z` → image tags `X.Y.Z`, `X.Y`, `X`, `latest`, `sha-<short>` + standard GitHub Release.
+  - Prerelease `vX.Y.Z-*` → image tag `X.Y.Z-…` + `sha-<short>` only (no floating tags) + GitHub Release marked as **prerelease**.
+- The infra repo pins the consumed image in `options-infra/foundry-byo-vnet-teams/main.bicep` as `existingImage` passed to `modules/aca/container-app.bicep`. Bump it whenever a new stable release ships.
+
+## Repository Hygiene Rules
+
+These are enforced conventions — agents should refuse to skip them without explicit operator override.
+
+- **Every pushed tag MUST result in a GitHub Release** (stable or prerelease). Do not push tags whose Release entry would be missing; the release workflow now creates them automatically — verify on the Releases page after each tag push.
+- **Every branch MUST have an open or merged PR.** No long-lived "scratch" branches on the remote. Delete the branch immediately after merge (GitHub setting + `git push origin --delete <branch>` for backfill).
+- **Prerelease workflow:** use `vX.Y.Z-rc.N` or `vX.Y.Z-diag.N` tags for testing in the live container app. These produce **prerelease** GitHub Releases. Promote to stable by tagging `vX.Y.Z` on the SAME commit that was last in rc.
+- **Diagnostic / log-spew patches** (e.g. JWT claim logging) are always prereleases. Strip them before cutting a stable `vX.Y.Z`.
+- **Goal: clean linear history on `main`** + a clean Releases page that lets anyone see what changed between any two versions.
 
 ## Common Traps
 

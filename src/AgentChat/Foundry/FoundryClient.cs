@@ -118,6 +118,7 @@ public sealed class FoundryClient
         {
             var userToken = FoundryUserAuthScope.Current;
             var bearer    = userToken ?? GetAppTokenSync();
+            LogBearerClaims(bearer, userToken is not null, message.Request.Uri);
             message.Request.Headers.Set("Authorization", "Bearer " + bearer);
             if (currentIndex < pipeline.Count - 1)
                 pipeline[currentIndex + 1].Process(message, pipeline, currentIndex + 1);
@@ -127,9 +128,35 @@ public sealed class FoundryClient
         {
             var userToken = FoundryUserAuthScope.Current;
             var bearer    = userToken ?? await GetAppTokenAsync().ConfigureAwait(false);
+            LogBearerClaims(bearer, userToken is not null, message.Request.Uri);
             message.Request.Headers.Set("Authorization", "Bearer " + bearer);
             if (currentIndex < pipeline.Count - 1)
                 await pipeline[currentIndex + 1].ProcessAsync(message, pipeline, currentIndex + 1).ConfigureAwait(false);
+        }
+
+        // DIAG (0.9.1-diag): log JWT aud/oid/scp/appid/iss on every outbound
+        // Foundry call so we can confirm what identity the bearer represents
+        // and whether the audience matches the Foundry endpoint.
+        private static void LogBearerClaims(string? bearer, bool fromUserScope, Uri? requestUri)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(bearer)) return;
+                var parts = bearer.Split('.');
+                if (parts.Length < 2) return;
+                var pad = parts[1].Length % 4;
+                var b64 = parts[1] + new string('=', pad == 0 ? 0 : 4 - pad);
+                b64 = b64.Replace('-', '+').Replace('_', '/');
+                var json = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(b64));
+                using var doc = System.Text.Json.JsonDocument.Parse(json);
+                var r = doc.RootElement;
+                string Get(string n) => r.TryGetProperty(n, out var v) ? v.ToString() : "(missing)";
+                Console.WriteLine($"[diag-jwt] uri={requestUri} source={(fromUserScope ? "user-obo" : "app-uami")} aud={Get("aud")} appid={Get("appid")} oid={Get("oid")} scp={Get("scp")} roles={Get("roles")} iss={Get("iss")} upn={Get("upn")} preferred_username={Get("preferred_username")}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[diag-jwt] decode failed: {ex.Message}");
+            }
         }
 
         private string GetAppTokenSync()

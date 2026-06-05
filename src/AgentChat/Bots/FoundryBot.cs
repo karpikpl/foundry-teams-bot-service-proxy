@@ -152,7 +152,7 @@ public class FoundryBot : TeamsActivityHandler
                 var forceRefresh    = parts.Length > 1 && parts[1].Trim().Equals("refresh", StringComparison.OrdinalIgnoreCase);
                 var auth            = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
                 if (!auth.ShouldProceed) break;
-                using var authScope = auth.Scope;
+                using var authScope = ApplyAuthScope(auth);
                 var routing         = TurnRouting.From(_httpContext, _agents);
                 var projectEndpoint = ProjectEndpointForTurn(state, routing);
                 var catalog         = await _agents.GetDescriptorsAsync(auth.UserObjectId, auth.UserToken, projectEndpoint, forceRefresh: forceRefresh, ct: ct);
@@ -337,7 +337,7 @@ public class FoundryBot : TeamsActivityHandler
     {
         var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
         if (!auth.ShouldProceed) return;
-        using var authScope = auth.Scope;
+        using var authScope = ApplyAuthScope(auth);
         var routing = TurnRouting.From(_httpContext, _agents);
         var projectEndpoint = ProjectEndpointForTurn(state, routing);
         var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(auth.UserObjectId, auth.UserToken, projectEndpoint, ct)).Endpoint;
@@ -450,7 +450,7 @@ public class FoundryBot : TeamsActivityHandler
 
         await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = Microsoft.Bot.Schema.ActivityTypes.Typing }, ct);
 
-        using (auth.Scope)
+        using (ApplyAuthScope(auth))
         {
             try
             {
@@ -504,7 +504,7 @@ public class FoundryBot : TeamsActivityHandler
         var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(auth.UserObjectId, auth.UserToken, routing.ProjectEndpoint, ct)).Endpoint;
         var foundry  = _clientCache.For(endpoint);
 
-        using (auth.Scope)
+        using (ApplyAuthScope(auth))
         {
             try
             {
@@ -539,7 +539,7 @@ public class FoundryBot : TeamsActivityHandler
         }
         var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
         if (!auth.ShouldProceed) return;
-        using var authScope = auth.Scope;
+        using var authScope = ApplyAuthScope(auth);
         var routing = TurnRouting.From(_httpContext, _agents);
         var projectEndpoint = ProjectEndpointForTurn(state, routing);
         var agent = await _agents.FindByKeyAsync(key!, auth.UserObjectId, auth.UserToken, projectEndpoint, ct);
@@ -585,10 +585,28 @@ public class FoundryBot : TeamsActivityHandler
     /// turn in, or a signal that we sent a sign-in/error card and the caller
     /// should stop processing this turn.
     /// </summary>
-    private readonly record struct UserAuth(IDisposable? Scope, bool SignInSent, string? UserToken = null, string? UserObjectId = null)
+    private readonly record struct UserAuth(bool SignInSent, string? UserToken = null, string? UserObjectId = null)
     {
         public bool ShouldProceed => !SignInSent;
     }
+
+    private sealed class NoopDisposable : IDisposable
+    {
+        public static readonly NoopDisposable Instance = new();
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// Activates <see cref="FoundryUserAuthScope"/> for the duration of the
+    /// returned <see cref="IDisposable"/>. MUST be called synchronously in the
+    /// caller's execution context — AsyncLocal mutations performed inside an
+    /// awaited helper method do NOT flow back to the caller, so the scope must
+    /// be opened at the same call-stack level that owns the <c>using</c> block.
+    /// </summary>
+    private static IDisposable ApplyAuthScope(UserAuth auth)
+        => string.IsNullOrEmpty(auth.UserToken)
+            ? NoopDisposable.Instance
+            : FoundryUserAuthScope.Use(auth.UserToken!);
 
     /// <summary>
     /// Acquire a user-delegated Foundry token via Teams SSO and return a
@@ -607,7 +625,7 @@ public class FoundryBot : TeamsActivityHandler
             _logger.LogWarning("Teams SSO disabled; refusing to call Foundry without a user OBO token.");
             await turnContext.SendActivityAsync(MessageFactory.Text(
                 "⚠️ Sign-in is required to use Foundry agents, but Teams SSO is not configured on this bot."), ct);
-            return new UserAuth(null, true);
+            return new UserAuth(true);
         }
 
         var token = await _sso.TryGetUserTokenAsync(turnContext, ct);
@@ -621,9 +639,9 @@ public class FoundryBot : TeamsActivityHandler
                 _logger.LogError("Teams SSO returned a token but Activity.From.AadObjectId is missing; cannot build a per-user catalog cache key.");
                 await turnContext.SendActivityAsync(MessageFactory.Text(
                     "⚠️ Sign-in succeeded, but Teams did not include your Entra user id. Contact your admin."), ct);
-                return new UserAuth(null, true);
+                return new UserAuth(true);
             }
-            return new UserAuth(FoundryUserAuthScope.Use(token.Token), false, token.Token, userObjectId);
+            return new UserAuth(false, token.Token, userObjectId);
         }
 
         // No token yet — Teams will normally attempt silent SSO when the
@@ -638,7 +656,7 @@ public class FoundryBot : TeamsActivityHandler
         }
         _logger.LogInformation("Sending Teams SSO sign-in card for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
         await SendSignInCardAsync(turnContext, ct);
-        return new UserAuth(null, true);
+        return new UserAuth(true);
     }
 
     /// <summary>
@@ -700,10 +718,10 @@ public class FoundryBot : TeamsActivityHandler
 
         var auth = string.IsNullOrEmpty(userTokenOverride)
             ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct)
-            : new UserAuth(FoundryUserAuthScope.Use(userTokenOverride), false, userTokenOverride, turnContext.Activity.From?.AadObjectId);
+            : new UserAuth(false, userTokenOverride, turnContext.Activity.From?.AadObjectId);
         if (!auth.ShouldProceed) return;
 
-        using (auth.Scope)
+        using (ApplyAuthScope(auth))
         {
             await RunAgentTurnInnerAsync(turnContext, state, userText, auth, ct);
         }

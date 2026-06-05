@@ -17,9 +17,9 @@ namespace AgentChat.Foundry;
 ///   }
 /// </code>
 ///
-/// Outside any scope, the policy falls back to the configured
-/// <see cref="TokenCredential"/> (App Service UMI). That fallback is what
-/// admin/catalog calls (e.g. /admin/agents) continue to use.
+/// Outside any scope, the policy can fall back to the configured
+/// <see cref="TokenCredential"/> (App Service UMI). Catalog callers do not use
+/// this fallback; they require an explicit user OBO token.
 /// </summary>
 public static class FoundryUserAuthScope
 {
@@ -100,7 +100,7 @@ public sealed class FoundryClient
 
     /// <summary>Adds <c>Authorization: Bearer &lt;token&gt;</c> using either the
     /// per-request user token from <see cref="FoundryUserAuthScope"/> or, as a
-    /// fallback, a cached AAD app token via the configured <see cref="TokenCredential"/>.</summary>
+    /// legacy fallback, a cached AAD app token via the configured <see cref="TokenCredential"/>.</summary>
     private sealed class EntraIdAuthenticationPolicy : AuthenticationPolicy
     {
         private readonly TokenCredential _credential;

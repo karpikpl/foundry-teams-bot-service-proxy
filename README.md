@@ -52,7 +52,7 @@ Web Chat             │
             └──────────────────────┘
 ```
 
-The app holds no agent-definition state — it just forwards Teams activities to the Foundry per-agent URL and pipes streaming events back. Agents are provisioned in Foundry (via portal or Terraform); the bot just needs the project endpoint and the agent names.
+The app holds no global agent-definition state — it fetches the Foundry agent catalog on demand with the signed-in user's OBO token and caches it per `(userObjectId, projectEndpoint)` for a short TTL. Teams activities are then forwarded to the selected Foundry per-agent URL and streaming events are piped back.
 
 ## Quick start
 
@@ -81,8 +81,8 @@ curl http://localhost:8080/admin/agents  # → JSON list of configured agents
 ### Deploy to Azure App Service for Containers
 
 1. Provision: Foundry project + 1+ agents, Cosmos serverless (AAD-only), App Service plan, App Service registered to the GHCR image, Bot Service registration with the App Service's UMI as MSA app id
-2. App Service identity: assign two UAMIs — one for the app (Foundry + Cosmos data-plane), one shared by all Bot Service registrations that target this app
-3. Roles: grant the app UMI `Azure AI User` on the Foundry account and `Cosmos DB Built-in Data Contributor` on the Cosmos account
+2. App Service identity: assign two UAMIs — one for the app (Cosmos data-plane), one shared by all Bot Service registrations that target this app
+3. Roles: grant the app UMI `Cosmos DB Built-in Data Contributor` on the Cosmos account. It no longer needs `Azure AI User` / `Foundry User` on the Foundry project because catalog and chat calls use per-user OBO tokens.
 4. App settings: the env vars listed in [Configuration](#configuration)
 5. Bot Service endpoint: `https://{app}.azurewebsites.net/api/messages`
 
@@ -100,10 +100,7 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 | Env var | Required | Description |
 |---|---|---|
 | `Foundry__ProjectEndpoint` | ✅ | Project URL up to `.../api/projects/{name}` |
-| `Foundry__Agents__N__Key` | optional | Override default agent catalog (see below) |
-| `Foundry__Agents__N__Name` | optional | Agent name in Foundry |
-| `Foundry__Agents__N__Description` | optional | User-facing description in `/agents` picker |
-| `Foundry__Agents__N__Endpoint` | optional | Full per-agent URL; auto-composed from project + name if omitted |
+| `Foundry__CatalogCacheSeconds` | optional | Per-user agent catalog TTL in seconds; defaults to `300` |
 | `Cosmos__Endpoint` | ✅ | Cosmos serverless URL (AAD auth, no keys) |
 | `Cosmos__Database` | optional | Defaults to `botstate` |
 | `Cosmos__Container` | optional | Defaults to `conversations` |
@@ -113,7 +110,7 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 | `BOTSERVICE_UAMI_CLIENTID` | ✅ | UMI client id the JWT middleware validates `aud` against |
 | `AZURE_CLIENT_ID` | optional | If set, `ManagedIdentityCredential` targets this specific UAMI |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | optional | App Insights wiring |
-| `AdminChatAuth__Enabled` | optional | Set `true` to require Entra ID sign-in for `/admin/chat` only |
+| `AdminChatAuth__Enabled` | required for catalog/chat | Set `true` to require Entra ID sign-in for `/admin` catalog, manifest, and chat endpoints |
 | `AdminChatAuth__TenantId` | optional | Tenant for browser chat sign-in; falls back to `TeamsSso__TenantId` |
 | `AdminChatAuth__ClientId` | optional | AAD app client ID; falls back to `TeamsSso__AadAppId` |
 | `AdminChatAuth__ClientSecret` | required when enabled | Client secret for the browser chat confidential client flow |
@@ -121,15 +118,15 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 
 Cosmos is only used for per-conversation bot state. Manifest generation no longer stores bot ↔ agent registrations; operators paste the Bot Service app ID into the inline manifest form.
 
-### Optional: per-user identity for `/admin/chat`
+### Required: per-user identity for `/admin` and Teams chat
 
-By default, the browser test harness at `/admin/chat` is anonymous and calls Foundry with the proxy's managed identity. In multi-user testing this is unsafe: Foundry does not see the browser user, so MCP OAuth can use whichever token was consented last (often the operator who set up the app). Enable `AdminChatAuth` to make only `/admin/chat` and its chat API endpoints require Microsoft Entra ID sign-in; `/admin`, manifests, `/admin/agents`, `/api/messages`, and `/health` remain anonymous.
+Agent catalog discovery no longer runs in the proxy's managed identity. The first authenticated `/admin` request or Teams SSO turn acquires a user-delegated Foundry token, fetches that user's catalog, and caches it under `(userObjectId, projectEndpoint)`. If OBO is unavailable, catalog lookups return no agents instead of falling back to UAMI.
 
 Setup:
 
 1. Reuse the Teams SSO AAD app when possible. If `TeamsSso__AadAppId` is already set, leave `AdminChatAuth__ClientId` unset so the app falls back to it.
 2. In the AAD app registration, add a **Web** platform redirect URI: `https://<host>/signin-oidc`.
-3. Ensure the app has delegated permission `https://ai.azure.com/user_impersonation` and grant/admin-consent it as appropriate.
+3. Ensure the app has delegated permission for Azure AI Foundry and grant/admin-consent it as appropriate.
 4. Create a client secret and set `AdminChatAuth__ClientSecret` from App Service settings or Key Vault.
 5. Enable the feature:
 
@@ -141,26 +138,11 @@ AdminChatAuth__ClientSecret=<secret>
 AdminChatAuth__Instance=https://login.microsoftonline.com/
 ```
 
-When enabled, the signed-in user's token is acquired for `https://ai.azure.com/user_impersonation` on each chat request and sent to Foundry for that request. Workload Identity or managed-credential confidential-client auth could remove the client secret in a future version; v1 uses `ClientSecret` only.
+When enabled, the signed-in user's token is acquired for `https://ai.azure.com/.default` and sent to Foundry for catalog and chat requests. The cache TTL is configurable with `Foundry__CatalogCacheSeconds` (default `300`). Workload Identity or managed-credential confidential-client auth could remove the client secret in a future version; v1 uses `ClientSecret` only.
 
-### Default agent catalog vs. custom
+### Agent catalog
 
-Out of the box the bot exposes three agents in `/agents`:
-
-| Key | Name |
-|---|---|
-| `docs` | `docs-assistant` |
-| `code` | `code-helper` |
-| `orchestrator` | `orchestrator` |
-
-Override by setting `Foundry__Agents__*`:
-
-```bash
--e Foundry__Agents__0__Key=claude \
--e Foundry__Agents__0__Name=claude-static \
--e Foundry__Agents__0__Description="Anthropic Claude Opus via APIM passthrough" \
-# Endpoint omitted → composed as {ProjectEndpoint}/agents/claude-static/endpoint/protocols/openai/v1
-```
+There is no background refresh loop and no static `Foundry__Agents__*` catalog. `/agents`, routed bot turns, manifest generation, and `/admin/chat` fetch the active agents from Foundry on demand using the signed-in user's OBO token. The container app identity needs no Foundry RBAC.
 
 ### URL-routed multi-agent
 

@@ -20,8 +20,7 @@
 #
 # Env vars (double-underscore = ASP.NET config section nesting):
 #   - Foundry__ProjectEndpoint     (required) Project URL up to .../api/projects/{name}
-#   - Foundry__Agents__0__Key      (optional) Override the default agent catalog
-#   - Foundry__Agents__0__Name     (optional) ... see AgentService for shape
+#   - Foundry__CatalogCacheSeconds (optional) Per-user agent catalog TTL; defaults to 300
 #   - Cosmos__Endpoint             (required) Cosmos serverless URL — AAD auth
 #   - Cosmos__Database             (optional) defaults to "botstate"
 #   - Cosmos__Container            (optional) defaults to "conversations"

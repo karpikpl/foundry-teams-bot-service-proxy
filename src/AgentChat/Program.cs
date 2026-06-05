@@ -99,6 +99,6 @@ if (adminChatAuth.Enabled)
 app.MapHealthChecks("/health");
 
 var svc = app.Services.GetRequiredService<AgentService>();
-app.Logger.LogInformation("Configured Foundry project: {Endpoint}. Agent catalog will be discovered on first /agents request.", svc.DefaultProjectEndpoint);
+app.Logger.LogInformation("Configured Foundry project: {Endpoint}. Agent catalog will be discovered on first authenticated request.", svc.DefaultProjectEndpoint);
 
 app.Run();

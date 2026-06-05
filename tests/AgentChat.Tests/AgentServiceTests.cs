@@ -89,54 +89,84 @@ public class AgentServiceTests
         // The configured endpoint doesn't resolve; we expect graceful degradation:
         // an empty catalog, not an exception bubbling up through /agents.
         var svc = MakeService();
-        var result = await svc.GetDescriptorsAsync();
+        var result = await svc.GetDescriptorsAsync("user-a", "obo-token-a");
         result.Should().BeEmpty();
     }
 
+    [Fact]
+    public async Task GetDescriptorsAsync_uses_user_token_and_cache_key_includes_user_oid()
+    {
+        var project = "https://aif-one.services.ai.azure.com/api/projects/proj-a";
+        var handler = new CatalogHandler();
+        var svc = MakeService(httpFactory: new HandlerHttpClientFactory(handler));
+
+        var first = await svc.GetDescriptorsAsync("user-a", "obo-token-a", project);
+        var second = await svc.GetDescriptorsAsync("user-a", "obo-token-b", project);
+
+        first.Should().ContainSingle(d => d.Name == "agent-proj-a");
+        second.Should().BeSameAs(first);
+        handler.Counts[("user-a", project)].Should().Be(1);
+        handler.AuthorizationTokens.Should().ContainSingle().Which.Should().Be("obo-token-a");
+        AgentService.CatalogCacheKey("user-a", project).Should().Be($"agents:user-a:{project}");
+    }
 
     [Fact]
-    public async Task GetDescriptorsAsync_caches_catalogs_separately_per_project()
+    public async Task GetDescriptorsAsync_caches_catalogs_separately_per_user_and_project()
     {
         var projectA = "https://aif-one.services.ai.azure.com/api/projects/proj-a";
         var projectB = "https://aif-two.services.ai.azure.com/api/projects/proj-b";
         var handler = new CatalogHandler();
         var svc = MakeService(httpFactory: new HandlerHttpClientFactory(handler));
 
-        var firstA = await svc.GetDescriptorsAsync(projectA);
-        var firstB = await svc.GetDescriptorsAsync(projectB);
-        var secondA = await svc.GetDescriptorsAsync(projectA);
-        var secondB = await svc.GetDescriptorsAsync(projectB);
+        var userAProjectA = await svc.GetDescriptorsAsync("user-a", "token-a", projectA);
+        var userBProjectA = await svc.GetDescriptorsAsync("user-b", "token-b", projectA);
+        var userAProjectB = await svc.GetDescriptorsAsync("user-a", "token-a", projectB);
+        var secondUserAProjectA = await svc.GetDescriptorsAsync("user-a", "token-a-2", projectA);
 
-        firstA.Should().ContainSingle(d => d.Name == "agent-proj-a");
-        firstB.Should().ContainSingle(d => d.Name == "agent-proj-b");
-        secondA.Should().BeSameAs(firstA);
-        secondB.Should().BeSameAs(firstB);
-        handler.Counts[projectA].Should().Be(1);
-        handler.Counts[projectB].Should().Be(1);
-        firstA[0].Endpoint.Should().StartWith(projectA);
-        firstB[0].Endpoint.Should().StartWith(projectB);
+        userAProjectA.Should().ContainSingle(d => d.Name == "agent-proj-a");
+        userBProjectA.Should().ContainSingle(d => d.Name == "agent-proj-a");
+        userAProjectB.Should().ContainSingle(d => d.Name == "agent-proj-b");
+        secondUserAProjectA.Should().BeSameAs(userAProjectA);
+        handler.Counts[("user-a", projectA)].Should().Be(1);
+        handler.Counts[("user-b", projectA)].Should().Be(1);
+        handler.Counts[("user-a", projectB)].Should().Be(1);
+        handler.AuthorizationTokens.Should().Contain(new[] { "token-a", "token-b" });
+        userAProjectA[0].Endpoint.Should().StartWith(projectA);
+        userAProjectB[0].Endpoint.Should().StartWith(projectB);
+    }
+
+    [Fact]
+    public async Task GetDescriptorsAsync_returns_empty_without_user_context()
+    {
+        var handler = new CatalogHandler();
+        var svc = MakeService(httpFactory: new HandlerHttpClientFactory(handler));
+
+        var result = await svc.GetDescriptorsAsync(null, null);
+
+        result.Should().BeEmpty();
+        handler.Counts.Should().BeEmpty();
     }
 
     [Fact]
     public async Task FindByKeyAsync_returns_null_when_unknown()
     {
         var svc = MakeService();
-        (await svc.FindByKeyAsync("does-not-exist")).Should().BeNull();
+        (await svc.FindByKeyAsync("does-not-exist", "user-a", "obo-token-a")).Should().BeNull();
     }
 
     [Fact]
     public async Task FindKeyForEndpointAsync_returns_null_for_null_or_empty()
     {
         var svc = MakeService();
-        (await svc.FindKeyForEndpointAsync(null)).Should().BeNull();
-        (await svc.FindKeyForEndpointAsync("")).Should().BeNull();
+        (await svc.FindKeyForEndpointAsync(null, "user-a", "obo-token-a")).Should().BeNull();
+        (await svc.FindKeyForEndpointAsync("", "user-a", "obo-token-a")).Should().BeNull();
     }
 
     [Fact]
     public async Task DefaultAsync_throws_when_no_agents_discovered()
     {
         var svc = MakeService();
-        var act = async () => await svc.DefaultAsync();
+        var act = async () => await svc.DefaultAsync("user-a", "obo-token-a");
         await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*No active agents*");
     }
 
@@ -163,15 +193,23 @@ public class AgentServiceTests
 
     private sealed class CatalogHandler : HttpMessageHandler
     {
-        public Dictionary<string, int> Counts { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Dictionary<(string User, string Project), int> Counts { get; } = new();
+        public List<string> AuthorizationTokens { get; } = new();
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            var token = request.Headers.Authorization?.Parameter ?? "";
+            AuthorizationTokens.Add(token);
+            var user = token.Contains("user-b", StringComparison.OrdinalIgnoreCase) || token.EndsWith("-b", StringComparison.OrdinalIgnoreCase)
+                ? "user-b"
+                : "user-a";
+
             var url = request.RequestUri!.ToString();
             var marker = "/agents?";
             var idx = url.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
             var project = idx < 0 ? url : url.Substring(0, idx);
-            Counts[project] = Counts.GetValueOrDefault(project) + 1;
+            var countKey = (user, project);
+            Counts[countKey] = Counts.GetValueOrDefault(countKey) + 1;
             var projectName = project.Split('/').Last();
             var json = $$"""
             {

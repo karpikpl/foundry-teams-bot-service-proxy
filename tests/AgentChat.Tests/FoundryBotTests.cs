@@ -278,7 +278,7 @@ public class FoundryBotTests
             TestServices.Config(),
             new HttpContextAccessor(),
             foundry.ToClientCache(agents),
-            new FakeSsoService(token: null, enabled: false),
+            new FakeSsoService(token: "foundry-user-token", enabled: true),
             NullLogger<FoundryBot>.Instance);
         var adapter = new TestAdapter();
         var turn = MakeMessageTurn(adapter, "boom", convId: "conv-teams-error");
@@ -361,7 +361,7 @@ public class FoundryBotTests
         var activity = MessageFactory.Text(text);
         activity.ChannelId = "msteams";
         activity.Conversation = new ConversationAccount(id: convId);
-        activity.From = new ChannelAccount("user-1", "User");
+        activity.From = new ChannelAccount("user-1", "User") { AadObjectId = "aad-user-1" };
         activity.Recipient = new ChannelAccount("bot-1", "Bot");
         activity.Value = value;
         return new TurnContext(adapter, activity);
@@ -375,7 +375,7 @@ public class FoundryBotTests
             Name = name,
             ChannelId = "msteams",
             Conversation = new ConversationAccount(id: convId),
-            From = new ChannelAccount("user-1", "User"),
+            From = new ChannelAccount("user-1", "User") { AadObjectId = "aad-user-1" },
             Recipient = new ChannelAccount("bot-1", "Bot"),
             Value = value
         };

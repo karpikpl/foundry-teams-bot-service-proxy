@@ -79,29 +79,38 @@ public class ManifestController : ControllerBase
         public string? AppId { get; set; }
     }
 
+    private sealed record FoundryUserContext(string ObjectId, string Token);
+
     /// <summary>
-    /// Acquire an OBO-derived Foundry token for the signed-in admin and push
-    /// it onto the async-local FoundryUserAuthScope, so any FoundryAgentsApi
-    /// call inside the returned scope authenticates as that user. Returns a
-    /// no-op disposable when AdminChatAuth isn't enabled (preserves previous
-    /// UAMI fallback behavior for dev).
+    /// Acquire an OBO-derived Foundry token for the signed-in admin. Agent catalog
+    /// calls require this context; they never fall back to the container identity.
     /// </summary>
-    private async Task<IDisposable> BeginFoundryUserScopeAsync()
+    private async Task<FoundryUserContext?> GetFoundryUserContextAsync()
     {
-        if (_tokenAcquisition is null) return NoopDisposable.Instance;
-        if (!(User?.Identity?.IsAuthenticated ?? false)) return NoopDisposable.Instance;
+        if (_tokenAcquisition is null) return null;
+        if (!(User?.Identity?.IsAuthenticated ?? false)) return null;
         try
         {
+            var objectId = User.FindFirst("oid")?.Value
+                ?? User.FindFirst("http://schemas.microsoft.com/identity/claims/objectidentifier")?.Value
+                ?? User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+            if (string.IsNullOrWhiteSpace(objectId))
+                throw new InvalidOperationException("Signed-in user object id claim is missing.");
+
             var token = await _tokenAcquisition.GetAccessTokenForUserAsync(
-                new[] { AdminChatAuthOptions.FoundryScope });
-            return string.IsNullOrEmpty(token) ? NoopDisposable.Instance : FoundryUserAuthScope.Use(token);
+                new[] { AdminChatAuthOptions.FoundryScope },
+                user: User);
+            return string.IsNullOrEmpty(token) ? null : new FoundryUserContext(objectId, token);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "OBO token acquisition for /admin failed; falling back to UAMI credential.");
-            return NoopDisposable.Instance;
+            _logger.LogWarning(ex, "OBO token acquisition for /admin failed; returning an empty user-scoped agent catalog.");
+            return null;
         }
     }
+
+    private static IDisposable BeginFoundryUserScope(string? token)
+        => string.IsNullOrEmpty(token) ? NoopDisposable.Instance : FoundryUserAuthScope.Use(token);
 
     private sealed class NoopDisposable : IDisposable
     {
@@ -114,16 +123,16 @@ public class ManifestController : ControllerBase
     [HttpGet("agents")]
     public async Task<IActionResult> ListDefaultAgents(CancellationToken ct)
     {
-        using var scope = await BeginFoundryUserScopeAsync();
-        return Ok((await _agents.GetDescriptorsAsync(forceRefresh: false, ct: ct)).Select(ToDto));
+        var user = await GetFoundryUserContextAsync();
+        return Ok((await _agents.GetDescriptorsAsync(user?.ObjectId, user?.Token, forceRefresh: false, ct: ct)).Select(ToDto));
     }
 
     [HttpGet("{foundryHost}/{project}/agents")]
     public async Task<IActionResult> ListScopedAgents(string foundryHost, string project, CancellationToken ct)
     {
-        using var scope = await BeginFoundryUserScopeAsync();
+        var user = await GetFoundryUserContextAsync();
         var projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project);
-        var catalog = await _agents.GetDescriptorsAsync(projectEndpoint, forceRefresh: false, ct: ct);
+        var catalog = await _agents.GetDescriptorsAsync(user?.ObjectId, user?.Token, projectEndpoint, forceRefresh: false, ct: ct);
         return Ok(catalog.Select(ToDto));
     }
 
@@ -141,10 +150,10 @@ public class ManifestController : ControllerBase
     [Produces("text/html")]
     public async Task<ContentResult> Landing(CancellationToken ct)
     {
-        using var scope = await BeginFoundryUserScopeAsync();
+        var user = await GetFoundryUserContextAsync();
         var defaultEndpoint = _agents.DefaultProjectEndpoint;
         TryDeriveFoundryHostAndProject(defaultEndpoint, out var defaultFoundryHost, out var defaultProject);
-        var agents = await _agents.GetDescriptorsAsync(forceRefresh: false, ct: ct);
+        var agents = await _agents.GetDescriptorsAsync(user?.ObjectId, user?.Token, forceRefresh: false, ct: ct);
         var adminChatAuthEnabled = _config.GetValue<bool?>("AdminChatAuth:Enabled") ?? false;
         return HtmlResult(RenderLanding(defaultEndpoint, defaultFoundryHost, defaultProject, agents, adminChatAuthEnabled));
     }
@@ -364,12 +373,15 @@ public class ManifestController : ControllerBase
 
     private async Task<AgentLoadResult> LoadAgentsAsync(string foundryHost, string project, CancellationToken ct)
     {
-        using var scope = await BeginFoundryUserScopeAsync();
+        var user = await GetFoundryUserContextAsync();
         var projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project);
         var http = _httpFactory.CreateClient("foundry-agents");
         try
         {
-            var agents = await FoundryAgentsApi.ListAgentsAsync(http, projectEndpoint, _agents.Credential, ct);
+            if (user is null)
+                throw new InvalidOperationException("A signed-in user OBO token is required to list Foundry agents.");
+            using var scope = BeginFoundryUserScope(user.Token);
+            var agents = await FoundryAgentsApi.ListAgentsAsync(http, projectEndpoint, user.Token, ct);
             return new AgentLoadResult(agents.Where(a => a.IsActive).OrderBy(a => a.Name).ToList(), null);
         }
         catch (Exception ex)

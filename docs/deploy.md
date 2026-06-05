@@ -21,8 +21,7 @@ Reference your own Terraform/Bicep — this is a checklist, not a copy-pasteable
 
 Two UMIs:
 
-1. **App UMI** (`uami-app`) — assigned to the App Service. Used by `DefaultAzureCredential` to obtain tokens for Foundry (`https://ai.azure.com/.default`) and Cosmos. Holds:
-    - `Azure AI User` on the Foundry account
+1. **App UMI** (`uami-app`) — assigned to the App Service. Used by `DefaultAzureCredential` for Cosmos state only. It does **not** need Foundry RBAC because catalog and chat calls use signed-in user OBO tokens. Holds:
     - `Cosmos DB Built-in Data Contributor` on the Cosmos account
 
 2. **Bot UMI** (`uami-bot`) — assigned to the Bot Service registration as its MSA app id. Multiple Bot Service registrations can share this UMI, which gives you N Teams app entries pointing at the same App Service.
@@ -35,6 +34,7 @@ Both UMIs are assigned to the App Service's `userAssignedIdentities`. The app on
 |---|---|
 | `WEBSITES_PORT` | `8080` |
 | `Foundry__ProjectEndpoint` | `https://{foundry}.services.ai.azure.com/api/projects/{project}` |
+| `Foundry__CatalogCacheSeconds` | `300` (optional per-user catalog TTL) |
 | `Cosmos__Endpoint` | `https://{cosmos}.documents.azure.com:443/` |
 | `MicrosoftAppId` | `<bot-uami-client-id>` |
 | `MicrosoftAppType` | `UserAssignedMSI` |
@@ -45,9 +45,7 @@ Both UMIs are assigned to the App Service's `userAssignedIdentities`. The app on
 
 ## Creating agents
 
-The bot doesn't provision agents — that's a deliberate choice so Foundry portal/Terraform owns agent lifecycle. Create them however you prefer; the bot just needs the agent **name** to live at `…/api/projects/{project}/agents/{name}/endpoint/protocols/openai/v1`.
-
-If you want to keep the default catalog (`docs-assistant`, `code-helper`, `orchestrator`), create those 3 agents. Otherwise override with `Foundry__Agents__*` env vars (see [README](../README.md#configuration)).
+The bot doesn't provision agents — that's a deliberate choice so Foundry portal/Terraform owns agent lifecycle. Create them however you prefer. The proxy discovers active agents on demand with the signed-in user's OBO token and composes per-agent endpoints at `…/api/projects/{project}/agents/{name}/endpoint/protocols/openai/v1`.
 
 Sample Foundry agent definition (REST):
 
@@ -129,7 +127,7 @@ When you want each Teams user's identity to flow through to Foundry (and from th
    - Service Provider: **Azure Active Directory v2**
    - Client ID / client secret (or use a Federated Identity Credential on the App Service UMI to avoid storing a secret)
    - Token Exchange URL: `api://<bot-app-id>`
-   - Scopes: `https://ai.azure.com/user_impersonation offline_access`
+   - Scopes: `https://ai.azure.com/.default offline_access`
 3. **In the generated Teams manifest**, the bot embeds `webApplicationInfo` when `TeamsSso__AadAppId` is configured. This is what lets Teams attempt silent SSO without showing a sign-in card.
 4. **App settings**:
    - `TeamsSso__ConnectionName = <OAuth connection name from step 2>` *(SSO turns on automatically when this is set)*
@@ -145,16 +143,15 @@ When you want each Teams user's identity to flow through to Foundry (and from th
 
 ### What happens without Teams SSO
 
-- The bot falls back to its UMI / app identity for the Foundry call. Functionality works, but:
-  - Foundry traces don't show the human user
-  - MCP servers configured with OAuth identity passthrough won't have a user identity to pass through — Foundry will surface an error (or use the agent identity if configured)
+- Agent catalog lookups return no agents; the bot does not fall back to its UMI / app identity for Foundry catalog discovery.
+- Foundry traces and MCP OAuth identity passthrough require a signed-in user token, so configure Teams SSO before exposing the bot to users.
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---|---|
 | `/health` returns 503 | App startup failure — check container logs for `Failed to initialize` |
-| Bot responds with "An error occurred" in Teams | Look for `Foundry HTTP 4xx` in container logs — usually `MicrosoftAppId` mismatch or missing AAD role |
+| Bot responds with "An error occurred" in Teams | Look for `Foundry HTTP 4xx` in container logs — usually `MicrosoftAppId` mismatch, missing Teams SSO, or the signed-in user lacking Foundry access |
 | Streaming text doesn't appear in Teams | Channel must be `msteams` and conversation type `personal` (1:1) — group/channel chats don't support streaming-ux |
 | `Bot Connector HTTP 400` | Activity payload too large (~28 KB Teams limit) — see the per-conversation `/tools off` default |
 | Unknown SSE event logged | Foundry added something the OpenAI SDK doesn't model — log shows full JSON, file an issue |
@@ -163,7 +160,7 @@ When you want each Teams user's identity to flow through to Foundry (and from th
 
 The bot emits the following at `Information` level:
 
-- `Configured N agents` — startup summary of the agent catalog
+- `Refreshed user-scoped agent catalog` — on-demand catalog fetch for a signed-in user/project
 - Bot Framework activity send/receive logs (Kestrel + HttpClient)
 
 And at `Warning`:

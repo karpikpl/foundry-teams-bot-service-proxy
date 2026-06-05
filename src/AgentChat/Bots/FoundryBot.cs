@@ -150,16 +150,19 @@ public class FoundryBot : TeamsActivityHandler
             case "/agents":
             {
                 var forceRefresh    = parts.Length > 1 && parts[1].Trim().Equals("refresh", StringComparison.OrdinalIgnoreCase);
+                var auth            = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
+                if (!auth.ShouldProceed) break;
+                using var authScope = auth.Scope;
                 var routing         = TurnRouting.From(_httpContext, _agents);
                 var projectEndpoint = ProjectEndpointForTurn(state, routing);
-                var catalog         = await _agents.GetDescriptorsAsync(projectEndpoint, forceRefresh: forceRefresh, ct: ct);
+                var catalog         = await _agents.GetDescriptorsAsync(auth.UserObjectId, auth.UserToken, projectEndpoint, forceRefresh: forceRefresh, ct: ct);
                 if (catalog.Count == 0)
                 {
                     await turnContext.SendActivityAsync(MessageFactory.Text(
                         "No agents are available in this Foundry project. Create one in Foundry first, then `/agents refresh`."), ct);
                     break;
                 }
-                var currentKey = await _agents.FindKeyForEndpointAsync(state.AgentEndpoint, projectEndpoint, ct);
+                var currentKey = await _agents.FindKeyForEndpointAsync(state.AgentEndpoint, auth.UserObjectId, auth.UserToken, projectEndpoint, ct);
                 await turnContext.SendActivityAsync(
                     MessageFactory.Attachment(AdaptiveCardBuilder.BuildAgentPickerCard(catalog, currentKey)),
                     ct);
@@ -332,10 +335,13 @@ public class FoundryBot : TeamsActivityHandler
 
     private async Task HandleAgentInfoCommandAsync(ITurnContext turnContext, ConversationState state, CancellationToken ct)
     {
+        var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
+        if (!auth.ShouldProceed) return;
+        using var authScope = auth.Scope;
         var routing = TurnRouting.From(_httpContext, _agents);
         var projectEndpoint = ProjectEndpointForTurn(state, routing);
-        var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(projectEndpoint, ct)).Endpoint;
-        var catalog  = await _agents.GetDescriptorsAsync(projectEndpoint, ct: ct);
+        var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(auth.UserObjectId, auth.UserToken, projectEndpoint, ct)).Endpoint;
+        var catalog  = await _agents.GetDescriptorsAsync(auth.UserObjectId, auth.UserToken, projectEndpoint, ct: ct);
         var desc     = catalog.FirstOrDefault(d => string.Equals(d.Endpoint, endpoint, StringComparison.OrdinalIgnoreCase));
         var facts = new List<(string, string)>
         {
@@ -490,13 +496,13 @@ public class FoundryBot : TeamsActivityHandler
         var previousResponseId = state.PendingApprovalResponseId!;
         await turnContext.SendActivityAsync(MessageFactory.Text(approve ? "✅ Approved." : "❌ Denied."), ct);
 
-        var routing = TurnRouting.From(_httpContext, _agents);
-        var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(routing.ProjectEndpoint, ct)).Endpoint;
-        var foundry  = _clientCache.For(endpoint);
-
         // The approval flow is itself a follow-on Foundry call; honor SSO.
         var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
         if (!auth.ShouldProceed) return;
+
+        var routing = TurnRouting.From(_httpContext, _agents);
+        var endpoint = state.AgentEndpoint ?? (await _agents.DefaultAsync(auth.UserObjectId, auth.UserToken, routing.ProjectEndpoint, ct)).Endpoint;
+        var foundry  = _clientCache.For(endpoint);
 
         using (auth.Scope)
         {
@@ -531,9 +537,12 @@ public class FoundryBot : TeamsActivityHandler
             await turnContext.SendActivityAsync(MessageFactory.Text("Pick an agent first."), ct);
             return;
         }
+        var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
+        if (!auth.ShouldProceed) return;
+        using var authScope = auth.Scope;
         var routing = TurnRouting.From(_httpContext, _agents);
         var projectEndpoint = ProjectEndpointForTurn(state, routing);
-        var agent = await _agents.FindByKeyAsync(key!, projectEndpoint, ct);
+        var agent = await _agents.FindByKeyAsync(key!, auth.UserObjectId, auth.UserToken, projectEndpoint, ct);
         if (agent is null)
         {
             await turnContext.SendActivityAsync(MessageFactory.Text(
@@ -573,11 +582,10 @@ public class FoundryBot : TeamsActivityHandler
 
     /// <summary>
     /// Outcome of acquiring per-turn user auth: either a scope to wrap the
-    /// turn in (which may be null when SSO is disabled and we fall back to
-    /// UMI), or a signal that we sent a sign-in card and the caller should
-    /// stop processing this turn.
+    /// turn in, or a signal that we sent a sign-in/error card and the caller
+    /// should stop processing this turn.
     /// </summary>
-    private readonly record struct UserAuth(IDisposable? Scope, bool SignInSent)
+    private readonly record struct UserAuth(IDisposable? Scope, bool SignInSent, string? UserToken = null, string? UserObjectId = null)
     {
         public bool ShouldProceed => !SignInSent;
     }
@@ -585,9 +593,9 @@ public class FoundryBot : TeamsActivityHandler
     /// <summary>
     /// Acquire a user-delegated Foundry token via Teams SSO and return a
     /// <see cref="FoundryUserAuthScope"/> to wrap subsequent Foundry calls.
-    /// When SSO is disabled, returns a no-op scope so callers fall back to
-    /// the UMI/app token (today's behavior). When SSO is enabled but the
-    /// user isn't signed in, sends an OAuthCard and signals the caller to
+    /// When SSO is disabled, sends an error instead of falling back to the
+    /// UMI/app token. When SSO is enabled but the user isn't signed in, sends
+    /// an OAuthCard and signals the caller to
     /// pause; the user's silent Teams SSO (or explicit sign-in) will
     /// re-trigger via the <c>signin/tokenExchange</c> invoke handler.
     /// </summary>
@@ -596,8 +604,10 @@ public class FoundryBot : TeamsActivityHandler
     {
         if (!_sso.Enabled)
         {
-            _logger.LogInformation("Teams SSO disabled; using app identity for this turn.");
-            return new UserAuth(null, false);
+            _logger.LogWarning("Teams SSO disabled; refusing to call Foundry without a user OBO token.");
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                "⚠️ Sign-in is required to use Foundry agents, but Teams SSO is not configured on this bot."), ct);
+            return new UserAuth(null, true);
         }
 
         var token = await _sso.TryGetUserTokenAsync(turnContext, ct);
@@ -605,7 +615,15 @@ public class FoundryBot : TeamsActivityHandler
             token is not null && !string.IsNullOrEmpty(token.Token) ? "present" : "absent");
         if (token is not null && !string.IsNullOrEmpty(token.Token))
         {
-            return new UserAuth(FoundryUserAuthScope.Use(token.Token), false);
+            var userObjectId = turnContext.Activity.From?.AadObjectId;
+            if (string.IsNullOrWhiteSpace(userObjectId))
+            {
+                _logger.LogError("Teams SSO returned a token but Activity.From.AadObjectId is missing; cannot build a per-user catalog cache key.");
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    "⚠️ Sign-in succeeded, but Teams did not include your Entra user id. Contact your admin."), ct);
+                return new UserAuth(null, true);
+            }
+            return new UserAuth(FoundryUserAuthScope.Use(token.Token), false, token.Token, userObjectId);
         }
 
         // No token yet — Teams will normally attempt silent SSO when the
@@ -682,16 +700,16 @@ public class FoundryBot : TeamsActivityHandler
 
         var auth = string.IsNullOrEmpty(userTokenOverride)
             ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct)
-            : new UserAuth(FoundryUserAuthScope.Use(userTokenOverride), false);
+            : new UserAuth(FoundryUserAuthScope.Use(userTokenOverride), false, userTokenOverride, turnContext.Activity.From?.AadObjectId);
         if (!auth.ShouldProceed) return;
 
         using (auth.Scope)
         {
-            await RunAgentTurnInnerAsync(turnContext, state, userText, ct);
+            await RunAgentTurnInnerAsync(turnContext, state, userText, auth, ct);
         }
     }
 
-    private async Task RunAgentTurnInnerAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct)
+    private async Task RunAgentTurnInnerAsync(ITurnContext turnContext, ConversationState state, string userText, UserAuth auth, CancellationToken ct)
     {
         var activityId = EnsureActivityId(turnContext);
         using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
@@ -699,7 +717,18 @@ public class FoundryBot : TeamsActivityHandler
         var routing = TurnRouting.From(_httpContext, _agents);
         var targetEndpoint = routing.IsRouted
             ? routing.AgentEndpoint
-            : state.AgentEndpoint ?? (await _agents.DefaultAsync(routing.ProjectEndpoint, ct)).Endpoint;
+            : state.AgentEndpoint ?? (await _agents.DefaultAsync(auth.UserObjectId, auth.UserToken, routing.ProjectEndpoint, ct)).Endpoint;
+
+        if (routing.IsRouted)
+        {
+            var routedKey = await _agents.FindKeyForEndpointAsync(routing.AgentEndpoint, auth.UserObjectId, auth.UserToken, routing.ProjectEndpoint, ct);
+            if (string.IsNullOrEmpty(routedKey))
+            {
+                await turnContext.SendActivityAsync(MessageFactory.Text(
+                    "⚠️ This agent is not available to your signed-in Foundry user."), ct);
+                return;
+            }
+        }
 
         // Endpoint switch wipes the bound Foundry conversation.
         if (!string.Equals(state.AgentEndpoint, targetEndpoint, StringComparison.OrdinalIgnoreCase))

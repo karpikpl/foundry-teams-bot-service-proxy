@@ -12,7 +12,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write   # for creating GitHub Releases
   packages: write
   id-token: write   # cosign keyless signing
   attestations: write
@@ -113,3 +113,21 @@ jobs:
           COSIGN_EXPERIMENTAL: 'true'
         run: |
           echo "$TAGS" | xargs -I{} cosign sign --yes "{}@${DIGEST}"
+
+      # Every tag MUST produce a GitHub Release so the Releases page is the
+      # single source of truth. Pre-release tags (vX.Y.Z-*) are marked as
+      # prereleases. Body is auto-generated from commits since the previous
+      # tag; edit on the Releases page if you want to flesh it out.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:               ${{ steps.tag.outputs.value }}
+          name:                   ${{ steps.tag.outputs.value }}
+          prerelease:             ${{ contains(steps.tag.outputs.value, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          body: |
+            Container image: `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.value }}`
+            Digest: `${{ steps.build.outputs.digest }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

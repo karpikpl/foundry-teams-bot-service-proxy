@@ -30,7 +30,9 @@ src/AgentChat/
   - `ChatTestController`: `/admin/chat/*` browser test harness with SSE streaming; protected with `AdminChatAuthFilter` and `AuthorizeForScopes`.
   - `NotifyController`: `/api/notify` proactive message helper using stored conversation references.
 - `Middleware/`
-  - `BotServiceJwtMiddleware`: route-bound inbound JWT guard for `/api/messages*`.
+  - `BotServiceJwtMiddleware`: route-bound inbound JWT guard for `/api/messages*`. **Does not touch `/api/passthrough/*`.**
+- `Passthrough/`
+  - `PassthroughEndpoints` + `ActivityProtocolTransformer`: YARP-based **transparent reverse proxy** at `POST /api/passthrough/{foundry}/{project}/{agent}` → Foundry's `…/endpoint/protocols/activityprotocol` URL. Forwards the inbound JWT (signed by Bot Service for the Foundry agent SP) **unchanged** so Foundry validates it normally; the proxy contributes only a network hop + path rewrite. Used when Foundry public network access is disabled and Bot Service must reach Foundry through a VNet-attached relay. The bot service for this route is configured exactly like the "direct" bot (`msaAppId` = Foundry agent SP) except the endpoint points at our container.
 - `Auth/`
   - `AdminChatAuthOptions`: OIDC/OBO settings and fallbacks.
   - `AdminChatAuthFilter`: challenges anonymous `/admin/*` users when admin auth is enabled.

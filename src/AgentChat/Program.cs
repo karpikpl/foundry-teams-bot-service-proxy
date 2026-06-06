@@ -1,6 +1,7 @@
 using AgentChat.Auth;
 using AgentChat.Bots;
 using AgentChat.Middleware;
+using AgentChat.Passthrough;
 using AgentChat.Services;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.Bot.Builder;
@@ -77,6 +78,10 @@ builder.Services.AddSingleton<BotFrameworkAuthentication, ConfigurationBotFramew
 builder.Services.AddSingleton<IBotFrameworkHttpAdapter, AdapterWithErrorHandler>();
 builder.Services.AddTransient<IBot, FoundryBot>();
 
+// Transparent reverse-proxy route for Foundry Activity Protocol
+// (/api/passthrough/{foundry}/{project}/{agent}). See PassthroughEndpoints.
+builder.Services.AddActivityProtocolPassthrough();
+
 var app = builder.Build();
 
 app.UseDefaultFiles();
@@ -92,6 +97,7 @@ if (adminChatAuth.Enabled)
     app.UseAuthorization();
 }
 app.MapControllers();
+app.MapActivityProtocolPassthrough();
 if (adminChatAuth.Enabled)
 {
     app.MapRazorPages();

@@ -24,7 +24,19 @@ jobs:
         run: dotnet build --configuration Release --no-restore
 
       - name: Test
-        run: dotnet test --configuration Release --no-build --logger "trx;LogFileName=results.trx" --results-directory ./TestResults
+        run: dotnet test --configuration Release --no-build --logger "trx;LogFileName=results.trx" --logger "GitHubActions;summary.includePassedTests=false" --results-directory ./TestResults
+
+      - name: Publish test report
+        # Posts a check run on the PR with pass/fail counts and per-test details.
+        # `if: always()` so failed tests still get a report (and the workflow
+        # itself still fails because the test step exited non-zero).
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: dotnet tests
+          path: TestResults/results.trx
+          reporter: dotnet-trx
+          fail-on-error: false
 
       - name: Upload test results
         if: always()

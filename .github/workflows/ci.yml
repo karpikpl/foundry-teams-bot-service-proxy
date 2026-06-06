@@ -7,6 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  checks: write          # dorny/test-reporter creates a check run with test detail
+  pull-requests: write   # …and posts a summary to the PR
+
 jobs:
   test:
     runs-on: ubuntu-latest

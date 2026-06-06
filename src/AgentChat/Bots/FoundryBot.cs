@@ -135,6 +135,7 @@ public class FoundryBot : TeamsActivityHandler
                         ("/tokens",        "Show token usage for this conversation"),
                         ("/usage on|off",  "Toggle the per-run usage footer"),
                         ("/tools on|off",  "Show or hide tool-call cards (off by default)"),
+                        ("/thinking on|off", "Show or hide live thinking status (on by default)"),
                         ("/auto list|clear", "Manage auto-approved MCP tools"),
                         ("/signout",       "Sign out (clears cached Teams SSO token)"),
                         ("/reset",         "Start a new conversation (loses memory)"),
@@ -179,6 +180,10 @@ public class FoundryBot : TeamsActivityHandler
 
             case "/tools":
                 await HandleToolsCommandAsync(turnContext, state, parts.Length > 1 ? parts[1].Trim() : "", ct);
+                break;
+
+            case "/thinking":
+                await HandleThinkingCommandAsync(turnContext, state, parts.Length > 1 ? parts[1].Trim() : "", ct);
                 break;
 
             case "/auto":
@@ -282,6 +287,28 @@ public class FoundryBot : TeamsActivityHandler
             newValue.Value
                 ? "🔧 Tool-call cards **on** — you'll see what the agent called and the raw output."
                 : "🔧 Tool-call cards **off** — the agent's text summary is all you'll see."), ct);
+    }
+
+    private async Task HandleThinkingCommandAsync(ITurnContext turnContext, ConversationState state, string arg, CancellationToken ct)
+    {
+        bool? newValue = arg.ToLowerInvariant() switch
+        {
+            "on" or "1" or "true"   => true,
+            "off" or "0" or "false" => false,
+            _ => null
+        };
+        if (newValue is null)
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                $"Live thinking status is currently **{(state.ShowThinking ? "on" : "off")}**. Use `/thinking on` or `/thinking off`."), ct);
+            return;
+        }
+        state.ShowThinking = newValue.Value;
+        await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+        await turnContext.SendActivityAsync(MessageFactory.Text(
+            newValue.Value
+                ? "💭 Live thinking status **on** — you'll see what the agent is doing while it works."
+                : "💭 Live thinking status **off** — the chat will only show the final response."), ct);
     }
 
     private async Task HandleAutoCommandAsync(ITurnContext turnContext, ConversationState state, string arg, CancellationToken ct)
@@ -996,6 +1023,17 @@ public class FoundryBot : TeamsActivityHandler
         // 1) Function calls — dispatch and post outputs; continue loop.
         if (pendingFunctionCalls.Count > 0)
         {
+            // Live "thinking" status: surface what the agent is about to do
+            // BEFORE we close the stream. The informative-update slot stays
+            // visible during the dispatch + next streaming request; the next
+            // text delta naturally replaces it.
+            if (state.ShowThinking && streaming.Enabled)
+            {
+                var status = pendingFunctionCalls.Count == 1
+                    ? ThinkingStatus.ForFunctionCall(pendingFunctionCalls[0].FunctionName)
+                    : ThinkingStatus.ForBatch(pendingFunctionCalls.Count);
+                await streaming.SendInformativeAsync(status, ct);
+            }
             await streaming.FinalizeAsync(ct);
             var outputs = new List<ResponseItem>();
             foreach (var fc in pendingFunctionCalls)
@@ -1113,6 +1151,14 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             case McpToolCallItem mcp:
+                // Live "thinking" status (independent of full tool cards):
+                // surface that an MCP tool just completed so the user has a
+                // breadcrumb even when ShowToolCalls is off.
+                if (state.ShowThinking && streaming.Enabled)
+                {
+                    await streaming.SendInformativeAsync(
+                        ThinkingStatus.ForMcpCallCompleted(mcp.ToolName, mcp.ServerLabel), ct);
+                }
                 if (!state.ShowToolCalls) break;
                 await streaming.FinalizeAsync(ct);
                 var argsStr = mcp.ToolArguments?.ToString() ?? "{}";

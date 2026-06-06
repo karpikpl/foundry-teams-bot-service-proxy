@@ -288,6 +288,161 @@ public static class AdaptiveCardBuilder
         return AsAttachment(card);
     }
 
+    // -------------------------------------------------------------------- reasoning
+
+    private const int MaxArgsInReasoningStep   = 200;
+    private const int MaxOutputInReasoningStep = 400;
+    private const int MaxStepsInReasoningCard  = 20;
+
+    /// <summary>
+    /// Collapsible "Reasoning" summary card attached to the FINAL streaming
+    /// message of a turn. Lists each tool/function call the agent made, with
+    /// truncated arguments and output. Hidden by default — user clicks
+    /// "Show steps" to expand.
+    ///
+    /// Sized conservatively: per-step caps + a hard cap of 20 steps keep the
+    /// payload well under Bot Connector's ~28 KB activity limit even on long
+    /// multi-tool turns.
+    /// </summary>
+    public static Attachment BuildReasoningCard(IList<ThinkingStep> steps)
+    {
+        ArgumentNullException.ThrowIfNull(steps);
+        if (steps.Count == 0)
+            throw new ArgumentException("At least one step is required.", nameof(steps));
+
+        var detailsId = "reasoningDetails";
+
+        var details = new AdaptiveContainer
+        {
+            Id        = detailsId,
+            IsVisible = false,
+            Spacing   = AdaptiveSpacing.Medium
+        };
+
+        var shown = steps.Take(MaxStepsInReasoningCard).ToList();
+        for (int i = 0; i < shown.Count; i++)
+        {
+            details.Items.Add(BuildReasoningStep(i + 1, shown[i]));
+        }
+
+        if (steps.Count > MaxStepsInReasoningCard)
+        {
+            details.Items.Add(new AdaptiveTextBlock
+            {
+                Text     = $"… {steps.Count - MaxStepsInReasoningCard} more step(s) omitted.",
+                Size     = AdaptiveTextSize.Small,
+                IsSubtle = true,
+                Wrap     = true,
+                Spacing  = AdaptiveSpacing.Medium
+            });
+        }
+
+        var subtitle = steps.Count == 1 ? "1 step" : $"{steps.Count} steps";
+
+        var showActionSet = new AdaptiveActionSet
+        {
+            Id = "showStepsBar",
+            Actions =
+            {
+                new AdaptiveToggleVisibilityAction
+                {
+                    Title = "Show steps",
+                    TargetElements =
+                    {
+                        new AdaptiveTargetElement(detailsId,      isVisible: true),
+                        new AdaptiveTargetElement("showStepsBar", isVisible: false),
+                        new AdaptiveTargetElement("hideStepsBar", isVisible: true)
+                    }
+                }
+            }
+        };
+
+        var hideActionSet = new AdaptiveActionSet
+        {
+            Id        = "hideStepsBar",
+            IsVisible = false,
+            Actions =
+            {
+                new AdaptiveToggleVisibilityAction
+                {
+                    Title = "Hide steps",
+                    TargetElements =
+                    {
+                        new AdaptiveTargetElement(detailsId,      isVisible: false),
+                        new AdaptiveTargetElement("showStepsBar", isVisible: true),
+                        new AdaptiveTargetElement("hideStepsBar", isVisible: false)
+                    }
+                }
+            }
+        };
+
+        var card = new AdaptiveCard(Schema)
+        {
+            Body =
+            {
+                HeaderBar("💭", "Reasoning", subtitle, AdaptiveContainerStyle.Default),
+                showActionSet,
+                hideActionSet,
+                details
+            }
+        };
+
+        return AsAttachment(card);
+    }
+
+    private static AdaptiveContainer BuildReasoningStep(int index, ThinkingStep step)
+    {
+        var (icon, kindLabel) = step.Kind switch
+        {
+            "Function"        => ("🛠️", "Function"),
+            "CodeInterpreter" => ("🐍", "Code Interpreter"),
+            _                 => ("🔧", "MCP")
+        };
+        if (step.IsError) icon = "⚠️";
+
+        var subtitle = string.IsNullOrEmpty(step.ServerLabel)
+            ? kindLabel
+            : $"{kindLabel} on `{step.ServerLabel}`";
+
+        var header = new AdaptiveTextBlock
+        {
+            Text   = $"{icon} **{index}. {step.ToolName}**",
+            Wrap   = true,
+            Size   = AdaptiveTextSize.Small,
+            Weight = AdaptiveTextWeight.Default
+        };
+
+        var sub = new AdaptiveTextBlock
+        {
+            Text     = subtitle,
+            Wrap     = true,
+            Size     = AdaptiveTextSize.Small,
+            IsSubtle = true,
+            Spacing  = AdaptiveSpacing.None
+        };
+
+        var container = new AdaptiveContainer
+        {
+            Separator = index > 1,
+            Spacing   = AdaptiveSpacing.Small,
+            Items     = { header, sub }
+        };
+
+        if (!string.IsNullOrWhiteSpace(step.Arguments) && step.Arguments != "{}")
+        {
+            container.Items.Add(SubtleLabel("Arguments"));
+            container.Items.Add(CodeBlock(Truncate(step.Arguments, MaxArgsInReasoningStep)));
+        }
+
+        if (!string.IsNullOrWhiteSpace(step.Output))
+        {
+            container.Items.Add(SubtleLabel(step.IsError ? "Error" : "Output"));
+            container.Items.Add(CodeBlock(Truncate(step.Output, MaxOutputInReasoningStep)));
+        }
+
+        return container;
+    }
+
     // -------------------------------------------------------------------- help
 
     public static Attachment BuildHelpCard(IEnumerable<(string cmd, string description)> commands)

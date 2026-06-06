@@ -77,6 +77,16 @@ public class ConversationState : IStoreItem
     public bool ShowToolCalls { get; set; } = false;
 
     /// <summary>
+    /// Whether to surface live "thinking" status updates in the Teams
+    /// informative-update slot (the blue progress bar) as the agent calls
+    /// tools. Default on — keeps the user informed of activity during long
+    /// tool calls. Independent of <see cref="ShowToolCalls"/>, which controls
+    /// whether the full tool I/O is rendered as detail cards. Toggle with
+    /// <c>/thinking on|off</c>.
+    /// </summary>
+    public bool ShowThinking { get; set; } = true;
+
+    /// <summary>
     /// Conversation reference captured on every turn so we can do proactive
     /// pushes from a different request later.
     /// </summary>

@@ -241,6 +241,61 @@ public class StreamingMessageHelperTests
             "subsequent sends must include the streamId from the first response");
     }
 
+    [Fact]
+    public async Task FinalizeAsync_attaches_attachments_to_final_streaming_message()
+    {
+        var sent = new List<IActivity>();
+        var s = new StreamingMessageHelper(Teams(sent));
+
+        await s.SendInformativeAsync("thinking…", default);
+        s.AppendDelta("hello world");
+        await s.FinalizeAsync(default, new List<Attachment>
+        {
+            new("application/vnd.microsoft.card.adaptive", content: new JObject(new JProperty("type", "AdaptiveCard")))
+        });
+
+        var final = (Activity)sent.Last();
+        final.Type.Should().Be(ActivityTypes.Message);
+        final.Entities!.Single(e => e.Type == "streaminfo")
+            .Properties!["streamType"]!.ToString().Should().Be("final");
+        final.Attachments.Should().HaveCount(1);
+        final.Attachments[0].ContentType.Should().Be("application/vnd.microsoft.card.adaptive");
+    }
+
+    [Fact]
+    public async Task FinalizeAsync_without_attachments_omits_attachments_on_final_message()
+    {
+        var sent = new List<IActivity>();
+        var s = new StreamingMessageHelper(Teams(sent));
+        await s.SendInformativeAsync("…", default);
+        s.AppendDelta("done");
+        await s.FinalizeAsync(default);
+
+        var final = (Activity)sent.Last();
+        (final.Attachments ?? new List<Attachment>()).Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task FinalizeAsync_sends_attachments_as_plain_message_when_stream_disabled()
+    {
+        // Non-Teams channel = streaming disabled. Attachments still need to flow.
+        var sent = new List<IActivity>();
+        var ctx  = MakeContext("webchat", "personal", sent);
+        var s    = new StreamingMessageHelper(ctx);
+
+        s.AppendDelta("answer text");
+        await s.FinalizeAsync(default, new List<Attachment>
+        {
+            new("application/vnd.microsoft.card.adaptive", content: new JObject())
+        });
+
+        sent.Should().HaveCount(1);
+        var act = (Activity)sent[0];
+        act.Text.Should().Be("answer text");
+        act.Attachments.Should().HaveCount(1);
+        (act.Entities ?? new List<Entity>()).Should().BeEmpty("non-streaming channels must not carry streaminfo");
+    }
+
     private sealed class RecordingAdapter : BotAdapter
     {
         private readonly List<IActivity> _sent;

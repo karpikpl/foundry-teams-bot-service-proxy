@@ -335,6 +335,157 @@ public class AdaptiveCardBuilderTests
         }
     }
 
+    // ============================================================ Reasoning
+
+    [Fact]
+    public void ReasoningCard_renders_subtitle_with_step_count()
+    {
+        var att = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("Function", "get_weather", null, "{\"city\":\"oslo\"}", "sunny", false),
+            new("MCP",      "search",      "microsoft_learn", "{\"q\":\"foundry\"}", "3 results", false)
+        });
+        AllText(att).Should().Contain("Reasoning");
+        AllText(att).Should().Contain(t => t.Contains("2 steps"));
+        AllText(att).Should().Contain(t => t.Contains("get_weather"));
+        AllText(att).Should().Contain(t => t.Contains("search"));
+    }
+
+    [Fact]
+    public void ReasoningCard_uses_singular_when_only_one_step()
+    {
+        var att = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("Function", "f", null, "{}", "ok", false)
+        });
+        AllText(att).Should().Contain(t => t.Contains("1 step") && !t.Contains("1 steps"));
+    }
+
+    [Fact]
+    public void ReasoningCard_details_container_starts_hidden_and_secondary_action_bar_starts_hidden()
+    {
+        var att     = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("MCP", "x", "srv", "{}", "y", false)
+        });
+        var root    = (JObject)att.Content;
+        var details = FindById(root, "reasoningDetails");
+        details.Should().NotBeNull();
+        details!["isVisible"]!.Value<bool>().Should().BeFalse();
+
+        var hideBar = FindById(root, "hideStepsBar");
+        hideBar.Should().NotBeNull();
+        hideBar!["isVisible"]!.Value<bool>().Should().BeFalse();
+
+        var showBar = FindById(root, "showStepsBar");
+        showBar.Should().NotBeNull();
+        // Default isVisible = true when not specified.
+        (showBar!["isVisible"]?.Value<bool>() ?? true).Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReasoningCard_show_action_targets_swap_visibility_of_details_and_buttons()
+    {
+        var att     = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("MCP", "x", "srv", "{}", "y", false)
+        });
+        var showBar = FindById((JObject)att.Content, "showStepsBar")!;
+        var act     = (JObject)((JArray)showBar["actions"]!)[0];
+        act["type"]!.ToString().Should().Be("Action.ToggleVisibility");
+        var targets = ((JArray)act["targetElements"]!).Cast<JObject>().ToList();
+
+        targets.Single(t => t["elementId"]!.ToString() == "reasoningDetails")["isVisible"]!.Value<bool>().Should().BeTrue();
+        targets.Single(t => t["elementId"]!.ToString() == "showStepsBar")["isVisible"]!.Value<bool>().Should().BeFalse();
+        targets.Single(t => t["elementId"]!.ToString() == "hideStepsBar")["isVisible"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
+    public void ReasoningCard_truncates_long_arguments_and_output_with_ellipsis()
+    {
+        var bigArgs   = new string('a', 5000);
+        var bigOutput = new string('b', 5000);
+        var att = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("Function", "blob", null, bigArgs, bigOutput, false)
+        });
+        var texts = AllText(att);
+        // Arguments cap is 200 chars in BuildReasoningStep.
+        texts.Should().Contain(t => t.StartsWith("aaaa") && t.Length <= 240);
+        // Output cap is 400 chars.
+        texts.Should().Contain(t => t.StartsWith("bbbb") && t.Length <= 440);
+        // Neither field renders the raw 5000-char input.
+        texts.Should().NotContain(t => t.Length >= 5000);
+    }
+
+    [Fact]
+    public void ReasoningCard_caps_at_20_visible_steps_and_notes_overflow()
+    {
+        var steps = Enumerable.Range(0, 25)
+            .Select(i => new ThinkingStep("MCP", $"tool_{i}", "srv", "{}", "ok", false))
+            .ToList();
+        var att = AdaptiveCardBuilder.BuildReasoningCard(steps);
+        var texts = AllText(att);
+        texts.Should().Contain(t => t.Contains("tool_0"));
+        texts.Should().Contain(t => t.Contains("tool_19"));
+        texts.Should().NotContain(t => t.Contains("tool_20"));
+        texts.Should().Contain(t => t.Contains("5") && t.Contains("more"));
+    }
+
+    [Fact]
+    public void ReasoningCard_error_step_uses_warning_icon_and_error_label()
+    {
+        var att = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("MCP", "broken_tool", "srv", "{}", "boom", IsError: true)
+        });
+        var texts = AllText(att);
+        texts.Should().Contain(t => t.Contains("⚠️") && t.Contains("broken_tool"));
+        texts.Should().Contain(t => t == "Error");
+        texts.Should().NotContain(t => t == "Output");
+    }
+
+    [Fact]
+    public void ReasoningCard_throws_on_empty_step_list()
+    {
+        Action act = () => AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>());
+        act.Should().Throw<ArgumentException>().WithParameterName("steps");
+    }
+
+    [Fact]
+    public void ReasoningCard_uses_default_style_for_neutral_header()
+    {
+        var att = AdaptiveCardBuilder.BuildReasoningCard(new List<ThinkingStep>
+        {
+            new("MCP", "x", "srv", "{}", "ok", false)
+        });
+        StylesIn((JToken)att.Content).Should().Contain("default");
+    }
+
+    private static JObject? FindById(JObject root, string id)
+    {
+        JObject? hit = null;
+        Walk(root);
+        return hit;
+
+        void Walk(JToken n)
+        {
+            if (hit is not null) return;
+            switch (n)
+            {
+                case JObject obj when obj["id"]?.ToString() == id:
+                    hit = obj;
+                    return;
+                case JObject obj:
+                    foreach (var p in obj.Properties()) Walk(p.Value);
+                    break;
+                case JArray arr:
+                    foreach (var c in arr) Walk(c);
+                    break;
+            }
+        }
+    }
+
     // ============================================================ helpers
 
     /// <summary>Recursively collects every visible text string from a card.</summary>

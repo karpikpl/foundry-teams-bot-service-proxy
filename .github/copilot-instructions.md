@@ -38,7 +38,7 @@ src/AgentChat/
   - `AdminChatAuthFilter`: challenges anonymous `/admin/*` users when admin auth is enabled.
   - `FicServiceClientCredentialsFactory`: mints per-bot Bot Framework tokens via Federated Identity Credential (FIC), no per-bot secrets.
 - `Bots/`
-  - `FoundryBot`: Teams activity handler, commands (`/agents`, `/reset`, `/stop`, `/usage`, `/tools`, `/auto`, `/tokens`, `/signout`), Foundry turn execution, MCP approval flow.
+  - `FoundryBot`: Teams activity handler, commands (`/agents`, `/reset`, `/stop`, `/usage`, `/tools`, `/thinking`, `/auto`, `/tokens`, `/signout`), Foundry turn execution, MCP approval flow.
   - `StreamingMessageHelper`: Teams 1:1 streaming UX helper; it sends typing/informative/streaming/final activities and must finalize open streams.
   - `ConversationStore`/`ConversationState`: Cosmos-backed state and conversation references.
   - `ManifestBuilder`, `AdaptiveCardBuilder`, `McpApproval`, `FunctionToolDispatcher`, `AgentMessageRenderer`, `TurnRouting`, `UrlSafety`, `ConsentLinkParser`.

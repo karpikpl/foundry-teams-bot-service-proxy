@@ -135,6 +135,7 @@ public class FoundryBot : TeamsActivityHandler
                         ("/tokens",        "Show token usage for this conversation"),
                         ("/usage on|off",  "Toggle the per-run usage footer"),
                         ("/tools on|off",  "Show or hide tool-call cards (off by default)"),
+                        ("/thinking on|off", "Show or hide live thinking status (on by default)"),
                         ("/auto list|clear", "Manage auto-approved MCP tools"),
                         ("/signout",       "Sign out (clears cached Teams SSO token)"),
                         ("/reset",         "Start a new conversation (loses memory)"),
@@ -179,6 +180,10 @@ public class FoundryBot : TeamsActivityHandler
 
             case "/tools":
                 await HandleToolsCommandAsync(turnContext, state, parts.Length > 1 ? parts[1].Trim() : "", ct);
+                break;
+
+            case "/thinking":
+                await HandleThinkingCommandAsync(turnContext, state, parts.Length > 1 ? parts[1].Trim() : "", ct);
                 break;
 
             case "/auto":
@@ -282,6 +287,28 @@ public class FoundryBot : TeamsActivityHandler
             newValue.Value
                 ? "🔧 Tool-call cards **on** — you'll see what the agent called and the raw output."
                 : "🔧 Tool-call cards **off** — the agent's text summary is all you'll see."), ct);
+    }
+
+    private async Task HandleThinkingCommandAsync(ITurnContext turnContext, ConversationState state, string arg, CancellationToken ct)
+    {
+        bool? newValue = arg.ToLowerInvariant() switch
+        {
+            "on" or "1" or "true"   => true,
+            "off" or "0" or "false" => false,
+            _ => null
+        };
+        if (newValue is null)
+        {
+            await turnContext.SendActivityAsync(MessageFactory.Text(
+                $"Live thinking status is currently **{(state.ShowThinking ? "on" : "off")}**. Use `/thinking on` or `/thinking off`."), ct);
+            return;
+        }
+        state.ShowThinking = newValue.Value;
+        await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+        await turnContext.SendActivityAsync(MessageFactory.Text(
+            newValue.Value
+                ? "💭 Live thinking status **on** — you'll see what the agent is doing while it works."
+                : "💭 Live thinking status **off** — the chat will only show the final response."), ct);
     }
 
     private async Task HandleAutoCommandAsync(ITurnContext turnContext, ConversationState state, string arg, CancellationToken ct)
@@ -801,6 +828,7 @@ public class FoundryBot : TeamsActivityHandler
     {
         var sw         = Stopwatch.StartNew();
         var streaming  = new StreamingMessageHelper(turnContext);
+        var steps      = new List<ThinkingStep>();
 
         var responses = foundry.OpenAI.GetResponsesClient();
 
@@ -825,10 +853,25 @@ public class FoundryBot : TeamsActivityHandler
                     opts.ConversationOptions is not null,
                     opts.InputItems.Count);
 
-                var step = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, opts, sw, ct);
+                var step = await ProcessStreamAsync(turnContext, state, foundry, responses, streaming, opts, sw, ct, steps);
                 if (step.Stop) break;
                 nextInputItems = step.NextInputItems;
                 nextPreviousResponseId = null;
+            }
+
+            // Success path: attach collapsible "Reasoning" card on the final
+            // streaming message if the user has /thinking on and any tools fired.
+            var attachments = BuildReasoningAttachments(state, steps);
+            if (attachments is not null)
+            {
+                try
+                {
+                    await streaming.FinalizeAsync(ct, attachments);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to finalize streaming activity with reasoning card.");
+                }
             }
         }
         catch (Exception ex)
@@ -841,6 +884,24 @@ public class FoundryBot : TeamsActivityHandler
         {
             await FinalizeStreamingSafelyAsync(streaming, ct);
         }
+    }
+
+    private static IList<Attachment>? BuildReasoningAttachments(ConversationState state, IList<ThinkingStep> steps)
+    {
+        if (!state.ShowThinking || steps.Count == 0) return null;
+        return new List<Attachment> { AdaptiveCardBuilder.BuildReasoningCard(steps) };
+    }
+
+    // Per-field caps for reasoning steps. Sized to match the display caps in
+    // AdaptiveCardBuilder.BuildReasoningStep so we never store more than we'll
+    // ever render — keeps the per-turn list bounded even on huge tool outputs.
+    private const int ReasoningArgsCap   = 240;
+    private const int ReasoningOutputCap = 500;
+
+    private static string TruncateForStep(string text, int max)
+    {
+        if (string.IsNullOrEmpty(text)) return text ?? string.Empty;
+        return text.Length <= max ? text : text.Substring(0, max) + "…";
     }
 
     private static CreateResponseOptions BuildResponseOptions(
@@ -894,7 +955,8 @@ public class FoundryBot : TeamsActivityHandler
         StreamingMessageHelper streaming,
         CreateResponseOptions opts,
         Stopwatch sw,
-        CancellationToken ct)
+        CancellationToken ct,
+        List<ThinkingStep> steps)
     {
         var pendingFunctionCalls = new List<FunctionCallResponseItem>();
         var pendingApprovals     = new List<PendingMcpApproval>();
@@ -931,7 +993,7 @@ public class FoundryBot : TeamsActivityHandler
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
                         turnContext, state, streaming, done.Item, responseIdForResume,
-                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, ct);
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -996,6 +1058,17 @@ public class FoundryBot : TeamsActivityHandler
         // 1) Function calls — dispatch and post outputs; continue loop.
         if (pendingFunctionCalls.Count > 0)
         {
+            // Live "thinking" status: surface what the agent is about to do
+            // BEFORE we close the stream. The informative-update slot stays
+            // visible during the dispatch + next streaming request; the next
+            // text delta naturally replaces it.
+            if (state.ShowThinking && streaming.Enabled)
+            {
+                var status = pendingFunctionCalls.Count == 1
+                    ? ThinkingStatus.ForFunctionCall(pendingFunctionCalls[0].FunctionName)
+                    : ThinkingStatus.ForBatch(pendingFunctionCalls.Count);
+                await streaming.SendInformativeAsync(status, ct);
+            }
             await streaming.FinalizeAsync(ct);
             var outputs = new List<ResponseItem>();
             foreach (var fc in pendingFunctionCalls)
@@ -1018,6 +1091,15 @@ public class FoundryBot : TeamsActivityHandler
 
                 // The full untruncated result still goes to the agent.
                 outputs.Add(ResponseItem.CreateFunctionCallOutputItem(fc.CallId, result));
+
+                // Record into per-turn reasoning summary (rendered on final message).
+                steps.Add(new ThinkingStep(
+                    Kind:        "Function",
+                    ToolName:    fc.FunctionName,
+                    ServerLabel: null,
+                    Arguments:   TruncateForStep(argsStr,  ReasoningArgsCap),
+                    Output:      TruncateForStep(result,   ReasoningOutputCap),
+                    IsError:     false));
             }
             _logger.LogInformation("Continuing Foundry response with {OutputCount} function output item(s).", outputs.Count);
             return new StreamStep(false, outputs);
@@ -1098,6 +1180,7 @@ public class FoundryBot : TeamsActivityHandler
         List<PendingMcpApproval> pendingApprovals,
         List<PendingConsent> pendingConsents,
         HashSet<string> seenIds,
+        List<ThinkingStep> steps,
         CancellationToken ct)
     {
         if (item.Id is { } id && !seenIds.Add(id)) return; // de-dup repeated done events for the same item
@@ -1113,6 +1196,28 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             case McpToolCallItem mcp:
+                // Live "thinking" status (independent of full tool cards):
+                // surface that an MCP tool just completed so the user has a
+                // breadcrumb even when ShowToolCalls is off.
+                if (state.ShowThinking && streaming.Enabled)
+                {
+                    await streaming.SendInformativeAsync(
+                        ThinkingStatus.ForMcpCallCompleted(mcp.ToolName, mcp.ServerLabel), ct);
+                }
+                {
+                    var mcpArgs   = mcp.ToolArguments?.ToString() ?? "{}";
+                    var mcpOutput = mcp.ToolOutput;
+                    var mcpError  = mcp.Error?.ToString();
+                    steps.Add(new ThinkingStep(
+                        Kind:        "MCP",
+                        ToolName:    mcp.ToolName,
+                        ServerLabel: mcp.ServerLabel,
+                        Arguments:   TruncateForStep(mcpArgs, ReasoningArgsCap),
+                        Output:      TruncateForStep(
+                                         mcpError ?? mcpOutput ?? "(no output)",
+                                         ReasoningOutputCap),
+                        IsError:     mcpError is not null));
+                }
                 if (!state.ShowToolCalls) break;
                 await streaming.FinalizeAsync(ct);
                 var argsStr = mcp.ToolArguments?.ToString() ?? "{}";

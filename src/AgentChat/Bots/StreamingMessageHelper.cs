@@ -72,15 +72,28 @@ public class StreamingMessageHelper
     /// ALWAYS call this before sending any non-streaming activity, and at end of run.
     /// Closes an open stream with a final message. Idempotent / no-op if no stream open.
     /// </summary>
-    public async Task FinalizeAsync(CancellationToken ct)
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="attachments">
+    /// Optional attachments (e.g. the collapsible "Reasoning" card) to include
+    /// on the final activity. Per Teams streaming-UX rules, attachments are
+    /// only permitted on the final chunk — never mid-stream.
+    /// </param>
+    public async Task FinalizeAsync(CancellationToken ct, IList<Attachment>? attachments = null)
     {
         if (!_enabled || !_isOpen)
         {
             // No active stream. If we have buffered text but never opened a stream
             // (e.g. fallback channel), send as a plain message.
-            if (_buffer.Length > 0)
+            if (_buffer.Length > 0 || (attachments is { Count: > 0 }))
             {
-                await _ctx.SendActivityAsync(MessageFactory.Text(_buffer.ToString()), ct);
+                var fallback = _buffer.Length > 0
+                    ? MessageFactory.Text(_buffer.ToString())
+                    : MessageFactory.Text(" ");
+                if (attachments is { Count: > 0 })
+                {
+                    foreach (var a in attachments) fallback.Attachments.Add(a);
+                }
+                await _ctx.SendActivityAsync(fallback, ct);
                 _buffer.Clear();
             }
             return;
@@ -100,6 +113,11 @@ public class StreamingMessageHelper
         var entity = new Entity("streaminfo");
         entity.Properties = props;
         act.Entities = new List<Entity> { entity };
+
+        if (attachments is { Count: > 0 })
+        {
+            foreach (var a in attachments) act.Attachments.Add(a);
+        }
 
         await _ctx.SendActivityAsync(act, ct);
 

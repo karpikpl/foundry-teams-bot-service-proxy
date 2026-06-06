@@ -188,7 +188,7 @@ https://{foundry}.services.ai.azure.com/api/projects/{project}/agents/{agent}/en
 | `/tokens` | Show cumulative + last-run token usage |
 | `/usage on\|off` | Toggle the per-run usage footer |
 | `/tools on\|off` | Show or hide tool-call cards (off by default — turn on for troubleshooting) |
-| `/thinking on\|off` | Show or hide live "thinking" status pings in the Teams informative-update slot as the agent calls tools (on by default) |
+| `/thinking on\|off` | Toggle live "thinking" status pings in the Teams informative-update slot AND the collapsible "Reasoning" summary card attached to the final message (on by default) |
 | `/auto list\|clear` | Manage MCP tools the user has marked "always approve" |
 
 ## Build from source

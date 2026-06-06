@@ -29,7 +29,7 @@ jobs:
         run: dotnet build --configuration Release --no-restore
 
       - name: Test
-        run: dotnet test --configuration Release --no-build --logger "trx;LogFileName=results.trx" --logger "GitHubActions;summary.includePassedTests=false" --results-directory ./TestResults
+        run: dotnet test --configuration Release --no-build --logger "trx;LogFileName=results.trx" --results-directory ./TestResults
 
       - name: Publish test report
         # Posts a check run on the PR with pass/fail counts and per-test details.

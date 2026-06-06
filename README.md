@@ -160,6 +160,22 @@ Examples:
 /api/messages/https%3A%2F%2Faif.example.com%2Fapi%2Fprojects%2Fp/code-helper
 ```
 
+### Transparent passthrough route (private Foundry)
+
+For deployments where **Foundry public network access is disabled**, the proxy also exposes a pure YARP-based reverse proxy:
+
+```
+POST /api/passthrough/{foundry}/{project}/{agent}
+```
+
+It rewrites the request URI to:
+
+```
+https://{foundry}.services.ai.azure.com/api/projects/{project}/agents/{agent}/endpoint/protocols/activityprotocol{?query}
+```
+
+…and forwards the body, query string, and `Authorization` header **unchanged**. The proxy adds zero auth logic: configure your Azure Bot Service with `msaAppId` = the Foundry agent service principal (same as a "direct" bot), but point its endpoint at this URL. Bot Service's JWT (audience = Foundry agent SP) is validated by Foundry on the receiving end exactly as it would be for a direct bot. Use this when Bot Service needs a VNet-attached relay to reach a network-isolated Foundry account.
+
 ## Commands cheat sheet
 
 | Command | Effect |

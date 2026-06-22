@@ -832,6 +832,13 @@ public class FoundryBot : TeamsActivityHandler
 
         var responses = foundry.OpenAI.GetResponsesClient();
 
+        // Start a background heartbeat so the user sees the informative bar
+        // text change every few seconds — even during long model "thinking"
+        // gaps before the first text delta and during tool round-trips. The
+        // helper auto-suppresses pulses once text deltas start flowing and
+        // resumes after each FinalizeAsync hop.
+        streaming.StartHeartbeat("Thinking…");
+
         try
         {
             int safety = 0;
@@ -882,6 +889,7 @@ public class FoundryBot : TeamsActivityHandler
         }
         finally
         {
+            await streaming.StopHeartbeatAsync();
             await FinalizeStreamingSafelyAsync(streaming, ct);
         }
     }
@@ -1102,6 +1110,7 @@ public class FoundryBot : TeamsActivityHandler
                     IsError:     false));
             }
             _logger.LogInformation("Continuing Foundry response with {OutputCount} function output item(s).", outputs.Count);
+            streaming.SetHeartbeatStatus("Thinking…");
             return new StreamStep(false, outputs);
         }
 

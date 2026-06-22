@@ -296,6 +296,91 @@ public class StreamingMessageHelperTests
         (act.Entities ?? new List<Entity>()).Should().BeEmpty("non-streaming channels must not carry streaminfo");
     }
 
+    [Fact]
+    public async Task Heartbeat_emits_informative_pulses_when_no_text_deltas()
+    {
+        var sent = new List<IActivity>();
+        var s = new StreamingMessageHelper(Teams(sent));
+
+        s.StartHeartbeat("Thinking…", TimeSpan.FromMilliseconds(50));
+        // Wait long enough for several pulses, but also long enough that the
+        // 1500 ms inter-send throttle is the limiting factor — we expect at
+        // least 2 pulses in ~3.5s.
+        await Task.Delay(3500);
+        await s.StopHeartbeatAsync();
+        await s.FinalizeAsync(default);
+
+        var pulses = sent.Where(a => a.Type == ActivityTypes.Typing).ToList();
+        pulses.Count.Should().BeGreaterOrEqualTo(2, "heartbeat should fire at least every ~1.5s while idle");
+
+        foreach (var p in pulses)
+        {
+            var props = ((Activity)p).Entities!.Single(e => e.Type == "streaminfo").Properties!;
+            props["streamType"]!.ToString().Should().Be("informative");
+        }
+
+        // Heartbeat text rotates between explicit status and fallback phrases.
+        pulses.Select(p => ((Activity)p).Text).Distinct().Should().NotBeEmpty();
+    }
+
+    [Fact]
+    public async Task Heartbeat_pauses_once_text_streaming_starts()
+    {
+        var sent = new List<IActivity>();
+        var s = new StreamingMessageHelper(Teams(sent));
+
+        s.StartHeartbeat("Thinking…", TimeSpan.FromMilliseconds(50));
+
+        // Simulate text deltas starting — a streaming chunk should make the
+        // heartbeat go quiet from then on.
+        s.AppendDelta("hello");
+        await s.ForceFlushAsync(default);
+
+        var countAfterFlush = sent.Count;
+        await Task.Delay(2500); // would normally allow several more pulses
+        await s.StopHeartbeatAsync();
+        await s.FinalizeAsync(default);
+
+        // After flush + finalize there should be exactly one new activity
+        // (the final message) — no extra heartbeat pulses while text was
+        // streaming.
+        sent.Count.Should().Be(countAfterFlush + 1);
+        sent.Last().Type.Should().Be(ActivityTypes.Message);
+    }
+
+    [Fact]
+    public async Task SetHeartbeatStatus_updates_text_for_next_pulse()
+    {
+        var sent = new List<IActivity>();
+        var s = new StreamingMessageHelper(Teams(sent));
+
+        s.StartHeartbeat("Thinking…", TimeSpan.FromMilliseconds(50));
+        await Task.Delay(1800); // ~1 pulse with "Thinking…"
+        s.SetHeartbeatStatus("Calling search…");
+        await Task.Delay(1800); // ~1 more pulse with the new status
+        await s.StopHeartbeatAsync();
+        await s.FinalizeAsync(default);
+
+        var texts = sent.Where(a => a.Type == ActivityTypes.Typing)
+                        .Select(a => ((Activity)a).Text)
+                        .ToList();
+        texts.Should().Contain("Thinking…");
+        texts.Should().Contain("Calling search…");
+    }
+
+    [Fact]
+    public async Task Heartbeat_is_noop_on_non_teams_channels()
+    {
+        var sent = new List<IActivity>();
+        var s = new StreamingMessageHelper(MakeContext("webchat", "personal", sent));
+
+        s.StartHeartbeat("Thinking…", TimeSpan.FromMilliseconds(50));
+        await Task.Delay(500);
+        await s.StopHeartbeatAsync();
+
+        sent.Should().BeEmpty();
+    }
+
     private sealed class RecordingAdapter : BotAdapter
     {
         private readonly List<IActivity> _sent;

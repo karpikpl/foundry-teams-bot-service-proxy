@@ -22,9 +22,23 @@ namespace AgentChat.Bots;
 public class StreamingMessageHelper
 {
     private const int MinIntervalMs = 1500;
+    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromSeconds(4);
+
+    // Rotated through when the bot hasn't set an explicit status, so the user
+    // sees the informative bar text change every few seconds even during long
+    // model "thinking" gaps with no tool calls or deltas.
+    private static readonly string[] FallbackHeartbeatStatuses =
+    {
+        "Thinking…",
+        "Working on it…",
+        "Still thinking…",
+        "Hang tight…",
+        "Almost there…",
+    };
 
     private readonly ITurnContext _ctx;
     private readonly bool _enabled;
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
 
     private string? _streamId;
     private int _sequence;
@@ -32,6 +46,12 @@ public class StreamingMessageHelper
     private readonly StringBuilder _buffer = new();
     private string? _lastStatus;     // last informative text — used as placeholder if final has no body text
     private bool _isOpen;            // true if we've sent at least one chunk
+    private bool _textStreamingStarted; // true once a "streaming" (text) chunk was sent — suppresses heartbeat
+
+    private CancellationTokenSource? _heartbeatCts;
+    private Task? _heartbeatTask;
+    private string? _heartbeatStatus;
+    private int _heartbeatRotation;
 
     public StreamingMessageHelper(ITurnContext ctx)
     {
@@ -47,25 +67,134 @@ public class StreamingMessageHelper
     public void AppendDelta(string delta) => _buffer.Append(delta);
 
     /// <summary>Send an informative status update (e.g. "Searching docs...").</summary>
-    public Task SendInformativeAsync(string text, CancellationToken ct)
+    public async Task SendInformativeAsync(string text, CancellationToken ct)
     {
-        if (!_enabled) return Task.CompletedTask;
+        if (!_enabled) return;
         _lastStatus = text;
-        return SendChunkAsync(ActivityTypes.Typing, text, "informative", ct);
+        // Keep the heartbeat in sync so any subsequent pulse continues from
+        // the most recent semantic status instead of reverting to "Thinking…".
+        _heartbeatStatus = text;
+        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await SendChunkInternalAsync(ActivityTypes.Typing, text, "informative", ct).ConfigureAwait(false);
+        }
+        finally { _sendGate.Release(); }
     }
 
     /// <summary>Send the buffered text if enough time has passed.</summary>
-    public Task MaybeFlushAsync(CancellationToken ct)
+    public async Task MaybeFlushAsync(CancellationToken ct)
     {
-        if (!_enabled || _buffer.Length == 0) return Task.CompletedTask;
-        if ((DateTime.UtcNow - _lastSent).TotalMilliseconds < MinIntervalMs) return Task.CompletedTask;
-        return SendChunkAsync(ActivityTypes.Typing, _buffer.ToString(), "streaming", ct);
+        if (!_enabled || _buffer.Length == 0) return;
+        if ((DateTime.UtcNow - _lastSent).TotalMilliseconds < MinIntervalMs) return;
+        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_buffer.Length == 0) return;
+            if ((DateTime.UtcNow - _lastSent).TotalMilliseconds < MinIntervalMs) return;
+            await SendChunkInternalAsync(ActivityTypes.Typing, _buffer.ToString(), "streaming", ct).ConfigureAwait(false);
+            _textStreamingStarted = true;
+        }
+        finally { _sendGate.Release(); }
     }
 
-    public Task ForceFlushAsync(CancellationToken ct)
+    public async Task ForceFlushAsync(CancellationToken ct)
     {
-        if (!_enabled || _buffer.Length == 0) return Task.CompletedTask;
-        return SendChunkAsync(ActivityTypes.Typing, _buffer.ToString(), "streaming", ct);
+        if (!_enabled || _buffer.Length == 0) return;
+        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (_buffer.Length == 0) return;
+            await SendChunkInternalAsync(ActivityTypes.Typing, _buffer.ToString(), "streaming", ct).ConfigureAwait(false);
+            _textStreamingStarted = true;
+        }
+        finally { _sendGate.Release(); }
+    }
+
+    /// <summary>
+    /// Start a background heartbeat that periodically emits an informative
+    /// chunk so the user always sees activity (e.g. while the model thinks
+    /// before producing the first text delta or while a tool round-trip is in
+    /// flight). Pulses are suppressed once text deltas start flowing; they
+    /// resume after each <see cref="FinalizeAsync"/> (i.e. across multi-hop
+    /// tool/function-call turns) until <see cref="StopHeartbeatAsync"/>.
+    /// No-op on non-streaming channels. Safe to call multiple times.
+    /// </summary>
+    public void StartHeartbeat(string? initialStatus = null, TimeSpan? interval = null)
+    {
+        if (!_enabled || _heartbeatTask is not null) return;
+        if (!string.IsNullOrWhiteSpace(initialStatus)) _heartbeatStatus = initialStatus;
+        var period = interval ?? DefaultHeartbeatInterval;
+        _heartbeatCts = new CancellationTokenSource();
+        var token = _heartbeatCts.Token;
+        _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(period, token));
+    }
+
+    /// <summary>
+    /// Update the text the heartbeat will use on its next pulse without
+    /// sending immediately. Useful to label what the bot is currently doing
+    /// (e.g. "Calling search…") while waiting on a long operation.
+    /// </summary>
+    public void SetHeartbeatStatus(string? status)
+    {
+        if (!_enabled) return;
+        if (!string.IsNullOrWhiteSpace(status)) _heartbeatStatus = status;
+    }
+
+    /// <summary>Stop the background heartbeat. Awaits the loop to exit.</summary>
+    public async Task StopHeartbeatAsync()
+    {
+        var cts = _heartbeatCts;
+        var task = _heartbeatTask;
+        _heartbeatCts = null;
+        _heartbeatTask = null;
+        if (cts is null) return;
+        try { cts.Cancel(); } catch { /* ignore */ }
+        if (task is not null)
+        {
+            try { await task.ConfigureAwait(false); } catch { /* best-effort */ }
+        }
+        cts.Dispose();
+    }
+
+    private async Task HeartbeatLoopAsync(TimeSpan period, CancellationToken token)
+    {
+        try
+        {
+            while (!token.IsCancellationRequested)
+            {
+                try { await Task.Delay(period, token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+
+                if (_textStreamingStarted) continue;
+                if ((DateTime.UtcNow - _lastSent).TotalMilliseconds < MinIntervalMs) continue;
+
+                try { await _sendGate.WaitAsync(token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { return; }
+                try
+                {
+                    if (token.IsCancellationRequested) return;
+                    if (_textStreamingStarted) continue;
+                    if ((DateTime.UtcNow - _lastSent).TotalMilliseconds < MinIntervalMs) continue;
+
+                    var text = _heartbeatStatus
+                        ?? FallbackHeartbeatStatuses[_heartbeatRotation++ % FallbackHeartbeatStatuses.Length];
+                    _lastStatus = text;
+                    await SendChunkInternalAsync(ActivityTypes.Typing, text, "informative", token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { return; }
+                catch
+                {
+                    // Heartbeat is best-effort; never let a transient send
+                    // error tear down the turn. Loop continues.
+                }
+                finally
+                {
+                    try { _sendGate.Release(); } catch { /* ignore */ }
+                }
+            }
+        }
+        catch { /* swallow — best-effort */ }
     }
 
     /// <summary>
@@ -99,38 +228,48 @@ public class StreamingMessageHelper
             return;
         }
 
-        // Stream is open — MUST send final to close it. Teams requires non-empty text.
-        var finalText = _buffer.Length > 0
-            ? _buffer.ToString()
-            : (_lastStatus ?? " ");
-
-        var act = MessageFactory.Text(finalText);
-        act.Type = ActivityTypes.Message;
-
-        var props = new JObject { ["streamType"] = "final" };
-        if (_streamId is not null) props["streamId"] = _streamId;
-
-        var entity = new Entity("streaminfo");
-        entity.Properties = props;
-        act.Entities = new List<Entity> { entity };
-
-        if (attachments is { Count: > 0 })
+        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            foreach (var a in attachments) act.Attachments.Add(a);
+            if (!_isOpen) return; // racing heartbeat may have closed nothing — re-check under lock
+
+            // Stream is open — MUST send final to close it. Teams requires non-empty text.
+            var finalText = _buffer.Length > 0
+                ? _buffer.ToString()
+                : (_lastStatus ?? " ");
+
+            var act = MessageFactory.Text(finalText);
+            act.Type = ActivityTypes.Message;
+
+            var props = new JObject { ["streamType"] = "final" };
+            if (_streamId is not null) props["streamId"] = _streamId;
+
+            var entity = new Entity("streaminfo");
+            entity.Properties = props;
+            act.Entities = new List<Entity> { entity };
+
+            if (attachments is { Count: > 0 })
+            {
+                foreach (var a in attachments) act.Attachments.Add(a);
+            }
+
+            await _ctx.SendActivityAsync(act, ct);
+
+            // Reset so further activity creates a brand-new stream — including
+            // re-enabling heartbeat pulses for the next round-trip.
+            _isOpen               = false;
+            _streamId             = null;
+            _sequence             = 0;
+            _lastSent             = DateTime.MinValue;
+            _lastStatus           = null;
+            _textStreamingStarted = false;
+            _buffer.Clear();
         }
-
-        await _ctx.SendActivityAsync(act, ct);
-
-        // Reset so further activity creates a brand-new stream.
-        _isOpen     = false;
-        _streamId   = null;
-        _sequence   = 0;
-        _lastSent   = DateTime.MinValue;
-        _lastStatus = null;
-        _buffer.Clear();
+        finally { _sendGate.Release(); }
     }
 
-    private async Task SendChunkAsync(string activityType, string text, string streamType, CancellationToken ct)
+    // Caller is responsible for holding _sendGate.
+    private async Task SendChunkInternalAsync(string activityType, string text, string streamType, CancellationToken ct)
     {
         _sequence++;
 

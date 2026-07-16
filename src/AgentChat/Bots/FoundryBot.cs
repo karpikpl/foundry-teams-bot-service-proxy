@@ -827,7 +827,7 @@ public class FoundryBot : TeamsActivityHandler
         string? firstPreviousResponseId = null)
     {
         var sw         = Stopwatch.StartNew();
-        var streaming  = new StreamingMessageHelper(turnContext);
+        var streaming  = new SdkStreamingMessageHelper(turnContext);
         var steps      = new List<ThinkingStep>();
 
         var responses = foundry.OpenAI.GetResponsesClient();
@@ -939,7 +939,7 @@ public class FoundryBot : TeamsActivityHandler
 
     private sealed record StreamStep(bool Stop, IReadOnlyList<ResponseItem>? NextInputItems = null);
 
-    private async Task FinalizeStreamingSafelyAsync(StreamingMessageHelper streaming, CancellationToken ct)
+    private async Task FinalizeStreamingSafelyAsync(SdkStreamingMessageHelper streaming, CancellationToken ct)
     {
         try
         {
@@ -960,7 +960,7 @@ public class FoundryBot : TeamsActivityHandler
         ConversationState state,
         Foundry.FoundryClient foundry,
         ResponsesClient responses,
-        StreamingMessageHelper streaming,
+        SdkStreamingMessageHelper streaming,
         CreateResponseOptions opts,
         Stopwatch sw,
         CancellationToken ct,
@@ -1182,7 +1182,7 @@ public class FoundryBot : TeamsActivityHandler
     private async Task HandleCompletedItemAsync(
         ITurnContext turnContext,
         ConversationState state,
-        StreamingMessageHelper streaming,
+        SdkStreamingMessageHelper streaming,
         ResponseItem item,
         string? responseIdForResume,
         List<FunctionCallResponseItem> pendingFunctionCalls,

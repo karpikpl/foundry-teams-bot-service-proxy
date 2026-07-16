@@ -8,6 +8,11 @@ using Xunit;
 
 namespace AgentChat.Tests;
 
+// StreamingMessageHelper is [Obsolete] but these tests continue to pin its
+// behavior contract until the legacy class is removed post-soak (see PR
+// #30). Suppression is per-class so any accidental new consumer still gets
+// the warning.
+#pragma warning disable CS0618 // Type or member is obsolete
 public class StreamingMessageHelperTests
 {
     private static ITurnContext MakeContext(string channelId, string convType, List<IActivity> sent)
@@ -401,3 +406,4 @@ public class StreamingMessageHelperTests
     }
 }
 
+#pragma warning restore CS0618

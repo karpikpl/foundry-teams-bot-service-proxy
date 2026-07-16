@@ -6,7 +6,7 @@ using Microsoft.Agents.Core.Models;
 namespace AgentChat.Bots;
 
 /// <summary>
-/// Teams streaming response helper.
+/// Teams streaming response helper (LEGACY, hand-rolled channelData plumbing).
 /// https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
 ///
 /// CRITICAL invariant: once a stream is opened (any informative or streaming
@@ -19,6 +19,7 @@ namespace AgentChat.Bots;
 /// Use IsOpen to check before sending non-stream activities and call
 /// FinalizeAsync() to gracefully close the stream first.
 /// </summary>
+[Obsolete("Use SdkStreamingMessageHelper — this hand-rolled helper is scheduled for removal once the M365 Agents SDK's StreamingResponse has been validated in the container app (target: after v0.10.0-rc soak).")]
 public class StreamingMessageHelper
 {
     private const int MinIntervalMs = 1500;

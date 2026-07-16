@@ -2,6 +2,7 @@ using AdaptiveCards;
 using AgentChat.Bots;
 using AgentChat.Services;
 using FluentAssertions;
+using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -79,7 +80,7 @@ public class AdaptiveCardBuilderTests
         deny["style"]?.ToString().Should().Be("destructive");
     }
 
-    private static Microsoft.Bot.Schema.Attachment MakeApproval()
+    private static Attachment MakeApproval()
         => AdaptiveCardBuilder.BuildApprovalCard("x", "y", "{}", "appr", "conv");
 
     // ============================================================ Tool call
@@ -489,7 +490,7 @@ public class AdaptiveCardBuilderTests
     // ============================================================ helpers
 
     /// <summary>Recursively collects every visible text string from a card.</summary>
-    private static List<string> AllText(Microsoft.Bot.Schema.Attachment att)
+    private static List<string> AllText(Attachment att)
     {
         var results = new List<string>();
         Walk((JToken)att.Content, results);
@@ -512,7 +513,7 @@ public class AdaptiveCardBuilderTests
     }
 
     /// <summary>Finds the first element of the given AdaptiveCard type.</summary>
-    private static JObject? FindFirst(Microsoft.Bot.Schema.Attachment att, string adaptiveType)
+    private static JObject? FindFirst(Attachment att, string adaptiveType)
     {
         JObject? hit = null;
         Walk((JToken)att.Content);

@@ -1,8 +1,8 @@
-using Microsoft.Bot.Builder;
+using Microsoft.Agents.Builder;
 
 namespace AgentChat.Bots;
 
-public sealed class LoggingMiddleware : Microsoft.Bot.Builder.IMiddleware
+public sealed class LoggingMiddleware : Microsoft.Agents.Builder.IMiddleware
 {
     private readonly ILogger<LoggingMiddleware> _logger;
 

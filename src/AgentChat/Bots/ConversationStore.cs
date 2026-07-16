@@ -1,6 +1,7 @@
 using AgentChat.Services;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Storage;
 
 namespace AgentChat.Bots;
 

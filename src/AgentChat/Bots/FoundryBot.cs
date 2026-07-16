@@ -4,10 +4,10 @@ using System.Net;
 using System.Text.Json;
 using AgentChat.Foundry;
 using AgentChat.Services;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Builder.Teams;
-using Microsoft.Bot.Connector.Authentication;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Extensions.Teams.Compat;
+using Microsoft.Agents.Authentication;
+using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Responses;
@@ -475,7 +475,7 @@ public class FoundryBot : TeamsActivityHandler
         var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
         if (!auth.ShouldProceed) return;
 
-        await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = Microsoft.Bot.Schema.ActivityTypes.Typing }, ct);
+        await turnContext.SendActivityAsync(new Microsoft.Agents.Core.Models.Activity { Type = Microsoft.Agents.Core.Models.ActivityTypes.Typing }, ct);
 
         using (ApplyAuthScope(auth))
         {
@@ -1438,7 +1438,7 @@ public class FoundryBot : TeamsActivityHandler
     /// so all the discriminator + nested-shape work is handled by the SDK.
     /// </summary>
     private static Task<ResourceResponse> SendTypingAsync(ITurnContext turnContext, CancellationToken ct)
-        => turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = ActivityTypes.Typing }, ct);
+        => turnContext.SendActivityAsync(new Microsoft.Agents.Core.Models.Activity { Type = ActivityTypes.Typing }, ct);
 
     private static async Task PostConversationItemsAsync(
         Foundry.FoundryClient foundry,

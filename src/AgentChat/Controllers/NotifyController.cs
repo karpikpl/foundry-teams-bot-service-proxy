@@ -1,14 +1,15 @@
 using AgentChat.Bots;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Builder.Integration.AspNet.Core;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Hosting.AspNetCore;
 
 namespace AgentChat.Controllers;
 
 /// <summary>
 /// Proactive messaging endpoint. POST a JSON body { conversationId, text } and
 /// the bot pushes the text to the recorded conversation using
-/// BotAdapter.ContinueConversationAsync.
+/// <c>ChannelAdapter.ContinueConversationAsync</c>.
 ///
 /// Requires that the bot has seen at least one activity from that conversation
 /// (so we've stored its ConversationReference).
@@ -18,13 +19,13 @@ namespace AgentChat.Controllers;
 public class NotifyController : ControllerBase
 {
     private readonly ConversationStore _store;
-    private readonly IBotFrameworkHttpAdapter _adapter;
+    private readonly IChannelAdapter _adapter;
     private readonly IConfiguration _config;
     private readonly ILogger<NotifyController> _logger;
 
     public NotifyController(
         ConversationStore store,
-        IBotFrameworkHttpAdapter adapter,
+        IChannelAdapter adapter,
         IConfiguration config,
         ILogger<NotifyController> logger)
     {
@@ -45,7 +46,7 @@ public class NotifyController : ControllerBase
 
         var botAppId = _config["MicrosoftAppId"] ?? "";
 
-        await ((BotAdapter)_adapter).ContinueConversationAsync(
+        await _adapter.ContinueConversationAsync(
             botAppId,
             state.ConversationReference,
             async (turnContext, innerCt) =>
@@ -64,3 +65,4 @@ public class NotifyController : ControllerBase
         return Ok(new { note = "Pass a conversationId from Bot Framework logs / App Insights to POST." });
     }
 }
+

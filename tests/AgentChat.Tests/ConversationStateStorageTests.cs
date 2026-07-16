@@ -1,7 +1,8 @@
 using System.Collections.Concurrent;
 using AgentChat.Bots;
 using FluentAssertions;
-using Microsoft.Bot.Builder;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 using ConversationState = AgentChat.Bots.ConversationState;
@@ -138,6 +139,25 @@ public class ConversationStateStorageTests
                 _store[kv.Key] = (kv.Value, newETag);
             }
             return Task.CompletedTask;
+        }
+
+        public async Task<IDictionary<string, TStoreItem>> ReadAsync<TStoreItem>(string[] keys, CancellationToken ct = default)
+            where TStoreItem : class
+        {
+            var raw = await ReadAsync(keys, ct);
+            var result = new Dictionary<string, TStoreItem>();
+            foreach (var kv in raw)
+            {
+                if (kv.Value is TStoreItem typed) result[kv.Key] = typed;
+            }
+            return result;
+        }
+
+        public Task WriteAsync<TStoreItem>(IDictionary<string, TStoreItem> changes, CancellationToken ct = default)
+            where TStoreItem : class
+        {
+            var upcast = changes.ToDictionary(kv => kv.Key, kv => (object)kv.Value);
+            return WriteAsync(upcast, ct);
         }
     }
 }

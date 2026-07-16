@@ -1,7 +1,7 @@
 using System.Text;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Schema;
-using Newtonsoft.Json.Linq;
+using System.Text.Json;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Core.Models;
 
 namespace AgentChat.Bots;
 
@@ -241,8 +241,11 @@ public class StreamingMessageHelper
             var act = MessageFactory.Text(finalText);
             act.Type = ActivityTypes.Message;
 
-            var props = new JObject { ["streamType"] = "final" };
-            if (_streamId is not null) props["streamId"] = _streamId;
+            var props = new Dictionary<string, JsonElement>
+            {
+                ["streamType"] = JsonSerializer.SerializeToElement("final"),
+            };
+            if (_streamId is not null) props["streamId"] = JsonSerializer.SerializeToElement(_streamId);
 
             var entity = new Entity("streaminfo");
             entity.Properties = props;
@@ -276,12 +279,12 @@ public class StreamingMessageHelper
         var act = MessageFactory.Text(text);
         act.Type = activityType;
 
-        var props = new JObject
+        var props = new Dictionary<string, JsonElement>
         {
-            ["streamType"]     = streamType,
-            ["streamSequence"] = _sequence
+            ["streamType"]     = JsonSerializer.SerializeToElement(streamType),
+            ["streamSequence"] = JsonSerializer.SerializeToElement(_sequence),
         };
-        if (_streamId is not null) props["streamId"] = _streamId;
+        if (_streamId is not null) props["streamId"] = JsonSerializer.SerializeToElement(_streamId);
 
         var entity = new Entity("streaminfo");
         entity.Properties = props;

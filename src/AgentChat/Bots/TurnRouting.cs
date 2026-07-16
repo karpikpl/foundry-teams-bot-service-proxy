@@ -1,6 +1,6 @@
 using AgentChat.Foundry;
 using Microsoft.AspNetCore.Http;
-using Microsoft.Bot.Builder;
+using Microsoft.Agents.Builder;
 
 namespace AgentChat.Bots;
 

@@ -364,7 +364,7 @@ public class FoundryBotTests
         activity.Conversation = new ConversationAccount(id: convId);
         activity.From = new ChannelAccount("user-1", "User") { AadObjectId = "aad-user-1" };
         activity.Recipient = new ChannelAccount("bot-1", "Bot");
-        activity.Value = value;
+        activity.Value = value!;
         return new TurnContext(adapter, activity);
     }
 

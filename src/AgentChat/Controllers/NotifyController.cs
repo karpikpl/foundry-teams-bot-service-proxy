@@ -46,6 +46,15 @@ public class NotifyController : ControllerBase
 
         var botAppId = _config["MicrosoftAppId"] ?? "";
 
+        // TODO: The string-appId overload is [Obsolete] in the M365 Agents
+        // SDK in favor of a ClaimsIdentity-based overload. Migrating requires
+        // persisting the bot's appId (per-route EffectiveProxyAppId) alongside
+        // the ConversationReference in ConversationState so we can synthesize
+        // the right ClaimsIdentity at notify time — today NotifyController
+        // reads a single MicrosoftAppId that predates the multi-bot design
+        // and is effectively broken for multi-bot deployments. Tracked for
+        // follow-up after Slice 5 soak; suppressing the warning locally.
+#pragma warning disable CS0618 // Type or member is obsolete
         await _adapter.ContinueConversationAsync(
             botAppId,
             state.ConversationReference,
@@ -54,6 +63,7 @@ public class NotifyController : ControllerBase
                 await turnContext.SendActivityAsync(MessageFactory.Text(req.Text), innerCt);
             },
             ct);
+#pragma warning restore CS0618
 
         return Ok(new { sent = true });
     }

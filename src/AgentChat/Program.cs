@@ -91,6 +91,7 @@ if (adminChatAuth.Enabled)
 {
     app.UseAuthentication();
 }
+app.UseMiddleware<InboundSourceLoggingMiddleware>();
 app.UseMiddleware<BotServiceJwtMiddleware>();
 if (adminChatAuth.Enabled)
 {

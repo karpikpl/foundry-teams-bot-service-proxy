@@ -125,6 +125,9 @@ builder.Services.AddDefaultMsalAuth(builder.Configuration);
 // AddCloudAdapter transitively. Our AdapterWithErrorHandler subclasses CloudAdapter
 // so we replace the CloudAdapter registration below.
 builder.AddAgent<FoundryBot>();
+// AdapterOptions is a plain POCO required by the CloudAdapter ctor but not
+// auto-registered by AddAgent/AddCloudAdapter. Register defaults here.
+builder.Services.AddSingleton(new AdapterOptions());
 builder.Services.AddSingleton<CloudAdapter, AdapterWithErrorHandler>();
 builder.Services.AddSingleton<IAgentHttpAdapter>(sp => sp.GetRequiredService<CloudAdapter>());
 builder.Services.AddSingleton<IChannelAdapter>(sp => sp.GetRequiredService<CloudAdapter>());

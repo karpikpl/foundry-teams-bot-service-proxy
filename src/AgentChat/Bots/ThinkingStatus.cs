@@ -18,6 +18,10 @@ internal static class ThinkingStatus
     private const int MaxLen = 240;
 
     // ---- Rotating phrase pools ---------------------------------------------
+    // Each pool has 15 entries so a full 60-second wait at the 4-second
+    // heartbeat cadence never repeats a phrase. Ordering matters — the
+    // rotation is deterministic (index++ % pool.Length), so we frontload
+    // the friendliest / most on-topic phrases first.
 
     /// <summary>Generic "waiting on the model" phrases used when no tool is active.</summary>
     public static readonly string[] Generic =
@@ -26,7 +30,17 @@ internal static class ThinkingStatus
         "💭 Working on it…",
         "🔄 Still thinking…",
         "⏳ Hang tight…",
+        "🧩 Putting the pieces together…",
         "🚀 Almost there…",
+        "🤔 Mulling it over…",
+        "📝 Drafting a response…",
+        "🎯 Zeroing in on an answer…",
+        "🧠 Warming up the neurons…",
+        "🔍 Reviewing what you asked…",
+        "✨ Cooking up something good…",
+        "🛠️ Assembling the response…",
+        "📚 Consulting my training…",
+        "🧭 Charting the best path…",
     };
 
     /// <summary>Model-side reasoning (chain-of-thought) is in progress.</summary>
@@ -35,7 +49,18 @@ internal static class ThinkingStatus
         "🧠 Reasoning through this…",
         "🤔 Connecting the dots…",
         "🧩 Piecing it together…",
-        "🧠 Weighing the options…",
+        "⚖️ Weighing the options…",
+        "🔎 Examining the details…",
+        "🧠 Following the logic…",
+        "💡 Considering alternatives…",
+        "🗺️ Mapping out the answer…",
+        "🎯 Narrowing things down…",
+        "📐 Checking my work…",
+        "🧮 Working through the math…",
+        "🧠 Reading between the lines…",
+        "🔄 Second-guessing myself…",
+        "📊 Comparing possibilities…",
+        "🧠 Sanity-checking the logic…",
     };
 
     /// <summary>Web search / Bing grounding tool is running.</summary>
@@ -46,6 +71,16 @@ internal static class ThinkingStatus
         "🔎 Following breadcrumbs online…",
         "🕵️ Investigating the internet…",
         "📡 Pulling fresh results…",
+        "🌍 Casting a wide net…",
+        "🔗 Reading web pages…",
+        "📰 Checking recent articles…",
+        "🧭 Navigating the search results…",
+        "🗞️ Skimming the headlines…",
+        "🔍 Cross-referencing sources…",
+        "🌐 Looking that up online…",
+        "📚 Pulling context from the web…",
+        "🕸️ Crawling for details…",
+        "🔎 Digging deeper on the web…",
     };
 
     /// <summary>File search / RAG lookup is running.</summary>
@@ -55,6 +90,17 @@ internal static class ThinkingStatus
         "📚 Skimming the archives…",
         "🔍 Searching your files…",
         "📑 Cross-referencing sources…",
+        "🗂️ Sifting through folders…",
+        "📖 Reading the relevant chapters…",
+        "🔎 Locating the right passage…",
+        "📄 Comparing document sections…",
+        "🧾 Checking the details…",
+        "📚 Consulting the knowledge base…",
+        "📝 Pulling supporting evidence…",
+        "🗄️ Rummaging through the index…",
+        "📄 Retrieving matches…",
+        "🔍 Verifying quotes…",
+        "📑 Assembling citations…",
     };
 
     /// <summary>Code interpreter is running.</summary>
@@ -64,6 +110,17 @@ internal static class ThinkingStatus
         "🐍 Executing Python…",
         "🧮 Crunching data…",
         "⚙️ Working through the code…",
+        "📊 Computing results…",
+        "🧪 Testing the hypothesis…",
+        "🔢 Doing the math…",
+        "💻 Compiling the logic…",
+        "🖥️ Simulating the outcome…",
+        "🐍 Iterating on the script…",
+        "📈 Plotting the trend…",
+        "🔍 Inspecting the data…",
+        "⌨️ Writing a quick script…",
+        "💾 Wrangling the dataset…",
+        "🧰 Trying a different approach…",
     };
 
     /// <summary>Image generation is in progress.</summary>
@@ -72,6 +129,18 @@ internal static class ThinkingStatus
         "🎨 Painting pixels…",
         "🖼️ Rendering image…",
         "✨ Composing something visual…",
+        "🖌️ Adding brushstrokes…",
+        "🎨 Mixing the palette…",
+        "📐 Sketching the layout…",
+        "🖼️ Refining the details…",
+        "🌈 Choosing the colors…",
+        "✏️ Roughing out the shapes…",
+        "🎭 Setting the mood…",
+        "🔆 Adjusting the lighting…",
+        "🖼️ Composing the frame…",
+        "🎨 Adding the finishing touches…",
+        "✨ Polishing the result…",
+        "🖌️ Almost ready to reveal…",
     };
 
     /// <summary>MCP tool catalog discovery.</summary>
@@ -79,6 +148,19 @@ internal static class ThinkingStatus
     {
         "🧰 Discovering available tools…",
         "🔧 Loading tool catalog…",
+        "📋 Enumerating capabilities…",
+        "🧰 Checking what I can do…",
+        "🔍 Inspecting the toolset…",
+        "🗂️ Cataloging the tools…",
+        "🧭 Mapping the tool surface…",
+        "🔌 Connecting to tool server…",
+        "📦 Unpacking tool definitions…",
+        "🛠️ Reviewing the toolbox…",
+        "🧰 Refreshing the catalog…",
+        "🔧 Loading tool schemas…",
+        "📋 Reading tool descriptions…",
+        "🧰 Getting the lay of the land…",
+        "🔍 Confirming what's available…",
     };
 
     // ---- Live "starting" phrases (single string, not rotating) --------------

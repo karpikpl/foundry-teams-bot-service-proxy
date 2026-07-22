@@ -42,9 +42,10 @@ namespace AgentChat.Bots;
 public sealed class SdkStreamingMessageHelper
 {
     private const int InitialThrottleMs = 1000;             // Teams spec: 1 req/sec/stream
-    // 1.8s heartbeat: perceptibly "alive" (bar text changes ~every 2s) while
-    // staying above the 1s per-stream informative-update floor the SDK enforces.
-    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromMilliseconds(1800);
+    // 4s heartbeat: 15-phrase pools give a full minute of non-repeating
+    // context; ordering + the >=1s SDK throttle keep updates readable
+    // without feeling frantic.
+    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromSeconds(4);
 
     private readonly ITurnContext _ctx;
     private readonly bool _enabled;

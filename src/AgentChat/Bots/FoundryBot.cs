@@ -32,6 +32,11 @@ public class FoundryBot : TeamsActivityHandler
     private readonly AgentClientCache _clientCache;
     private readonly TeamsSsoService _sso;
     private readonly ILogger<FoundryBot> _logger;
+    // When true, Foundry calls use the container UAMI, not the user's OBO
+    // token. Teams SSO is skipped for the whole turn (no sign-in card, no
+    // per-user identity in Foundry). Keep this in sync with the same setting
+    // read by AgentService.
+    private readonly bool _useManagedIdentityForAgents;
 
     public FoundryBot(
         AgentService agents,
@@ -49,6 +54,7 @@ public class FoundryBot : TeamsActivityHandler
         _clientCache = clientCache;
         _sso         = sso;
         _logger      = logger;
+        _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
     }
 
     // ---------------------------------------------------------------- members added
@@ -647,6 +653,15 @@ public class FoundryBot : TeamsActivityHandler
     private async Task<UserAuth> TryAcquireUserAuthAsync(
         ITurnContext turnContext, ConversationState state, string? pendingMessage, CancellationToken ct)
     {
+        if (_useManagedIdentityForAgents)
+        {
+            // MI mode — no user identity flows to Foundry. Skip Teams SSO
+            // entirely: no sign-in card, no OBO token. Downstream callers
+            // (AgentService, FoundryClient) fall back to the container UAMI.
+            _logger.LogDebug("Foundry:UseManagedIdentityForAgents=true; skipping Teams SSO acquisition.");
+            return new UserAuth(false);
+        }
+
         if (!_sso.Enabled)
         {
             _logger.LogWarning("Teams SSO disabled; refusing to call Foundry without a user OBO token.");

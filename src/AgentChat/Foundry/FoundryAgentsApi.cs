@@ -25,23 +25,26 @@ public static class FoundryAgentsApi
     }
 
     /// <summary>
-    /// GET <c>{projectEndpoint}/agents?api-version=...</c>.
+    /// GET <c>{projectEndpoint}/agents?api-version=...</c>. The caller supplies
+    /// a delegate that returns the bearer token to use (either the user's OBO
+    /// token or an MI-issued token for <c>https://ai.azure.com/.default</c>).
     /// projectEndpoint is the URL up to (but not including) <c>/agents</c>,
     /// e.g. <c>https://acct.services.ai.azure.com/api/projects/p</c>.
     /// </summary>
     public static async Task<IReadOnlyList<AgentSummary>> ListAgentsAsync(
         HttpClient http,
         string projectEndpoint,
-        string userToken,
+        Func<CancellationToken, ValueTask<string>> tokenProvider,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(userToken))
-            throw new ArgumentException("A user OBO token is required to list Foundry agents.", nameof(userToken));
+        var token = await tokenProvider(ct);
+        if (string.IsNullOrWhiteSpace(token))
+            throw new InvalidOperationException("Foundry list-agents token provider returned an empty token.");
 
         var url = projectEndpoint.TrimEnd('/') + $"/agents?api-version={DefaultApiVersion}";
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
-        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", userToken);
+        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
 
         using var resp = await http.SendAsync(req, ct);
         if (!resp.IsSuccessStatusCode)

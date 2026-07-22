@@ -13,11 +13,16 @@ namespace AgentChat.Services;
 /// </summary>
 public class AgentService
 {
+    // AAD scope for Azure AI Foundry data-plane. Same scope works for both
+    // user OBO tokens (user_impersonation) and app-only (.default) tokens.
+    private const string FoundryScope = "https://ai.azure.com/.default";
+
     private readonly ILogger<AgentService> _logger;
     private readonly TokenCredential _credential;
     private readonly IHttpClientFactory _httpFactory;
     private readonly string _defaultProjectEndpoint;
     private readonly TimeSpan _cacheTtl;
+    private readonly bool _useManagedIdentity;
 
     public record AgentDescriptor(string Key, string Name, string Description, string Endpoint);
 
@@ -54,6 +59,14 @@ public class AgentService
 
         var ttlSeconds = config.GetValue("Foundry:CatalogCacheSeconds", 300);
         _cacheTtl = TimeSpan.FromSeconds(Math.Max(0, ttlSeconds));
+
+        // When true, list-agents uses the container's managed identity instead
+        // of the signed-in user's OBO token. Enable this for Teams bots that
+        // don't need per-user identity when talking to Foundry (the OBO path
+        // is fragile: scope/audience mismatches can cause Foundry to hang for
+        // 100s before returning any HTTP status). The UAMI must have
+        // "Azure AI User" on the project.
+        _useManagedIdentity = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
     }
 
     /// <summary>
@@ -83,7 +96,15 @@ public class AgentService
         bool forceRefresh = false,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(userObjectId) || string.IsNullOrWhiteSpace(userToken))
+        // With MI mode, we don't need the user token at all. Cache key is
+        // pinned to a synthetic MI identity so the catalog is shared across
+        // users (they all see the same UAMI-visible agents anyway).
+        if (_useManagedIdentity)
+        {
+            userObjectId = "__mi__";
+            userToken    = null;
+        }
+        else if (string.IsNullOrWhiteSpace(userObjectId) || string.IsNullOrWhiteSpace(userToken))
         {
             _logger.LogWarning("Agent catalog requested without a user OBO token; returning an empty catalog.");
             return Array.Empty<AgentDescriptor>();
@@ -111,7 +132,20 @@ public class AgentService
             }
 
             var http = _httpFactory.CreateClient("foundry-agents");
-            var agents = await FoundryAgentsApi.ListAgentsAsync(http, project, userToken!, ct);
+
+            // Token provider: MI (app-only) when the flag is on, otherwise the
+            // user's already-acquired OBO token verbatim.
+            var localUserToken = userToken;
+            Func<CancellationToken, ValueTask<string>> tokenProvider = _useManagedIdentity
+                ? async (c) =>
+                    {
+                        var tr = await _credential.GetTokenAsync(
+                            new TokenRequestContext(new[] { FoundryScope }), c);
+                        return tr.Token;
+                    }
+                : (c) => new ValueTask<string>(localUserToken!);
+
+            var agents = await FoundryAgentsApi.ListAgentsAsync(http, project, tokenProvider, ct);
             var snapshot = agents
                 .Where(a => a.IsActive)
                 .Select(a => new AgentDescriptor(
@@ -125,7 +159,8 @@ public class AgentService
 
             entry.Descriptors = snapshot;
             entry.CachedAtUtc = DateTime.UtcNow;
-            _logger.LogInformation("Refreshed user-scoped agent catalog: {Count} agent(s) from {Endpoint} for user {UserObjectId}", snapshot.Count, project, userObjectId);
+            var mode = _useManagedIdentity ? "MI" : "OBO";
+            _logger.LogInformation("Refreshed agent catalog ({Mode}): {Count} agent(s) from {Endpoint} for principal {UserObjectId}", mode, snapshot.Count, project, userObjectId);
             return entry.Descriptors;
         }
         catch (Exception ex)

@@ -1057,6 +1057,95 @@ public class FoundryBot : TeamsActivityHandler
                         $"⚠️ {err.Code ?? "error"}: {err.Message ?? "unknown"}"), ct);
                     break;
 
+                // --- Tool lifecycle: switch the heartbeat pool so the user
+                // sees rotating context-appropriate phrases while a
+                // Foundry-hosted tool is running. Completed events clear the
+                // pool so the heartbeat resumes generic rotation until the
+                // next tool or the first text delta arrives.
+                case StreamingResponseWebSearchCallInProgressUpdate:
+                case StreamingResponseWebSearchCallSearchingUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.WebSearch);
+                    break;
+                case StreamingResponseWebSearchCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseFileSearchCallInProgressUpdate:
+                case StreamingResponseFileSearchCallSearchingUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.FileSearch);
+                    break;
+                case StreamingResponseFileSearchCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseCodeInterpreterCallInProgressUpdate:
+                case StreamingResponseCodeInterpreterCallInterpretingUpdate:
+                case StreamingResponseCodeInterpreterCallCodeDeltaUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.CodeInterpreter);
+                    break;
+                case StreamingResponseCodeInterpreterCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseImageGenerationCallInProgressUpdate:
+                case StreamingResponseImageGenerationCallGeneratingUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.ImageGeneration);
+                    break;
+                case StreamingResponseImageGenerationCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseMcpListToolsInProgressUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.McpListTools);
+                    break;
+                case StreamingResponseMcpListToolsCompletedUpdate:
+                case StreamingResponseMcpListToolsFailedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseMcpCallInProgressUpdate mcpStart:
+                    if (state.ShowThinking)
+                    {
+                        // Try to pull the tool + server name off the enclosing
+                        // McpToolCallItem — the update itself only carries
+                        // sequence + item_id. We look up the item on the fly
+                        // by sniffing the update payload via Patch.
+                        streaming.SetHeartbeatStatus(
+                            ThinkingStatus.ForMcpCallInProgress(null, null));
+                    }
+                    break;
+                case StreamingResponseMcpCallCompletedUpdate:
+                case StreamingResponseMcpCallFailedUpdate:
+                    if (state.ShowThinking) streaming.SetHeartbeatStatus(null);
+                    break;
+
+                // Model-side chain-of-thought is running (no tool call).
+                case StreamingResponseReasoningTextDeltaUpdate:
+                case StreamingResponseReasoningSummaryTextDeltaUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.Reasoning);
+                    break;
+                case StreamingResponseReasoningTextDoneUpdate:
+                case StreamingResponseReasoningSummaryTextDoneUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                // Benign framing / lifecycle events we intentionally ignore
+                // (no user-visible effect, no state change). Listed
+                // explicitly so they don't fall through to the "unknown"
+                // logger and generate Debug noise.
+                case StreamingResponseInProgressUpdate:
+                case StreamingResponseQueuedUpdate:
+                case StreamingResponseContentPartAddedUpdate:
+                case StreamingResponseContentPartDoneUpdate:
+                case StreamingResponseOutputItemAddedUpdate:
+                case StreamingResponseOutputTextDoneUpdate:
+                case StreamingResponseFunctionCallArgumentsDeltaUpdate:
+                case StreamingResponseFunctionCallArgumentsDoneUpdate:
+                case StreamingResponseMcpCallArgumentsDeltaUpdate:
+                case StreamingResponseMcpCallArgumentsDoneUpdate:
+                case StreamingResponseTextAnnotationAddedUpdate:
+                    break;
+
                 default:
                     // Unknown / new event type the OpenAI SDK doesn't model yet.
                     // First, try to recognize known Foundry-specific events we

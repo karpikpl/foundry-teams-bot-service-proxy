@@ -26,6 +26,14 @@ namespace AgentChat.Bots;
 ///     thinking…" concept). We call <c>QueueInformativeUpdateAsync</c> on
 ///     each pulse; the SDK routes it correctly.
 ///
+/// Status model:
+///   - <c>SetStatusPool</c>: switch to a rotating pool of phrases (e.g. web
+///     search phrases while a search tool is in flight). Each pulse advances
+///     the rotation, giving the informative bar a sense of ongoing activity.
+///   - <c>SetHeartbeatStatus</c>: pin a single fixed phrase (e.g. an
+///     in-flight tool name); clears any pool.
+///   - Passing <c>null</c> to either restores the default generic pool.
+///
 /// Same critical invariant as the legacy helper: once a stream is opened, it
 /// MUST be closed via <see cref="FinalizeAsync"/> before sending any
 /// non-stream activity, or Teams shows a stuck "Calling tools…" bar for ~2
@@ -34,16 +42,9 @@ namespace AgentChat.Bots;
 public sealed class SdkStreamingMessageHelper
 {
     private const int InitialThrottleMs = 1000;             // Teams spec: 1 req/sec/stream
-    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromSeconds(4);
-
-    private static readonly string[] FallbackHeartbeatStatuses =
-    {
-        "Thinking…",
-        "Working on it…",
-        "Still thinking…",
-        "Hang tight…",
-        "Almost there…",
-    };
+    // 1.8s heartbeat: perceptibly "alive" (bar text changes ~every 2s) while
+    // staying above the 1s per-stream informative-update floor the SDK enforces.
+    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromMilliseconds(1800);
 
     private readonly ITurnContext _ctx;
     private readonly bool _enabled;
@@ -59,8 +60,14 @@ public sealed class SdkStreamingMessageHelper
 
     private CancellationTokenSource? _heartbeatCts;
     private Task? _heartbeatTask;
-    private string? _heartbeatStatus;
-    private int _heartbeatRotation;
+
+    // Status state — the loop reads one of these each tick (in this order):
+    //   1. _pinnedStatus (single sticky string, wins if set)
+    //   2. _statusPool (rotating pool, advanced each tick)
+    //   3. ThinkingStatus.Generic (fallback rotating pool)
+    private string? _pinnedStatus;
+    private string[]? _statusPool;
+    private int _rotationIndex;
 
     public SdkStreamingMessageHelper(ITurnContext ctx)
     {
@@ -92,7 +99,7 @@ public sealed class SdkStreamingMessageHelper
     {
         if (!_enabled) return;
         _lastStatus = text;
-        _heartbeatStatus = text;
+        _pinnedStatus = text;
         await _sendGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -113,18 +120,16 @@ public sealed class SdkStreamingMessageHelper
 
     /// <summary>
     /// Start a best-effort heartbeat that emits informative pulses via the SDK
-    /// while text deltas haven't started flowing. Matches the legacy helper's
-    /// semantics: pulses suppress themselves once <see cref="AppendDelta"/>
-    /// has been called; they resume across multi-hop tool calls until
-    /// <see cref="StopHeartbeatAsync"/>.
+    /// while text deltas haven't started flowing. Emits the first pulse
+    /// immediately so the user sees the bar right away (no 1.8s wait).
+    /// Matches the legacy helper's semantics: pulses suppress themselves once
+    /// <see cref="AppendDelta"/> has been called; they resume across multi-hop
+    /// tool calls until <see cref="StopHeartbeatAsync"/>.
     /// </summary>
     public void StartHeartbeat(string? initialStatus = null, TimeSpan? interval = null)
     {
         if (!_enabled || _heartbeatTask is not null) return;
-        // A non-null initialStatus becomes a sticky override; pass null to let
-        // the loop rotate through FallbackHeartbeatStatuses starting with
-        // "Thinking…". Callers that want variety must pass null here.
-        _heartbeatStatus = string.IsNullOrWhiteSpace(initialStatus) ? null : initialStatus;
+        _pinnedStatus = string.IsNullOrWhiteSpace(initialStatus) ? null : initialStatus;
         var period = interval ?? DefaultHeartbeatInterval;
         _heartbeatCts = new CancellationTokenSource();
         var token = _heartbeatCts.Token;
@@ -132,16 +137,29 @@ public sealed class SdkStreamingMessageHelper
     }
 
     /// <summary>
-    /// Set (or clear) the sticky informative-bar text used by the heartbeat
-    /// loop. Pass a non-null string to pin the bar to a live tool status
-    /// (e.g., "Calling get_weather…"). Pass <c>null</c> or whitespace to
-    /// CLEAR the override so the loop resumes rotating through
-    /// <see cref="FallbackHeartbeatStatuses"/>.
+    /// Pin the informative bar to a single fixed phrase (e.g. "Calling
+    /// get_weather…"). Clears any rotating pool. Pass <c>null</c> to clear
+    /// the pin and restore the generic rotating pool.
     /// </summary>
     public void SetHeartbeatStatus(string? status)
     {
         if (!_enabled) return;
-        _heartbeatStatus = string.IsNullOrWhiteSpace(status) ? null : status;
+        _pinnedStatus = string.IsNullOrWhiteSpace(status) ? null : status;
+        if (_pinnedStatus is not null) _statusPool = null;
+    }
+
+    /// <summary>
+    /// Switch the heartbeat to a rotating pool of phrases (e.g.
+    /// <see cref="ThinkingStatus.WebSearch"/>). Each tick advances the
+    /// rotation. Pass <c>null</c> or empty to restore the generic fallback
+    /// pool. Also clears any pinned status.
+    /// </summary>
+    public void SetStatusPool(string[]? pool)
+    {
+        if (!_enabled) return;
+        _pinnedStatus = null;
+        _statusPool = pool is { Length: > 0 } ? pool : null;
+        _rotationIndex = 0;
     }
 
     public async Task StopHeartbeatAsync()
@@ -163,10 +181,17 @@ public sealed class SdkStreamingMessageHelper
     {
         try
         {
+            // Fire the first pulse immediately so the user sees the informative
+            // bar without waiting a full period.
+            var initial = true;
             while (!token.IsCancellationRequested)
             {
-                try { await Task.Delay(period, token).ConfigureAwait(false); }
-                catch (OperationCanceledException) { return; }
+                if (!initial)
+                {
+                    try { await Task.Delay(period, token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { return; }
+                }
+                initial = false;
 
                 if (_textStreamingStarted) continue;
 
@@ -177,8 +202,8 @@ public sealed class SdkStreamingMessageHelper
                     if (token.IsCancellationRequested) return;
                     if (_textStreamingStarted) continue;
 
-                    var text = _heartbeatStatus
-                        ?? FallbackHeartbeatStatuses[_heartbeatRotation++ % FallbackHeartbeatStatuses.Length];
+                    var text = _pinnedStatus
+                        ?? ThinkingStatus.Pick(_statusPool ?? ThinkingStatus.Generic, _rotationIndex++);
                     _lastStatus = text;
                     await _ctx.StreamingResponse
                         .QueueInformativeUpdateAsync(text, token)

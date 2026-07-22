@@ -2,10 +2,11 @@ using AgentChat.Bots;
 using AgentChat.Services;
 using FluentAssertions;
 using Microsoft.AspNetCore.Http;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Builder.Adapters;
-using Microsoft.Bot.Connector.Authentication;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Storage;
+using Microsoft.Agents.Builder.Testing;
+using Microsoft.Agents.Connector;
+using Microsoft.Agents.Core.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -29,7 +30,7 @@ public class FoundryBotTests
 
         bot.AgentTurns.Should().ContainSingle().Which.Should().Be("hello");
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("agent:hello");
+        adapter.GetNextReply().Text.Should().Be("agent:hello");
     }
 
     [Fact]
@@ -43,7 +44,7 @@ public class FoundryBotTests
 
         bot.AgentTurns.Should().ContainSingle().Which.Should().Be("metadata text");
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("agent:metadata text");
+        adapter.GetNextReply().Text.Should().Be("agent:metadata text");
     }
 
     [Fact]
@@ -56,7 +57,7 @@ public class FoundryBotTests
         await bot.InvokeMessageAsync(turn);
 
         bot.AgentTurns.Should().BeEmpty();
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("Nothing is running right now.");
+        adapter.GetNextReply().Text.Should().Be("Nothing is running right now.");
     }
 
     [Fact]
@@ -82,7 +83,7 @@ public class FoundryBotTests
         bot.AgentTurns.Should().ContainSingle().Which.Should().Be("pending question");
         bot.AgentTurnTokens.Should().ContainSingle().Which.Should().Be("foundry-user-token");
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("agent:pending question");
+        adapter.GetNextReply().Text.Should().Be("agent:pending question");
         (await bot.Store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
     }
 
@@ -102,7 +103,7 @@ public class FoundryBotTests
         await bot.InvokeSignInAsync(turn);
 
         sso.ExchangeCalls.Should().Be(1);
-        var errorReply = adapter.GetNextReply().AsMessageActivity().Text;
+        var errorReply = adapter.GetNextReply().Text;
         errorReply.Should().Contain("Sign-in failed");
         errorReply.Should().Contain("InvalidOperationException");
         errorReply.Should().Contain("test failure");
@@ -144,7 +145,7 @@ public class FoundryBotTests
 
         await bot.InvokeSignInAsync(turn);
 
-        var reply = adapter.GetNextReply().AsMessageActivity().Text;
+        var reply = adapter.GetNextReply().Text;
         reply.Should().Contain("Teams silent SSO failed");
         reply.Should().Contain("```\n{\"code\":\"invokeerror\",\"message\":\"Invoke error occurred\",\"details\":\"full diagnostic body\"}\n```");
         reply.Should().Contain("Common causes");
@@ -210,7 +211,7 @@ public class FoundryBotTests
             await turn.SendActivityAsync(MessageFactory.Text("reply"), ct);
         }, CancellationToken.None);
 
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("reply");
+        adapter.GetNextReply().Text.Should().Be("reply");
         logger.Messages.Should().Contain(m =>
             m.Level == LogLevel.Information
             && m.Message.Contains("Incoming activity: type=message"));
@@ -234,9 +235,9 @@ public class FoundryBotTests
 
         await bot.InvokeSignInAsync(turn);
 
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Contain("Sign-in failed");
+        adapter.GetNextReply().Text.Should().Contain("Sign-in failed");
         var invokeResponseActivity = adapter.GetNextReply();
-        invokeResponseActivity.Type.Should().Be(ActivityTypesEx.InvokeResponse);
+        invokeResponseActivity.Type.Should().Be(ActivityTypes.InvokeResponse);
         var invokeResponse = ((Activity)invokeResponseActivity).Value.Should().BeOfType<InvokeResponse>().Subject;
         invokeResponse.Status.Should().Be(412);
         invokeResponse.Body.Should().BeOfType<TokenExchangeInvokeResponse>()
@@ -260,7 +261,7 @@ public class FoundryBotTests
         bot.AgentTurns.Should().ContainSingle().Which.Should().Be("pending verify");
         bot.AgentTurnTokens.Should().ContainSingle().Which.Should().Be("foundry-user-token");
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
-        adapter.GetNextReply().AsMessageActivity().Text.Should().Be("agent:pending verify");
+        adapter.GetNextReply().Text.Should().Be("agent:pending verify");
     }
 
     [Fact]
@@ -286,7 +287,7 @@ public class FoundryBotTests
         await bot.InvokeAsync(turn);
 
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
-        var errorReply = adapter.GetNextReply().AsMessageActivity().Text;
+        var errorReply = adapter.GetNextReply().Text;
         errorReply.Should().Contain("The agent encountered an error");
         errorReply.Should().Contain("bad foundry request");
     }
@@ -363,7 +364,7 @@ public class FoundryBotTests
         activity.Conversation = new ConversationAccount(id: convId);
         activity.From = new ChannelAccount("user-1", "User") { AadObjectId = "aad-user-1" };
         activity.Recipient = new ChannelAccount("bot-1", "Bot");
-        activity.Value = value;
+        activity.Value = value!;
         return new TurnContext(adapter, activity);
     }
 

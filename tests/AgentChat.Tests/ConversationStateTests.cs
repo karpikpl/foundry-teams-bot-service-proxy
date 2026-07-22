@@ -1,6 +1,6 @@
 using AgentChat.Bots;
 using FluentAssertions;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json;
 using Xunit;
 using ConversationState = AgentChat.Bots.ConversationState;
@@ -95,7 +95,7 @@ public class ConversationStateTests
             {
                 ChannelId = "msteams",
                 Conversation = new ConversationAccount { Id = "conv-1" },
-                Bot   = new ChannelAccount { Id = "bot-1" },
+                Agent = new ChannelAccount { Id = "bot-1" },
                 User  = new ChannelAccount { Id = "user-1" }
             }
         };

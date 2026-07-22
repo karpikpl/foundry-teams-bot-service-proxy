@@ -1,4 +1,11 @@
+using AgentChat.Bots;
 using FluentAssertions;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Hosting.AspNetCore;
+using Microsoft.Agents.Storage;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace AgentChat.Tests;
@@ -13,6 +20,31 @@ public class StartupRegistrationTests
 
         program.Should().NotContain("AddHostedService");
         program.Should().NotContain("BackgroundService");
+    }
+
+    // Regression: v0.12.0-rc.1 shipped with a missing AdapterOptions
+    // registration, which crashed every incoming request with
+    // "Unable to resolve service for type 'AdapterOptions' while attempting
+    // to activate 'AdapterWithErrorHandler'". Mirror Program.cs's adapter
+    // subgraph and assert CloudAdapter is resolvable from DI.
+    [Fact]
+    public void CloudAdapter_can_be_resolved_from_DI()
+    {
+        var services = new ServiceCollection();
+        services.AddLogging();
+        services.AddHttpClient();
+        services.AddSingleton<IConfiguration>(new ConfigurationBuilder().Build());
+        services.AddSingleton<IStorage, MemoryStorage>();
+
+        // Same registrations Program.cs performs for the adapter subgraph.
+        services.AddAgentCore<CloudAdapter>();
+        services.AddSingleton(new AdapterOptions());
+        services.AddSingleton<CloudAdapter, AdapterWithErrorHandler>();
+
+        using var sp = services.BuildServiceProvider();
+
+        var adapter = sp.GetRequiredService<CloudAdapter>();
+        adapter.Should().BeOfType<AdapterWithErrorHandler>();
     }
 
     private static string FindRepoRoot()

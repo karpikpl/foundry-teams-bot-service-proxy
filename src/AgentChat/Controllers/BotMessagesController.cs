@@ -1,6 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Builder.Integration.AspNet.Core;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Hosting.AspNetCore;
 
 namespace AgentChat.Controllers;
 
@@ -9,10 +9,10 @@ public class BotMessagesController : ControllerBase
 {
     public const string AgentEndpointKey = "Routing:AgentEndpoint";
 
-    private readonly IBotFrameworkHttpAdapter _adapter;
-    private readonly IBot _bot;
+    private readonly IAgentHttpAdapter _adapter;
+    private readonly IAgent _bot;
 
-    public BotMessagesController(IBotFrameworkHttpAdapter adapter, IBot bot)
+    public BotMessagesController(IAgentHttpAdapter adapter, IAgent bot)
     {
         _adapter = adapter;
         _bot     = bot;
@@ -46,7 +46,7 @@ public class BotMessagesController : ControllerBase
         return ProcessAsync();
     }
 
-    private Task ProcessAsync() => _adapter.ProcessAsync(Request, Response, _bot);
+    private Task ProcessAsync() => _adapter.ProcessAsync(Request, Response, _bot, HttpContext.RequestAborted);
 
     private static string ComposeAgentEndpoint(string foundryHost, string project, string agent)
     {

@@ -381,7 +381,9 @@ public class ManifestController : ControllerBase
             if (user is null)
                 throw new InvalidOperationException("A signed-in user OBO token is required to list Foundry agents.");
             using var scope = BeginFoundryUserScope(user.Token);
-            var agents = await FoundryAgentsApi.ListAgentsAsync(http, projectEndpoint, user.Token, ct);
+            var token = user.Token;
+            var agents = await FoundryAgentsApi.ListAgentsAsync(
+                http, projectEndpoint, _ => new ValueTask<string>(token), ct);
             return new AgentLoadResult(agents.Where(a => a.IsActive).OrderBy(a => a.Name).ToList(), null);
         }
         catch (Exception ex)

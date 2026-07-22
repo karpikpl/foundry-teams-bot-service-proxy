@@ -1,14 +1,15 @@
 using AgentChat.Bots;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Builder.Integration.AspNet.Core;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Hosting.AspNetCore;
 
 namespace AgentChat.Controllers;
 
 /// <summary>
 /// Proactive messaging endpoint. POST a JSON body { conversationId, text } and
 /// the bot pushes the text to the recorded conversation using
-/// BotAdapter.ContinueConversationAsync.
+/// <c>ChannelAdapter.ContinueConversationAsync</c>.
 ///
 /// Requires that the bot has seen at least one activity from that conversation
 /// (so we've stored its ConversationReference).
@@ -18,13 +19,13 @@ namespace AgentChat.Controllers;
 public class NotifyController : ControllerBase
 {
     private readonly ConversationStore _store;
-    private readonly IBotFrameworkHttpAdapter _adapter;
+    private readonly IChannelAdapter _adapter;
     private readonly IConfiguration _config;
     private readonly ILogger<NotifyController> _logger;
 
     public NotifyController(
         ConversationStore store,
-        IBotFrameworkHttpAdapter adapter,
+        IChannelAdapter adapter,
         IConfiguration config,
         ILogger<NotifyController> logger)
     {
@@ -45,7 +46,16 @@ public class NotifyController : ControllerBase
 
         var botAppId = _config["MicrosoftAppId"] ?? "";
 
-        await ((BotAdapter)_adapter).ContinueConversationAsync(
+        // TODO: The string-appId overload is [Obsolete] in the M365 Agents
+        // SDK in favor of a ClaimsIdentity-based overload. Migrating requires
+        // persisting the bot's appId (per-route EffectiveProxyAppId) alongside
+        // the ConversationReference in ConversationState so we can synthesize
+        // the right ClaimsIdentity at notify time — today NotifyController
+        // reads a single MicrosoftAppId that predates the multi-bot design
+        // and is effectively broken for multi-bot deployments. Tracked for
+        // follow-up after Slice 5 soak; suppressing the warning locally.
+#pragma warning disable CS0618 // Type or member is obsolete
+        await _adapter.ContinueConversationAsync(
             botAppId,
             state.ConversationReference,
             async (turnContext, innerCt) =>
@@ -53,6 +63,7 @@ public class NotifyController : ControllerBase
                 await turnContext.SendActivityAsync(MessageFactory.Text(req.Text), innerCt);
             },
             ct);
+#pragma warning restore CS0618
 
         return Ok(new { sent = true });
     }
@@ -64,3 +75,4 @@ public class NotifyController : ControllerBase
         return Ok(new { note = "Pass a conversationId from Bot Framework logs / App Insights to POST." });
     }
 }
+

@@ -1,6 +1,7 @@
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Connector.Authentication;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Authentication;
+using Microsoft.Agents.Connector;
+using Microsoft.Agents.Core.Models;
 
 namespace AgentChat.Services;
 
@@ -23,7 +24,7 @@ namespace AgentChat.Services;
 ///   4. Set <c>TeamsSso__ConnectionName=&lt;OAuth connection name&gt;</c>.
 ///      SSO turns on automatically whenever a connection name is configured.
 ///
-/// At runtime this service just calls <c>UserTokenClient.GetUserTokenAsync</c>;
+/// At runtime this service just calls <c>IUserTokenClient.GetUserTokenAsync</c>;
 /// Bot Service handles the SSO + OBO dance internally (cached, refreshed).
 ///
 /// When SSO is disabled or returns no token, callers must not fall back to
@@ -60,12 +61,12 @@ public class TeamsSsoService
     {
         if (!Enabled) return null;
 
-        var userTokenClient = turnContext.TurnState.Get<UserTokenClient>();
+        var userTokenClient = turnContext.Services.Get<IUserTokenClient>();
         if (userTokenClient is null)
         {
             // CloudAdapter normally provides this. If it's missing, we're likely
             // running under TestAdapter / unit tests without auth wired up.
-            _logger.LogInformation("UserTokenClient not available in turn state — SSO disabled for this turn.");
+            _logger.LogInformation("IUserTokenClient not available in turn state — SSO disabled for this turn.");
             return null;
         }
 
@@ -94,7 +95,7 @@ public class TeamsSsoService
     {
         if (!Enabled) return null;
 
-        var userTokenClient = turnContext.TurnState.Get<UserTokenClient>();
+        var userTokenClient = turnContext.Services.Get<IUserTokenClient>();
         if (userTokenClient is null) return null;
 
         try
@@ -133,12 +134,12 @@ public class TeamsSsoService
             throw new InvalidOperationException("Teams token-exchange request did not include a token.");
         }
 
-        var userTokenClient = turnContext.TurnState.Get<UserTokenClient>();
+        var userTokenClient = turnContext.Services.Get<IUserTokenClient>();
         if (userTokenClient is null)
         {
-            _logger.LogError("Teams token exchange failed: UserTokenClient missing from turn state (connection={Connection}, channel={Channel}).",
+            _logger.LogError("Teams token exchange failed: IUserTokenClient missing from turn state (connection={Connection}, channel={Channel}).",
                 _connectionName, turnContext.Activity.ChannelId);
-            throw new InvalidOperationException("Bot Framework UserTokenClient is not available for this turn.");
+            throw new InvalidOperationException("Bot Framework IUserTokenClient is not available for this turn.");
         }
 
         try
@@ -162,7 +163,7 @@ public class TeamsSsoService
         catch (Exception ex)
         {
             _logger.LogError(ex,
-                "Teams token exchange failed via UserTokenClient.ExchangeTokenAsync. Possible causes: user not consented, wrong audience, or OAuth connection misconfigured (connection={Connection}, requestUri={RequestUri}, channel={Channel}).",
+                "Teams token exchange failed via IUserTokenClient.ExchangeTokenAsync. Possible causes: user not consented, wrong audience, or OAuth connection misconfigured (connection={Connection}, requestUri={RequestUri}, channel={Channel}).",
                 _connectionName, request.Uri, turnContext.Activity.ChannelId);
             throw;
         }
@@ -175,7 +176,7 @@ public class TeamsSsoService
     public virtual async Task SignOutAsync(ITurnContext turnContext, CancellationToken ct = default)
     {
         if (!Enabled) return;
-        var userTokenClient = turnContext.TurnState.Get<UserTokenClient>();
+        var userTokenClient = turnContext.Services.Get<IUserTokenClient>();
         if (userTokenClient is null) return;
         try
         {

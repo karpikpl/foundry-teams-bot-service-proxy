@@ -1,5 +1,5 @@
 using System.Text;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Core.Models;
 using OpenAI.Responses;
 
 namespace AgentChat.Bots;

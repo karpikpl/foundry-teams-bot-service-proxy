@@ -1,12 +1,12 @@
 using System.Text;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Schema;
-using Newtonsoft.Json.Linq;
+using System.Text.Json;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Core.Models;
 
 namespace AgentChat.Bots;
 
 /// <summary>
-/// Teams streaming response helper.
+/// Teams streaming response helper (LEGACY, hand-rolled channelData plumbing).
 /// https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
 ///
 /// CRITICAL invariant: once a stream is opened (any informative or streaming
@@ -19,6 +19,7 @@ namespace AgentChat.Bots;
 /// Use IsOpen to check before sending non-stream activities and call
 /// FinalizeAsync() to gracefully close the stream first.
 /// </summary>
+[Obsolete("Use SdkStreamingMessageHelper — this hand-rolled helper is scheduled for removal once the M365 Agents SDK's StreamingResponse has been validated in the container app (target: after v0.10.0-rc soak).")]
 public class StreamingMessageHelper
 {
     private const int MinIntervalMs = 1500;
@@ -241,8 +242,11 @@ public class StreamingMessageHelper
             var act = MessageFactory.Text(finalText);
             act.Type = ActivityTypes.Message;
 
-            var props = new JObject { ["streamType"] = "final" };
-            if (_streamId is not null) props["streamId"] = _streamId;
+            var props = new Dictionary<string, JsonElement>
+            {
+                ["streamType"] = JsonSerializer.SerializeToElement("final"),
+            };
+            if (_streamId is not null) props["streamId"] = JsonSerializer.SerializeToElement(_streamId);
 
             var entity = new Entity("streaminfo");
             entity.Properties = props;
@@ -276,12 +280,12 @@ public class StreamingMessageHelper
         var act = MessageFactory.Text(text);
         act.Type = activityType;
 
-        var props = new JObject
+        var props = new Dictionary<string, JsonElement>
         {
-            ["streamType"]     = streamType,
-            ["streamSequence"] = _sequence
+            ["streamType"]     = JsonSerializer.SerializeToElement(streamType),
+            ["streamSequence"] = JsonSerializer.SerializeToElement(_sequence),
         };
-        if (_streamId is not null) props["streamId"] = _streamId;
+        if (_streamId is not null) props["streamId"] = JsonSerializer.SerializeToElement(_streamId);
 
         var entity = new Entity("streaminfo");
         entity.Properties = props;

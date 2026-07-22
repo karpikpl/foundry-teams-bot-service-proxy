@@ -1,12 +1,18 @@
 using AgentChat.Bots;
 using FluentAssertions;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Storage;
+using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace AgentChat.Tests;
 
+// StreamingMessageHelper is [Obsolete] but these tests continue to pin its
+// behavior contract until the legacy class is removed post-soak (see PR
+// #30). Suppression is per-class so any accidental new consumer still gets
+// the warning.
+#pragma warning disable CS0618 // Type or member is obsolete
 public class StreamingMessageHelperTests
 {
     private static ITurnContext MakeContext(string channelId, string convType, List<IActivity> sent)
@@ -108,9 +114,9 @@ public class StreamingMessageHelperTests
         await s.SendInformativeAsync("step 2", default);
         await s.SendInformativeAsync("step 3", default);
 
-        var seqs = sent.Select(a => (int)((Activity)a).Entities!
+        var seqs = sent.Select(a => ((Activity)a).Entities!
             .Single(e => e.Type == "streaminfo")
-            .Properties!["streamSequence"]!).ToList();
+            .Properties!["streamSequence"].GetInt32()).ToList();
 
         seqs.Should().Equal(new[] { 1, 2, 3 });
     }
@@ -129,7 +135,7 @@ public class StreamingMessageHelperTests
         var finalEntity = ((Activity)sent.Last()).Entities!
             .Single(e => e.Type == "streaminfo");
         finalEntity.Properties!.ContainsKey("streamSequence").Should().BeFalse();
-        finalEntity.Properties!["streamType"]!.ToString().Should().Be("final");
+        finalEntity.Properties!["streamType"].GetString().Should().Be("final");
     }
 
     [Fact]
@@ -145,8 +151,8 @@ public class StreamingMessageHelperTests
         sent.Clear();
 
         await s.SendInformativeAsync("B1", default);
-        var seq = (int)((Activity)sent[0]).Entities!
-            .Single(e => e.Type == "streaminfo").Properties!["streamSequence"]!;
+        var seq = ((Activity)sent[0]).Entities!
+            .Single(e => e.Type == "streaminfo").Properties!["streamSequence"].GetInt32();
         seq.Should().Be(1, "the sequence counter must reset after Finalize so the next stream starts fresh");
     }
 
@@ -381,22 +387,23 @@ public class StreamingMessageHelperTests
         sent.Should().BeEmpty();
     }
 
-    private sealed class RecordingAdapter : BotAdapter
+    private sealed class RecordingAdapter : ChannelAdapter
     {
         private readonly List<IActivity> _sent;
         public RecordingAdapter(List<IActivity> sink) { _sent = sink; }
 
-        public override Task<ResourceResponse[]> SendActivitiesAsync(ITurnContext turnContext, Activity[] activities, CancellationToken cancellationToken)
+        public override Task<ResourceResponse[]> SendActivitiesAsync(ITurnContext turnContext, IActivity[] activities, CancellationToken cancellationToken)
         {
             _sent.AddRange(activities);
             return Task.FromResult(activities.Select((_, i) =>
                 new ResourceResponse($"id-{_sent.Count - activities.Length + i}")).ToArray());
         }
 
-        public override Task<ResourceResponse> UpdateActivityAsync(ITurnContext t, Activity a, CancellationToken c)
+        public override Task<ResourceResponse> UpdateActivityAsync(ITurnContext t, IActivity a, CancellationToken c)
             => Task.FromResult(new ResourceResponse(a.Id ?? "id"));
 
         public override Task DeleteActivityAsync(ITurnContext t, ConversationReference r, CancellationToken c) => Task.CompletedTask;
     }
 }
 
+#pragma warning restore CS0618

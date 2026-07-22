@@ -1,6 +1,6 @@
 using AdaptiveCards;
 using AgentChat.Services;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json.Linq;
 
 namespace AgentChat.Bots;

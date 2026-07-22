@@ -4,10 +4,10 @@ using System.Net;
 using System.Text.Json;
 using AgentChat.Foundry;
 using AgentChat.Services;
-using Microsoft.Bot.Builder;
-using Microsoft.Bot.Builder.Teams;
-using Microsoft.Bot.Connector.Authentication;
-using Microsoft.Bot.Schema;
+using Microsoft.Agents.Builder;
+using Microsoft.Agents.Extensions.Teams.Compat;
+using Microsoft.Agents.Authentication;
+using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Responses;
@@ -32,6 +32,11 @@ public class FoundryBot : TeamsActivityHandler
     private readonly AgentClientCache _clientCache;
     private readonly TeamsSsoService _sso;
     private readonly ILogger<FoundryBot> _logger;
+    // When true, Foundry calls use the container UAMI, not the user's OBO
+    // token. Teams SSO is skipped for the whole turn (no sign-in card, no
+    // per-user identity in Foundry). Keep this in sync with the same setting
+    // read by AgentService.
+    private readonly bool _useManagedIdentityForAgents;
 
     public FoundryBot(
         AgentService agents,
@@ -49,6 +54,7 @@ public class FoundryBot : TeamsActivityHandler
         _clientCache = clientCache;
         _sso         = sso;
         _logger      = logger;
+        _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
     }
 
     // ---------------------------------------------------------------- members added
@@ -475,7 +481,7 @@ public class FoundryBot : TeamsActivityHandler
         var auth = await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: null, ct);
         if (!auth.ShouldProceed) return;
 
-        await turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = Microsoft.Bot.Schema.ActivityTypes.Typing }, ct);
+        await turnContext.SendActivityAsync(new Microsoft.Agents.Core.Models.Activity { Type = Microsoft.Agents.Core.Models.ActivityTypes.Typing }, ct);
 
         using (ApplyAuthScope(auth))
         {
@@ -647,6 +653,15 @@ public class FoundryBot : TeamsActivityHandler
     private async Task<UserAuth> TryAcquireUserAuthAsync(
         ITurnContext turnContext, ConversationState state, string? pendingMessage, CancellationToken ct)
     {
+        if (_useManagedIdentityForAgents)
+        {
+            // MI mode — no user identity flows to Foundry. Skip Teams SSO
+            // entirely: no sign-in card, no OBO token. Downstream callers
+            // (AgentService, FoundryClient) fall back to the container UAMI.
+            _logger.LogDebug("Foundry:UseManagedIdentityForAgents=true; skipping Teams SSO acquisition.");
+            return new UserAuth(false);
+        }
+
         if (!_sso.Enabled)
         {
             _logger.LogWarning("Teams SSO disabled; refusing to call Foundry without a user OBO token.");
@@ -827,7 +842,7 @@ public class FoundryBot : TeamsActivityHandler
         string? firstPreviousResponseId = null)
     {
         var sw         = Stopwatch.StartNew();
-        var streaming  = new StreamingMessageHelper(turnContext);
+        var streaming  = new SdkStreamingMessageHelper(turnContext);
         var steps      = new List<ThinkingStep>();
 
         var responses = foundry.OpenAI.GetResponsesClient();
@@ -837,7 +852,10 @@ public class FoundryBot : TeamsActivityHandler
         // gaps before the first text delta and during tool round-trips. The
         // helper auto-suppresses pulses once text deltas start flowing and
         // resumes after each FinalizeAsync hop.
-        streaming.StartHeartbeat("Thinking…");
+        // Pass null so the loop rotates through the fallback statuses
+        // ("Thinking…" → "Working on it…" → "Still thinking…" → …) instead
+        // of locking on a single string.
+        streaming.StartHeartbeat();
 
         try
         {
@@ -939,7 +957,7 @@ public class FoundryBot : TeamsActivityHandler
 
     private sealed record StreamStep(bool Stop, IReadOnlyList<ResponseItem>? NextInputItems = null);
 
-    private async Task FinalizeStreamingSafelyAsync(StreamingMessageHelper streaming, CancellationToken ct)
+    private async Task FinalizeStreamingSafelyAsync(SdkStreamingMessageHelper streaming, CancellationToken ct)
     {
         try
         {
@@ -960,7 +978,7 @@ public class FoundryBot : TeamsActivityHandler
         ConversationState state,
         Foundry.FoundryClient foundry,
         ResponsesClient responses,
-        StreamingMessageHelper streaming,
+        SdkStreamingMessageHelper streaming,
         CreateResponseOptions opts,
         Stopwatch sw,
         CancellationToken ct,
@@ -970,6 +988,7 @@ public class FoundryBot : TeamsActivityHandler
         var pendingApprovals     = new List<PendingMcpApproval>();
         var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
+        var citations            = new List<UrlCitation>();
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
@@ -1001,7 +1020,7 @@ public class FoundryBot : TeamsActivityHandler
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
                         turnContext, state, streaming, done.Item, responseIdForResume,
-                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, ct);
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, citations, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -1037,6 +1056,127 @@ public class FoundryBot : TeamsActivityHandler
                     await streaming.FinalizeAsync(ct);
                     await turnContext.SendActivityAsync(MessageFactory.Text(
                         $"⚠️ {err.Code ?? "error"}: {err.Message ?? "unknown"}"), ct);
+                    break;
+
+                // --- Tool lifecycle: switch the heartbeat pool so the user
+                // sees rotating context-appropriate phrases while a
+                // Foundry-hosted tool is running. Completed events clear the
+                // pool so the heartbeat resumes generic rotation until the
+                // next tool or the first text delta arrives.
+                case StreamingResponseWebSearchCallInProgressUpdate:
+                case StreamingResponseWebSearchCallSearchingUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.WebSearch);
+                    break;
+                case StreamingResponseWebSearchCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseFileSearchCallInProgressUpdate:
+                case StreamingResponseFileSearchCallSearchingUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.FileSearch);
+                    break;
+                case StreamingResponseFileSearchCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseCodeInterpreterCallInProgressUpdate:
+                case StreamingResponseCodeInterpreterCallInterpretingUpdate:
+                case StreamingResponseCodeInterpreterCallCodeDeltaUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.CodeInterpreter);
+                    break;
+                case StreamingResponseCodeInterpreterCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseImageGenerationCallInProgressUpdate:
+                case StreamingResponseImageGenerationCallGeneratingUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.ImageGeneration);
+                    break;
+                case StreamingResponseImageGenerationCallCompletedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseMcpListToolsInProgressUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.McpListTools);
+                    break;
+                case StreamingResponseMcpListToolsCompletedUpdate:
+                case StreamingResponseMcpListToolsFailedUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                case StreamingResponseMcpCallInProgressUpdate mcpStart:
+                    if (state.ShowThinking)
+                    {
+                        // Try to pull the tool + server name off the enclosing
+                        // McpToolCallItem — the update itself only carries
+                        // sequence + item_id. We look up the item on the fly
+                        // by sniffing the update payload via Patch.
+                        streaming.SetHeartbeatStatus(
+                            ThinkingStatus.ForMcpCallInProgress(null, null));
+                    }
+                    break;
+                case StreamingResponseMcpCallCompletedUpdate:
+                case StreamingResponseMcpCallFailedUpdate:
+                    if (state.ShowThinking) streaming.SetHeartbeatStatus(null);
+                    break;
+
+                // Model-side chain-of-thought is running (no tool call).
+                case StreamingResponseReasoningTextDeltaUpdate:
+                case StreamingResponseReasoningSummaryTextDeltaUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(ThinkingStatus.Reasoning);
+                    break;
+                case StreamingResponseReasoningTextDoneUpdate:
+                case StreamingResponseReasoningSummaryTextDoneUpdate:
+                    if (state.ShowThinking) streaming.SetStatusPool(null);
+                    break;
+
+                // Benign framing / lifecycle events we intentionally ignore
+                // (no user-visible effect, no state change). Listed
+                // explicitly so they don't fall through to the "unknown"
+                // logger and generate Debug noise.
+                case StreamingResponseInProgressUpdate:
+                case StreamingResponseQueuedUpdate:
+                case StreamingResponseContentPartAddedUpdate:
+                case StreamingResponseContentPartDoneUpdate:
+                case StreamingResponseOutputItemAddedUpdate:
+                case StreamingResponseOutputTextDoneUpdate:
+                case StreamingResponseFunctionCallArgumentsDeltaUpdate:
+                case StreamingResponseFunctionCallArgumentsDoneUpdate:
+                case StreamingResponseMcpCallArgumentsDeltaUpdate:
+                case StreamingResponseMcpCallArgumentsDoneUpdate:
+                    break;
+
+                case StreamingResponseTextAnnotationAddedUpdate annot:
+                    // URL citations arrive live during text streaming (interleaved
+                    // between output_text.delta events). Capture them as they
+                    // land so the Sources footer picks them up even if the
+                    // final MessageResponseItem is unavailable or truncated.
+                    // The SDK types are shallow so we round-trip via JSON.
+                    try
+                    {
+                        var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(annot);
+                        using var doc = System.Text.Json.JsonDocument.Parse(bd);
+                        if (doc.RootElement.TryGetProperty("annotation", out var an))
+                        {
+                            var typ = an.TryGetProperty("type", out var t) ? t.GetString() : null;
+                            if (typ is "url_citation" or "uri_citation")
+                            {
+                                var url = an.TryGetProperty("url", out var u) ? u.GetString()
+                                        : an.TryGetProperty("uri", out var ui) ? ui.GetString() : null;
+                                if (!string.IsNullOrWhiteSpace(url) &&
+                                    !citations.Any(c => string.Equals(c.Url, url, StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    var title = an.TryGetProperty("title", out var ti) ? ti.GetString() : null;
+                                    citations.Add(new UrlCitation(url!, string.IsNullOrWhiteSpace(title) ? url! : title!));
+                                    _logger.LogInformation("Captured URL citation: {Title} <{Url}>", title ?? "(no title)", url);
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to extract citation from annotation update");
+                    }
                     break;
 
                 default:
@@ -1110,7 +1250,10 @@ public class FoundryBot : TeamsActivityHandler
                     IsError:     false));
             }
             _logger.LogInformation("Continuing Foundry response with {OutputCount} function output item(s).", outputs.Count);
-            streaming.SetHeartbeatStatus("Thinking…");
+            // Tool call completed — clear the sticky "Calling tool X…" status
+            // so the heartbeat rotates through the generic fallback list
+            // while the model reasons over the tool output.
+            streaming.SetHeartbeatStatus(null);
             return new StreamStep(false, outputs);
         }
 
@@ -1164,7 +1307,24 @@ public class FoundryBot : TeamsActivityHandler
         // handled above: function-tool outputs (returns NextInputItems) and
         // MCP approvals (returns Stop=true to pause for user).
 
-        // 3) Done — emit usage card if enabled.
+        // 3) Done — append a Sources footer (if grounding tools produced
+        // URL citations), then emit usage card if enabled.
+        if (citations.Count > 0 && streaming.Enabled)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("\n\n---\n**Sources**\n");
+            var shown = 0;
+            foreach (var c in citations)
+            {
+                shown++;
+                if (shown > 10) break;
+                // Escape closing brackets in the title to avoid breaking markdown.
+                var safeTitle = c.Title.Replace("[", "\\[").Replace("]", "\\]");
+                sb.Append($"{shown}. [{safeTitle}]({c.Url})\n");
+            }
+            if (citations.Count > 10) sb.Append($"…and {citations.Count - 10} more.\n");
+            streaming.AppendDelta(sb.ToString());
+        }
         await streaming.FinalizeAsync(ct);
         if (state.ShowUsage && state.LastTotalTokens > 0)
         {
@@ -1182,7 +1342,7 @@ public class FoundryBot : TeamsActivityHandler
     private async Task HandleCompletedItemAsync(
         ITurnContext turnContext,
         ConversationState state,
-        StreamingMessageHelper streaming,
+        SdkStreamingMessageHelper streaming,
         ResponseItem item,
         string? responseIdForResume,
         List<FunctionCallResponseItem> pendingFunctionCalls,
@@ -1190,6 +1350,7 @@ public class FoundryBot : TeamsActivityHandler
         List<PendingConsent> pendingConsents,
         HashSet<string> seenIds,
         List<ThinkingStep> steps,
+        List<UrlCitation> citations,
         CancellationToken ct)
     {
         if (item.Id is { } id && !seenIds.Add(id)) return; // de-dup repeated done events for the same item
@@ -1198,6 +1359,87 @@ public class FoundryBot : TeamsActivityHandler
         {
             case FunctionCallResponseItem fc:
                 pendingFunctionCalls.Add(fc);
+                break;
+
+            case WebSearchCallResponseItem ws:
+                // Foundry buffers hosted web-search server-side and doesn't
+                // emit `response.web_search_call.*` stream events — we only
+                // learn a search ran when the completed item arrives. Log
+                // it, record it in the reasoning card, and (best-effort)
+                // capture the query so the citations footer can mention it.
+                {
+                    string? query = null;
+                    try
+                    {
+                        var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(ws);
+                        using var doc = System.Text.Json.JsonDocument.Parse(bd);
+                        if (doc.RootElement.TryGetProperty("action", out var actionEl))
+                        {
+                            if (actionEl.TryGetProperty("query", out var q) && q.ValueKind == System.Text.Json.JsonValueKind.String)
+                                query = q.GetString();
+                            else if (actionEl.TryGetProperty("search_query", out var sq) && sq.ValueKind == System.Text.Json.JsonValueKind.String)
+                                query = sq.GetString();
+                        }
+                    }
+                    catch { /* best-effort */ }
+                    _logger.LogInformation("Web search call completed (query={Query})", query ?? "(unknown)");
+                    steps.Add(new ThinkingStep(
+                        Kind:        "WebSearch",
+                        ToolName:    "web_search",
+                        ServerLabel: null,
+                        Arguments:   query is null ? "{}" : $"{{ \"query\": \"{query.Replace("\"", "\\\"")}\" }}",
+                        Output:      "(results embedded in message citations)",
+                        IsError:     false));
+                }
+                break;
+
+            case FileSearchCallResponseItem fs:
+                _logger.LogInformation("File search call completed (id={Id})", fs.Id);
+                steps.Add(new ThinkingStep(
+                    Kind:        "FileSearch",
+                    ToolName:    "file_search",
+                    ServerLabel: null,
+                    Arguments:   "{}",
+                    Output:      "(results embedded in message citations)",
+                    IsError:     false));
+                break;
+
+            case MessageResponseItem msgItem:
+                // Foundry's grounded-with-web-search agents attach these as
+                // `url_citation` annotations on the assistant message; we
+                // aggregate them here to render a "Sources" footer at the
+                // end of the turn (required for TOS compliance on
+                // grounded content).
+                try
+                {
+                    var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(msgItem);
+                    using var doc = System.Text.Json.JsonDocument.Parse(bd);
+                    if (doc.RootElement.TryGetProperty("content", out var contentEl) &&
+                        contentEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        foreach (var part in contentEl.EnumerateArray())
+                        {
+                            if (!part.TryGetProperty("annotations", out var annEl) ||
+                                annEl.ValueKind != System.Text.Json.JsonValueKind.Array) continue;
+                            foreach (var a in annEl.EnumerateArray())
+                            {
+                                if (!a.TryGetProperty("type", out var t)) continue;
+                                var typ = t.GetString();
+                                if (typ != "url_citation" && typ != "uri_citation") continue;
+                                var url = a.TryGetProperty("url", out var u) ? u.GetString()
+                                        : a.TryGetProperty("uri", out var ui) ? ui.GetString() : null;
+                                if (string.IsNullOrWhiteSpace(url)) continue;
+                                var title = a.TryGetProperty("title", out var ti) ? ti.GetString() : null;
+                                if (citations.Any(c => string.Equals(c.Url, url, StringComparison.OrdinalIgnoreCase))) continue;
+                                citations.Add(new UrlCitation(url!, string.IsNullOrWhiteSpace(title) ? url! : title!));
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to extract citations from MessageResponseItem");
+                }
                 break;
 
             case McpToolCallApprovalRequestItem appr:
@@ -1278,10 +1520,19 @@ public class FoundryBot : TeamsActivityHandler
                 }
                 break;
 
-            // MessageResponseItem and McpToolDefinitionListItem don't need cards;
-            // their text is already streamed via output_text deltas.
+            // McpToolDefinitionListItem doesn't need cards; its content is
+            // for the model. MessageResponseItem's text is streamed via
+            // output_text deltas — we only touch it above to extract URL
+            // citations before the stream closes.
         }
     }
+
+    /// <summary>
+    /// Compact URL citation record collected from assistant-message
+    /// annotations during streaming. Used to render a "Sources" footer at
+    /// the end of the turn.
+    /// </summary>
+    private sealed record UrlCitation(string Url, string Title);
 
     private bool TryExtractApprovalRequest(ResponseItem item, string? previousResponseId, out PendingMcpApproval approval)
     {
@@ -1395,36 +1646,45 @@ public class FoundryBot : TeamsActivityHandler
     /// Serialize an unknown streaming update back to JSON for diagnostics.
     /// Captures both the SDK-recognized fields and anything stashed in
     /// <c>Patch</c> (the SDK's bag of unknown properties).
+    ///
+    /// Logged at Debug: verified-safe frame/metadata events (in_progress,
+    /// output_item.added/done, content_part.added/done, output_text.done)
+    /// arrive alongside the delta events we act on, so ignoring them here
+    /// does not affect the streamed output — but keep the raw payload
+    /// available under Debug for schema drift debugging.
     /// </summary>
     private void LogUnknownStreamEvent(StreamingResponseUpdate update)
     {
+        if (!_logger.IsEnabled(LogLevel.Debug)) return;
         try
         {
             var raw = System.ClientModel.Primitives.ModelReaderWriter.Write(update).ToString();
-            _logger.LogWarning("Unhandled stream event ({Type}): {Raw}",
+            _logger.LogDebug("Unhandled stream event ({Type}): {Raw}",
                 update.GetType().Name, Truncate(raw, 2000));
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Unhandled stream event of type {Type}; could not serialize", update.GetType().Name);
+            _logger.LogDebug(ex, "Unhandled stream event of type {Type}; could not serialize", update.GetType().Name);
         }
     }
 
     /// <summary>
     /// Serialize an unknown response item back to JSON for diagnostics.
     /// Captures the typed shape plus any unknown fields stored in <c>Patch</c>.
+    /// See <see cref="LogUnknownStreamEvent"/> for why this is Debug.
     /// </summary>
     private void LogUnknownItem(ResponseItem item)
     {
+        if (!_logger.IsEnabled(LogLevel.Debug)) return;
         try
         {
             var raw = System.ClientModel.Primitives.ModelReaderWriter.Write(item).ToString();
-            _logger.LogWarning("Unhandled output item ({Type}): {Raw}",
+            _logger.LogDebug("Unhandled output item ({Type}): {Raw}",
                 item.GetType().Name, Truncate(raw, 2000));
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Unhandled output item of type {Type}; could not serialize", item.GetType().Name);
+            _logger.LogDebug(ex, "Unhandled output item of type {Type}; could not serialize", item.GetType().Name);
         }
     }
 
@@ -1438,7 +1698,7 @@ public class FoundryBot : TeamsActivityHandler
     /// so all the discriminator + nested-shape work is handled by the SDK.
     /// </summary>
     private static Task<ResourceResponse> SendTypingAsync(ITurnContext turnContext, CancellationToken ct)
-        => turnContext.SendActivityAsync(new Microsoft.Bot.Schema.Activity { Type = ActivityTypes.Typing }, ct);
+        => turnContext.SendActivityAsync(new Microsoft.Agents.Core.Models.Activity { Type = ActivityTypes.Typing }, ct);
 
     private static async Task PostConversationItemsAsync(
         Foundry.FoundryClient foundry,

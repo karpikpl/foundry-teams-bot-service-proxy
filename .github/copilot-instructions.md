@@ -130,7 +130,7 @@ Notable tests:
 
 ## Release Workflow
 
-- Current infra-pinned version: `0.9.1`.
+- Current infra-pinned version: `0.11.1`.
 - Tag `vX.Y.Z` (or prerelease `vX.Y.Z-rc.N`, `vX.Y.Z-diag.N`) in this repo to trigger `.github/workflows/release.yml`.
 - Release CI runs tests, builds a multi-arch image, pushes to GHCR, signs with cosign (stable tags only), and **creates a GitHub Release**.
   - Stable `vX.Y.Z` → image tags `X.Y.Z`, `X.Y`, `X`, `latest`, `sha-<short>` + standard GitHub Release.

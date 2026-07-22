@@ -1144,7 +1144,39 @@ public class FoundryBot : TeamsActivityHandler
                 case StreamingResponseFunctionCallArgumentsDoneUpdate:
                 case StreamingResponseMcpCallArgumentsDeltaUpdate:
                 case StreamingResponseMcpCallArgumentsDoneUpdate:
-                case StreamingResponseTextAnnotationAddedUpdate:
+                    break;
+
+                case StreamingResponseTextAnnotationAddedUpdate annot:
+                    // URL citations arrive live during text streaming (interleaved
+                    // between output_text.delta events). Capture them as they
+                    // land so the Sources footer picks them up even if the
+                    // final MessageResponseItem is unavailable or truncated.
+                    // The SDK types are shallow so we round-trip via JSON.
+                    try
+                    {
+                        var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(annot);
+                        using var doc = System.Text.Json.JsonDocument.Parse(bd);
+                        if (doc.RootElement.TryGetProperty("annotation", out var an))
+                        {
+                            var typ = an.TryGetProperty("type", out var t) ? t.GetString() : null;
+                            if (typ is "url_citation" or "uri_citation")
+                            {
+                                var url = an.TryGetProperty("url", out var u) ? u.GetString()
+                                        : an.TryGetProperty("uri", out var ui) ? ui.GetString() : null;
+                                if (!string.IsNullOrWhiteSpace(url) &&
+                                    !citations.Any(c => string.Equals(c.Url, url, StringComparison.OrdinalIgnoreCase)))
+                                {
+                                    var title = an.TryGetProperty("title", out var ti) ? ti.GetString() : null;
+                                    citations.Add(new UrlCitation(url!, string.IsNullOrWhiteSpace(title) ? url! : title!));
+                                    _logger.LogInformation("Captured URL citation: {Title} <{Url}>", title ?? "(no title)", url);
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to extract citation from annotation update");
+                    }
                     break;
 
                 default:

@@ -988,6 +988,7 @@ public class FoundryBot : TeamsActivityHandler
         var pendingApprovals     = new List<PendingMcpApproval>();
         var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
+        var citations            = new List<UrlCitation>();
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
@@ -1019,7 +1020,7 @@ public class FoundryBot : TeamsActivityHandler
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
                         turnContext, state, streaming, done.Item, responseIdForResume,
-                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, ct);
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, citations, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -1274,7 +1275,24 @@ public class FoundryBot : TeamsActivityHandler
         // handled above: function-tool outputs (returns NextInputItems) and
         // MCP approvals (returns Stop=true to pause for user).
 
-        // 3) Done — emit usage card if enabled.
+        // 3) Done — append a Sources footer (if grounding tools produced
+        // URL citations), then emit usage card if enabled.
+        if (citations.Count > 0 && streaming.Enabled)
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.Append("\n\n---\n**Sources**\n");
+            var shown = 0;
+            foreach (var c in citations)
+            {
+                shown++;
+                if (shown > 10) break;
+                // Escape closing brackets in the title to avoid breaking markdown.
+                var safeTitle = c.Title.Replace("[", "\\[").Replace("]", "\\]");
+                sb.Append($"{shown}. [{safeTitle}]({c.Url})\n");
+            }
+            if (citations.Count > 10) sb.Append($"…and {citations.Count - 10} more.\n");
+            streaming.AppendDelta(sb.ToString());
+        }
         await streaming.FinalizeAsync(ct);
         if (state.ShowUsage && state.LastTotalTokens > 0)
         {
@@ -1300,6 +1318,7 @@ public class FoundryBot : TeamsActivityHandler
         List<PendingConsent> pendingConsents,
         HashSet<string> seenIds,
         List<ThinkingStep> steps,
+        List<UrlCitation> citations,
         CancellationToken ct)
     {
         if (item.Id is { } id && !seenIds.Add(id)) return; // de-dup repeated done events for the same item
@@ -1308,6 +1327,87 @@ public class FoundryBot : TeamsActivityHandler
         {
             case FunctionCallResponseItem fc:
                 pendingFunctionCalls.Add(fc);
+                break;
+
+            case WebSearchCallResponseItem ws:
+                // Foundry buffers hosted web-search server-side and doesn't
+                // emit `response.web_search_call.*` stream events — we only
+                // learn a search ran when the completed item arrives. Log
+                // it, record it in the reasoning card, and (best-effort)
+                // capture the query so the citations footer can mention it.
+                {
+                    string? query = null;
+                    try
+                    {
+                        var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(ws);
+                        using var doc = System.Text.Json.JsonDocument.Parse(bd);
+                        if (doc.RootElement.TryGetProperty("action", out var actionEl))
+                        {
+                            if (actionEl.TryGetProperty("query", out var q) && q.ValueKind == System.Text.Json.JsonValueKind.String)
+                                query = q.GetString();
+                            else if (actionEl.TryGetProperty("search_query", out var sq) && sq.ValueKind == System.Text.Json.JsonValueKind.String)
+                                query = sq.GetString();
+                        }
+                    }
+                    catch { /* best-effort */ }
+                    _logger.LogInformation("Web search call completed (query={Query})", query ?? "(unknown)");
+                    steps.Add(new ThinkingStep(
+                        Kind:        "WebSearch",
+                        ToolName:    "web_search",
+                        ServerLabel: null,
+                        Arguments:   query is null ? "{}" : $"{{ \"query\": \"{query.Replace("\"", "\\\"")}\" }}",
+                        Output:      "(results embedded in message citations)",
+                        IsError:     false));
+                }
+                break;
+
+            case FileSearchCallResponseItem fs:
+                _logger.LogInformation("File search call completed (id={Id})", fs.Id);
+                steps.Add(new ThinkingStep(
+                    Kind:        "FileSearch",
+                    ToolName:    "file_search",
+                    ServerLabel: null,
+                    Arguments:   "{}",
+                    Output:      "(results embedded in message citations)",
+                    IsError:     false));
+                break;
+
+            case MessageResponseItem msgItem:
+                // Foundry's grounded-with-web-search agents attach these as
+                // `url_citation` annotations on the assistant message; we
+                // aggregate them here to render a "Sources" footer at the
+                // end of the turn (required for TOS compliance on
+                // grounded content).
+                try
+                {
+                    var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(msgItem);
+                    using var doc = System.Text.Json.JsonDocument.Parse(bd);
+                    if (doc.RootElement.TryGetProperty("content", out var contentEl) &&
+                        contentEl.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        foreach (var part in contentEl.EnumerateArray())
+                        {
+                            if (!part.TryGetProperty("annotations", out var annEl) ||
+                                annEl.ValueKind != System.Text.Json.JsonValueKind.Array) continue;
+                            foreach (var a in annEl.EnumerateArray())
+                            {
+                                if (!a.TryGetProperty("type", out var t)) continue;
+                                var typ = t.GetString();
+                                if (typ != "url_citation" && typ != "uri_citation") continue;
+                                var url = a.TryGetProperty("url", out var u) ? u.GetString()
+                                        : a.TryGetProperty("uri", out var ui) ? ui.GetString() : null;
+                                if (string.IsNullOrWhiteSpace(url)) continue;
+                                var title = a.TryGetProperty("title", out var ti) ? ti.GetString() : null;
+                                if (citations.Any(c => string.Equals(c.Url, url, StringComparison.OrdinalIgnoreCase))) continue;
+                                citations.Add(new UrlCitation(url!, string.IsNullOrWhiteSpace(title) ? url! : title!));
+                            }
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to extract citations from MessageResponseItem");
+                }
                 break;
 
             case McpToolCallApprovalRequestItem appr:
@@ -1388,10 +1488,19 @@ public class FoundryBot : TeamsActivityHandler
                 }
                 break;
 
-            // MessageResponseItem and McpToolDefinitionListItem don't need cards;
-            // their text is already streamed via output_text deltas.
+            // McpToolDefinitionListItem doesn't need cards; its content is
+            // for the model. MessageResponseItem's text is streamed via
+            // output_text deltas — we only touch it above to extract URL
+            // citations before the stream closes.
         }
     }
+
+    /// <summary>
+    /// Compact URL citation record collected from assistant-message
+    /// annotations during streaming. Used to render a "Sources" footer at
+    /// the end of the turn.
+    /// </summary>
+    private sealed record UrlCitation(string Url, string Title);
 
     private bool TryExtractApprovalRequest(ResponseItem item, string? previousResponseId, out PendingMcpApproval approval)
     {

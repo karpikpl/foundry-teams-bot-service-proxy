@@ -1410,36 +1410,45 @@ public class FoundryBot : TeamsActivityHandler
     /// Serialize an unknown streaming update back to JSON for diagnostics.
     /// Captures both the SDK-recognized fields and anything stashed in
     /// <c>Patch</c> (the SDK's bag of unknown properties).
+    ///
+    /// Logged at Debug: verified-safe frame/metadata events (in_progress,
+    /// output_item.added/done, content_part.added/done, output_text.done)
+    /// arrive alongside the delta events we act on, so ignoring them here
+    /// does not affect the streamed output — but keep the raw payload
+    /// available under Debug for schema drift debugging.
     /// </summary>
     private void LogUnknownStreamEvent(StreamingResponseUpdate update)
     {
+        if (!_logger.IsEnabled(LogLevel.Debug)) return;
         try
         {
             var raw = System.ClientModel.Primitives.ModelReaderWriter.Write(update).ToString();
-            _logger.LogWarning("Unhandled stream event ({Type}): {Raw}",
+            _logger.LogDebug("Unhandled stream event ({Type}): {Raw}",
                 update.GetType().Name, Truncate(raw, 2000));
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Unhandled stream event of type {Type}; could not serialize", update.GetType().Name);
+            _logger.LogDebug(ex, "Unhandled stream event of type {Type}; could not serialize", update.GetType().Name);
         }
     }
 
     /// <summary>
     /// Serialize an unknown response item back to JSON for diagnostics.
     /// Captures the typed shape plus any unknown fields stored in <c>Patch</c>.
+    /// See <see cref="LogUnknownStreamEvent"/> for why this is Debug.
     /// </summary>
     private void LogUnknownItem(ResponseItem item)
     {
+        if (!_logger.IsEnabled(LogLevel.Debug)) return;
         try
         {
             var raw = System.ClientModel.Primitives.ModelReaderWriter.Write(item).ToString();
-            _logger.LogWarning("Unhandled output item ({Type}): {Raw}",
+            _logger.LogDebug("Unhandled output item ({Type}): {Raw}",
                 item.GetType().Name, Truncate(raw, 2000));
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Unhandled output item of type {Type}; could not serialize", item.GetType().Name);
+            _logger.LogDebug(ex, "Unhandled output item of type {Type}; could not serialize", item.GetType().Name);
         }
     }
 

@@ -121,17 +121,27 @@ public sealed class SdkStreamingMessageHelper
     public void StartHeartbeat(string? initialStatus = null, TimeSpan? interval = null)
     {
         if (!_enabled || _heartbeatTask is not null) return;
-        if (!string.IsNullOrWhiteSpace(initialStatus)) _heartbeatStatus = initialStatus;
+        // A non-null initialStatus becomes a sticky override; pass null to let
+        // the loop rotate through FallbackHeartbeatStatuses starting with
+        // "Thinking…". Callers that want variety must pass null here.
+        _heartbeatStatus = string.IsNullOrWhiteSpace(initialStatus) ? null : initialStatus;
         var period = interval ?? DefaultHeartbeatInterval;
         _heartbeatCts = new CancellationTokenSource();
         var token = _heartbeatCts.Token;
         _heartbeatTask = Task.Run(() => HeartbeatLoopAsync(period, token));
     }
 
+    /// <summary>
+    /// Set (or clear) the sticky informative-bar text used by the heartbeat
+    /// loop. Pass a non-null string to pin the bar to a live tool status
+    /// (e.g., "Calling get_weather…"). Pass <c>null</c> or whitespace to
+    /// CLEAR the override so the loop resumes rotating through
+    /// <see cref="FallbackHeartbeatStatuses"/>.
+    /// </summary>
     public void SetHeartbeatStatus(string? status)
     {
         if (!_enabled) return;
-        if (!string.IsNullOrWhiteSpace(status)) _heartbeatStatus = status;
+        _heartbeatStatus = string.IsNullOrWhiteSpace(status) ? null : status;
     }
 
     public async Task StopHeartbeatAsync()

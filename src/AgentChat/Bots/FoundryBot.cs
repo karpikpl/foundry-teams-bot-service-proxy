@@ -852,7 +852,10 @@ public class FoundryBot : TeamsActivityHandler
         // gaps before the first text delta and during tool round-trips. The
         // helper auto-suppresses pulses once text deltas start flowing and
         // resumes after each FinalizeAsync hop.
-        streaming.StartHeartbeat("Thinking…");
+        // Pass null so the loop rotates through the fallback statuses
+        // ("Thinking…" → "Working on it…" → "Still thinking…" → …) instead
+        // of locking on a single string.
+        streaming.StartHeartbeat();
 
         try
         {
@@ -1125,7 +1128,10 @@ public class FoundryBot : TeamsActivityHandler
                     IsError:     false));
             }
             _logger.LogInformation("Continuing Foundry response with {OutputCount} function output item(s).", outputs.Count);
-            streaming.SetHeartbeatStatus("Thinking…");
+            // Tool call completed — clear the sticky "Calling tool X…" status
+            // so the heartbeat rotates through the generic fallback list
+            // while the model reasons over the tool output.
+            streaming.SetHeartbeatStatus(null);
             return new StreamStep(false, outputs);
         }
 

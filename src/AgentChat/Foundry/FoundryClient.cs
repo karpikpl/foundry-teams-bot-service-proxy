@@ -63,6 +63,20 @@ public static class FoundryUserAuthScope
 /// to a stable per-end-user identifier. Value is the AAD object id of the
 /// signed-in Teams user (either the SSO OBO claim, or
 /// <c>Activity.From.AadObjectId</c> when SSO is not in use).
+///
+/// IMPORTANT: sending this header requires the calling identity (the
+/// container UAMI in MI mode, or the signed-in user in OBO mode) to hold the
+/// custom permission
+/// <c>Microsoft.CognitiveServices/accounts/AIServices/agents/endpoints/UserIdentityImpersonation/action</c>
+/// on the Foundry account. This action is not part of any built-in role and
+/// must be granted via a custom role, otherwise Foundry returns HTTP 403
+/// "Caller is not authorized to delegate to another user via the
+/// x-ms-user-identity header." See
+/// https://aka.ms/hostedagents/user_identity_impersonation.
+///
+/// Callers should therefore only open this scope when the operator has
+/// opted in (e.g. <c>Foundry:SendUserIdentityHeader=true</c>) and the role
+/// assignment is in place.
 /// </summary>
 public static class FoundryUserIdentityScope
 {

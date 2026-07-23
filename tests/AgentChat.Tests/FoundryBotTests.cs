@@ -332,8 +332,45 @@ public class FoundryBotTests
         responsesCreate.Body.Should().Contain("conversation");
         responsesCreate.Body.Should().NotContain("previous_response_id");
         (await store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
-        foundry.UserIdentityHeaders.Should().Contain("aad-user-1",
-            because: "the SSO turn resolved UserAuth.UserObjectId from Activity.From.AadObjectId and ApplyAuthScope must stamp it as x-ms-user-identity on Foundry calls");
+        foundry.UserIdentityHeaders.Should().OnlyContain(v => v == null,
+            because: "Foundry:SendUserIdentityHeader defaults to false; header must be off out-of-the-box to avoid HTTP 403 UserIdentityImpersonation errors when the calling identity lacks the custom role");
+    }
+
+    [Fact]
+    public async Task Sends_x_ms_user_identity_header_when_flag_enabled()
+    {
+        var sso = new FakeSsoService(token: "foundry-user-token");
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv_flag\"}");
+        foundry.EnqueueSse(
+            ResponseCreated("resp_flag"),
+            TextDelta("hi"),
+            ResponseCompleted("resp_flag"));
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(new KeyValuePair<string, string?>("Foundry:SendUserIdentityHeader", "true")),
+            new HttpContextAccessor(),
+            foundry.ToClientCache(agents),
+            sso,
+            NullLogger<FoundryBot>.Instance);
+        var adapter = new TestAdapter();
+        var convId = "conv-flag-on";
+        await store.SaveAsync(convId, new ConversationState { PendingSsoMessage = "hello" });
+
+        var turn = MakeInvokeTurn(adapter, convId, "signin/tokenExchange", JObject.FromObject(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        }));
+
+        await bot.InvokeAsync(turn);
+
+        foundry.UserIdentityHeaders.Should().Contain("aad-user-1");
     }
 
     [Fact]

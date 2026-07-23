@@ -18,19 +18,22 @@ public static class ManifestBuilder
     public const int MaxShortDescChars = 80;
     public const int MaxFullDescChars  = 4000;
 
+    // Teams caps bot.commandLists at 10 commands. Order = user-facing priority.
+    // Every entry must map to a real handler in FoundryBot.HandleCommandAsync.
+    // /reset is intentionally omitted — /new is the alias and both still work
+    // if typed.
     private static readonly (string title, string description)[] DefaultCommands =
     {
-        ("/agents",  "Pick a Foundry agent"),
-        ("/agent",   "Show active agent + project info"),
-        ("/tokens",  "Show token usage for this conversation"),
-        ("/usage",   "Toggle the per-run usage footer (on/off)"),
-        ("/auto",    "Manage auto-approved MCP tools (list/clear)"),
-        ("/reset",   "Start a fresh thread"),
-        ("/new",     "Alias for /reset"),
-        ("/stop",    "Cancel the running turn"),
-        ("/history", "Show recent turns"),
-        ("/upload",  "/upload <url> — add a URL to this thread's knowledge"),
-        ("/help",    "List commands")
+        ("/agents",   "Pick a Foundry agent"),
+        ("/agent",    "Show active agent + project info"),
+        ("/new",      "Start a fresh thread (alias: /reset)"),
+        ("/tokens",   "Show token usage for this conversation"),
+        ("/tools",    "Show or hide tool-call cards (on/off)"),
+        ("/thinking", "Show or hide live thinking status (on/off)"),
+        ("/auto",     "Manage auto-approved MCP tools (list/clear)"),
+        ("/stop",     "Cancel the running turn"),
+        ("/signout",  "Sign out (clears cached Teams SSO token)"),
+        ("/help",     "List commands")
     };
 
     public static JObject Build(

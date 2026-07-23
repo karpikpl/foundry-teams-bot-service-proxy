@@ -26,6 +26,7 @@ public static class ManifestBuilder
         ("/usage",   "Toggle the per-run usage footer (on/off)"),
         ("/auto",    "Manage auto-approved MCP tools (list/clear)"),
         ("/reset",   "Start a fresh thread"),
+        ("/new",     "Alias for /reset"),
         ("/stop",    "Cancel the running turn"),
         ("/history", "Show recent turns"),
         ("/upload",  "/upload <url> — add a URL to this thread's knowledge"),

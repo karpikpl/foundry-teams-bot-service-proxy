@@ -104,16 +104,53 @@ public class ManifestBuilderTests
     }
 
     [Fact]
-    public void Build_includes_command_list_with_help_and_reset()
+    public void Build_includes_command_list_with_help_and_new()
     {
         var m = ManifestBuilder.Build("Agent", "Desc", BotId);
         var commands = (JArray)m["bots"]![0]!["commandLists"]![0]!["commands"]!;
         var titles = commands.Select(c => c["title"]!.ToString()).ToArray();
         titles.Should().Contain("/help");
-        titles.Should().Contain("/reset");
+        titles.Should().Contain("/new");
         titles.Should().Contain("/agents");
         titles.Should().Contain("/agent");
         titles.Should().Contain("/tokens");
+    }
+
+    [Fact]
+    public void Build_command_list_respects_Teams_10_command_cap()
+    {
+        // Teams manifest schema caps bots[].commandLists[].commands at 10.
+        // Uploading a manifest with more than 10 fails validation with
+        // "bot can only have 10 commands".
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId);
+        var commands = (JArray)m["bots"]![0]!["commandLists"]![0]!["commands"]!;
+        commands.Count.Should().BeLessOrEqualTo(10);
+    }
+
+    [Fact]
+    public void Build_command_list_only_contains_implemented_commands()
+    {
+        // Every entry in the compose-box command menu must map to a real
+        // handler in FoundryBot.HandleCommandAsync — otherwise Teams users
+        // see "Unknown command /foo".
+        var handlerSource = System.IO.File.ReadAllText(
+            System.IO.Path.Combine(RepoRoot(), "src", "AgentChat", "Bots", "FoundryBot.cs"));
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId);
+        var commands = (JArray)m["bots"]![0]!["commandLists"]![0]!["commands"]!;
+        foreach (var c in commands)
+        {
+            var title = c["title"]!.ToString();
+            handlerSource.Should().Contain($"case \"{title}\":",
+                because: $"'{title}' is in the manifest command list but has no case in FoundryBot.HandleCommandAsync");
+        }
+    }
+
+    private static string RepoRoot()
+    {
+        var d = new System.IO.DirectoryInfo(AppContext.BaseDirectory);
+        while (d is not null && !System.IO.Directory.Exists(System.IO.Path.Combine(d.FullName, "src")))
+            d = d.Parent;
+        return d?.FullName ?? throw new System.IO.DirectoryNotFoundException("repo root");
     }
 
     [Fact]

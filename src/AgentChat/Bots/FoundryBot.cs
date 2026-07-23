@@ -145,12 +145,14 @@ public class FoundryBot : TeamsActivityHandler
                         ("/auto list|clear", "Manage auto-approved MCP tools"),
                         ("/signout",       "Sign out (clears cached Teams SSO token)"),
                         ("/reset",         "Start a new conversation (loses memory)"),
+                        ("/new",           "Alias for /reset"),
                         ("/stop",          "Cancel the running agent turn"),
                         ("/help",          "Show this card")
                     })), ct);
                 break;
 
             case "/reset":
+            case "/new":
                 await ResetConversationAsync(turnContext, state, ct);
                 break;
 

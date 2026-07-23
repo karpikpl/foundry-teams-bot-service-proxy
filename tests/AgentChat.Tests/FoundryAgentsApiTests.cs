@@ -14,6 +14,23 @@ public class FoundryAgentsApiTests
     }
 
     [Fact]
+    public void AgentNameFor_returns_agent_slug_from_composed_endpoint()
+    {
+        var project = "https://acct.services.ai.azure.com/api/projects/project-a";
+        var endpoint = FoundryAgentsApi.ComposeAgentEndpoint(project, "researcher");
+
+        FoundryAgentsApi.AgentNameFor(endpoint).Should().Be("researcher");
+    }
+
+    [Fact]
+    public void AgentNameFor_returns_null_for_null_empty_or_unshaped_input()
+    {
+        FoundryAgentsApi.AgentNameFor(null).Should().BeNull();
+        FoundryAgentsApi.AgentNameFor("").Should().BeNull();
+        FoundryAgentsApi.AgentNameFor("https://acct.services.ai.azure.com/api/projects/p/agents/x").Should().BeNull();
+    }
+
+    [Fact]
     public void ProjectEndpointFor_round_trips_composed_agent_endpoint()
     {
         var project = "https://acct.services.ai.azure.com/api/projects/project-a";

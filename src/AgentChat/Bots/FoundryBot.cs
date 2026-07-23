@@ -64,10 +64,7 @@ public class FoundryBot : TeamsActivityHandler
         ITurnContext<IConversationUpdateActivity> turnContext,
         CancellationToken cancellationToken)
     {
-        const string welcome =
-            "👋 Hi! I'm a Foundry-backed agent.\n\n" +
-            "**Commands:** `/agents` pick an agent · `/reset` new conversation · " +
-            "`/stop` cancel a run · `/help` this message.";
+        var welcome = BuildWelcomeMessage();
 
         foreach (var m in membersAdded)
         {
@@ -76,6 +73,45 @@ public class FoundryBot : TeamsActivityHandler
                 await turnContext.SendActivityAsync(MessageFactory.Text(welcome, welcome), cancellationToken);
             }
         }
+    }
+
+    /// <summary>
+    /// Compose the welcome text sent when a user is first added to the
+    /// conversation. Prefers the per-route agent name (set by
+    /// <see cref="Middleware.BotServiceJwtMiddleware"/> or inferred from the
+    /// routed Foundry endpoint) so the bot introduces itself by the correct
+    /// name in multi-agent deployments. Falls back to a generic phrasing when
+    /// nothing routed the request (e.g. default /api/messages, tests).
+    /// </summary>
+    internal string BuildWelcomeMessage()
+    {
+        var agentName = ResolveAgentDisplayName();
+        var intro = agentName is null
+            ? "👋 Hi! I'm a Foundry-hosted agent."
+            : $"👋 Hi! I'm **{agentName}**, a Foundry-hosted agent.";
+
+        return intro + "\n\n" +
+               "**Commands:** `/agents` pick another agent · " +
+               "`/new` start a fresh conversation · " +
+               "`/stop` cancel a run · " +
+               "`/help` list all commands.";
+    }
+
+    private string? ResolveAgentDisplayName()
+    {
+        var http = _httpContext.HttpContext;
+        if (http?.Items["AgentName"] is string routedName && !string.IsNullOrWhiteSpace(routedName))
+            return routedName;
+
+        var routedEndpoint = http?.Items[Controllers.BotMessagesController.AgentEndpointKey] as string;
+        var fromEndpoint   = FoundryAgentsApi.AgentNameFor(routedEndpoint);
+        if (!string.IsNullOrWhiteSpace(fromEndpoint))
+            return fromEndpoint;
+
+        // Unrouted / default endpoint: only use a name if the operator
+        // explicitly pinned one via config (single-agent deployments).
+        var configured = _config["AgentName"];
+        return string.IsNullOrWhiteSpace(configured) ? null : configured;
     }
 
     // ---------------------------------------------------------------- entry
@@ -632,16 +668,40 @@ public class FoundryBot : TeamsActivityHandler
     }
 
     /// <summary>
-    /// Activates <see cref="FoundryUserAuthScope"/> for the duration of the
-    /// returned <see cref="IDisposable"/>. MUST be called synchronously in the
-    /// caller's execution context — AsyncLocal mutations performed inside an
-    /// awaited helper method do NOT flow back to the caller, so the scope must
-    /// be opened at the same call-stack level that owns the <c>using</c> block.
+    /// Activates <see cref="FoundryUserAuthScope"/> (if a user OBO token is
+    /// present) and <see cref="FoundryUserIdentityScope"/> (if a user oid is
+    /// present) for the duration of the returned <see cref="IDisposable"/>.
+    /// MUST be called synchronously in the caller's execution context —
+    /// AsyncLocal mutations performed inside an awaited helper method do NOT
+    /// flow back to the caller, so the scope must be opened at the same
+    /// call-stack level that owns the <c>using</c> block.
     /// </summary>
     private static IDisposable ApplyAuthScope(UserAuth auth)
-        => string.IsNullOrEmpty(auth.UserToken)
-            ? NoopDisposable.Instance
+    {
+        var tokenScope    = string.IsNullOrEmpty(auth.UserToken)
+            ? (IDisposable)NoopDisposable.Instance
             : FoundryUserAuthScope.Use(auth.UserToken!);
+        var identityScope = string.IsNullOrEmpty(auth.UserObjectId)
+            ? (IDisposable)NoopDisposable.Instance
+            : FoundryUserIdentityScope.Use(auth.UserObjectId!);
+        return new CompositeDisposable(tokenScope, identityScope);
+    }
+
+    private sealed class CompositeDisposable : IDisposable
+    {
+        private readonly IDisposable _a;
+        private readonly IDisposable _b;
+        private bool _disposed;
+        public CompositeDisposable(IDisposable a, IDisposable b) { _a = a; _b = b; }
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            // Reverse order so identity scope pops before token scope, mirroring
+            // how nested `using` blocks would behave.
+            try { _b.Dispose(); } finally { _a.Dispose(); }
+        }
+    }
 
     /// <summary>
     /// Acquire a user-delegated Foundry token via Teams SSO and return a
@@ -657,11 +717,14 @@ public class FoundryBot : TeamsActivityHandler
     {
         if (_useManagedIdentityForAgents)
         {
-            // MI mode — no user identity flows to Foundry. Skip Teams SSO
+            // MI mode — no user OBO token flows to Foundry. Skip Teams SSO
             // entirely: no sign-in card, no OBO token. Downstream callers
             // (AgentService, FoundryClient) fall back to the container UAMI.
+            // We still capture the Teams user's AAD oid so the
+            // x-ms-user-identity header can be stamped on Foundry calls for
+            // per-user attribution/tracing.
             _logger.LogDebug("Foundry:UseManagedIdentityForAgents=true; skipping Teams SSO acquisition.");
-            return new UserAuth(false);
+            return new UserAuth(false, UserObjectId: turnContext.Activity.From?.AadObjectId);
         }
 
         if (!_sso.Enabled)

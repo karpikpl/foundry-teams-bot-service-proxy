@@ -60,6 +60,7 @@ internal sealed class RecordingFoundryHandler : HttpMessageHandler
     public List<(string Method, string Url, string Body)> Requests { get; } = new();
     public List<string?> ObservedUserAuthScopes { get; } = new();
     public List<string?> AuthorizationHeaders { get; } = new();
+    public List<string?> UserIdentityHeaders { get; } = new();
 
     public void EnqueueJson(HttpStatusCode status, string json)
         => _responders.Enqueue(_ => new HttpResponseMessage(status)
@@ -94,6 +95,9 @@ internal sealed class RecordingFoundryHandler : HttpMessageHandler
         Requests.Add((request.Method.Method, request.RequestUri!.ToString(), body));
         ObservedUserAuthScopes.Add(FoundryUserAuthScope.Current);
         AuthorizationHeaders.Add(request.Headers.Authorization?.ToString());
+        UserIdentityHeaders.Add(request.Headers.TryGetValues("x-ms-user-identity", out var vals)
+            ? string.Join(",", vals)
+            : null);
         if (_responders.Count == 0)
         {
             return new HttpResponseMessage(HttpStatusCode.NotFound)

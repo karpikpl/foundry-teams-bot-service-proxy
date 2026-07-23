@@ -38,6 +38,14 @@ public class FoundryBot : TeamsActivityHandler
     // read by AgentService.
     private readonly bool _useManagedIdentityForAgents;
 
+    // When true, stamp x-ms-user-identity: {oid} on outgoing Foundry calls so
+    // sessions/conversations are isolated per end user. Requires the calling
+    // identity to hold the custom action
+    // Microsoft.CognitiveServices/accounts/AIServices/agents/endpoints/UserIdentityImpersonation/action
+    // (see FoundryUserIdentityScope docs). Defaults to false so a fresh
+    // deployment doesn't hit HTTP 403 before the operator grants the role.
+    private readonly bool _sendUserIdentityHeader;
+
     public FoundryBot(
         AgentService agents,
         ConversationStore state,
@@ -55,6 +63,7 @@ public class FoundryBot : TeamsActivityHandler
         _sso         = sso;
         _logger      = logger;
         _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
+        _sendUserIdentityHeader      = config.GetValue("Foundry:SendUserIdentityHeader", false);
     }
 
     // ---------------------------------------------------------------- members added
@@ -670,18 +679,19 @@ public class FoundryBot : TeamsActivityHandler
     /// <summary>
     /// Activates <see cref="FoundryUserAuthScope"/> (if a user OBO token is
     /// present) and <see cref="FoundryUserIdentityScope"/> (if a user oid is
-    /// present) for the duration of the returned <see cref="IDisposable"/>.
-    /// MUST be called synchronously in the caller's execution context —
-    /// AsyncLocal mutations performed inside an awaited helper method do NOT
-    /// flow back to the caller, so the scope must be opened at the same
-    /// call-stack level that owns the <c>using</c> block.
+    /// present AND <c>Foundry:SendUserIdentityHeader</c> is enabled) for the
+    /// duration of the returned <see cref="IDisposable"/>. MUST be called
+    /// synchronously in the caller's execution context — AsyncLocal mutations
+    /// performed inside an awaited helper method do NOT flow back to the
+    /// caller, so the scope must be opened at the same call-stack level that
+    /// owns the <c>using</c> block.
     /// </summary>
-    private static IDisposable ApplyAuthScope(UserAuth auth)
+    private IDisposable ApplyAuthScope(UserAuth auth)
     {
         var tokenScope    = string.IsNullOrEmpty(auth.UserToken)
             ? (IDisposable)NoopDisposable.Instance
             : FoundryUserAuthScope.Use(auth.UserToken!);
-        var identityScope = string.IsNullOrEmpty(auth.UserObjectId)
+        var identityScope = (!_sendUserIdentityHeader || string.IsNullOrEmpty(auth.UserObjectId))
             ? (IDisposable)NoopDisposable.Instance
             : FoundryUserIdentityScope.Use(auth.UserObjectId!);
         return new CompositeDisposable(tokenScope, identityScope);

@@ -2,6 +2,7 @@ using AdaptiveCards;
 using AgentChat.Services;
 using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json.Linq;
+using System.Text.Json.Nodes;
 
 namespace AgentChat.Bots;
 
@@ -669,7 +670,7 @@ public static class AdaptiveCardBuilder
         };
 
     private static Attachment AsAttachment(AdaptiveCard card)
-        => new() { ContentType = AdaptiveCard.ContentType, Content = JObject.Parse(card.ToJson()) };
+        => new() { ContentType = AdaptiveCard.ContentType, Content = JsonNode.Parse(card.ToJson()) };
 
     private static string PrettyJson(string raw)
     {

@@ -57,6 +57,45 @@ public static class FoundryUserAuthScope
 }
 
 /// <summary>
+/// Per-request end-user identity scope. When set, <see cref="FoundryClient"/>
+/// stamps <c>x-ms-user-identity: {oid}</c> on every outgoing Foundry request
+/// so hosted agents (and downstream Foundry tracing) can attribute the call
+/// to a stable per-end-user identifier. Value is the AAD object id of the
+/// signed-in Teams user (either the SSO OBO claim, or
+/// <c>Activity.From.AadObjectId</c> when SSO is not in use).
+/// </summary>
+public static class FoundryUserIdentityScope
+{
+    private static readonly AsyncLocal<string?> _oid = new();
+
+    /// <summary>Current per-request end-user oid, or null if not set.</summary>
+    public static string? Current => _oid.Value;
+
+    public static IDisposable Use(string oid)
+    {
+        if (string.IsNullOrEmpty(oid))
+            throw new ArgumentException("oid is required", nameof(oid));
+
+        var previous = _oid.Value;
+        _oid.Value = oid;
+        return new Restore(previous);
+    }
+
+    private sealed class Restore : IDisposable
+    {
+        private readonly string? _previous;
+        private bool _disposed;
+        public Restore(string? previous) { _previous = previous; }
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _oid.Value = _previous;
+        }
+    }
+}
+
+/// <summary>
 /// Thin per-agent wrapper around the OpenAI .NET SDK, targeting a Foundry
 /// per-agent endpoint URL of the form:
 ///   <c>https://{host}/api/projects/{project}/agents/{agent}/endpoint/protocols/openai/v1</c>
@@ -94,8 +133,39 @@ public sealed class FoundryClient
             options.Transport = transport;
         }
         options.AddPolicy(new ApiVersionPolicy(apiVersion), PipelinePosition.PerCall);
+        options.AddPolicy(new UserIdentityHeaderPolicy(),   PipelinePosition.PerCall);
 
         OpenAI = new OpenAIClient(new EntraIdAuthenticationPolicy(credential, TokenScope), options);
+    }
+
+    /// <summary>Stamps <c>x-ms-user-identity: {oid}</c> on every outgoing
+    /// Foundry request when <see cref="FoundryUserIdentityScope"/> is set.
+    /// Header name matches Foundry's convention for stable per-end-user
+    /// attribution (used by hosted agents and tracing).</summary>
+    private sealed class UserIdentityHeaderPolicy : PipelinePolicy
+    {
+        public const string HeaderName = "x-ms-user-identity";
+
+        public override void Process(PipelineMessage message, IReadOnlyList<PipelinePolicy> pipeline, int currentIndex)
+        {
+            Stamp(message);
+            if (currentIndex < pipeline.Count - 1)
+                pipeline[currentIndex + 1].Process(message, pipeline, currentIndex + 1);
+        }
+
+        public override async ValueTask ProcessAsync(PipelineMessage message, IReadOnlyList<PipelinePolicy> pipeline, int currentIndex)
+        {
+            Stamp(message);
+            if (currentIndex < pipeline.Count - 1)
+                await pipeline[currentIndex + 1].ProcessAsync(message, pipeline, currentIndex + 1).ConfigureAwait(false);
+        }
+
+        private static void Stamp(PipelineMessage message)
+        {
+            var oid = FoundryUserIdentityScope.Current;
+            if (!string.IsNullOrEmpty(oid))
+                message.Request.Headers.Set(HeaderName, oid);
+        }
     }
 
     /// <summary>Adds <c>Authorization: Bearer &lt;token&gt;</c> using either the

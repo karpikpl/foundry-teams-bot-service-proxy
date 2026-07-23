@@ -332,6 +332,47 @@ public class FoundryBotTests
         responsesCreate.Body.Should().Contain("conversation");
         responsesCreate.Body.Should().NotContain("previous_response_id");
         (await store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
+        foundry.UserIdentityHeaders.Should().Contain("aad-user-1",
+            because: "the SSO turn resolved UserAuth.UserObjectId from Activity.From.AadObjectId and ApplyAuthScope must stamp it as x-ms-user-identity on Foundry calls");
+    }
+
+    [Fact]
+    public void Welcome_message_uses_agent_name_from_routed_HttpContext_Items()
+    {
+        var http = new HttpContextAccessor { HttpContext = new DefaultHttpContext() };
+        http.HttpContext!.Items["AgentName"] = "joe";
+        var bot = MakeBot(httpContext: http);
+
+        var text = bot.BuildWelcomeMessage();
+
+        text.Should().Contain("**joe**");
+        text.Should().Contain("`/new`");
+        text.Should().NotContain("/reset");
+        text.Should().NotContain("Foundry-backed agent",
+            because: "wording was updated to 'Foundry-hosted' to distinguish from Bot Framework's 'backed by' phrasing");
+    }
+
+    [Fact]
+    public void Welcome_message_infers_agent_name_from_routed_endpoint_when_AgentName_missing()
+    {
+        var http = new HttpContextAccessor { HttpContext = new DefaultHttpContext() };
+        http.HttpContext!.Items[Controllers.BotMessagesController.AgentEndpointKey] =
+            "https://foo.services.ai.azure.com/api/projects/p1/agents/researcher/endpoint/protocols/openai/v1";
+        var bot = MakeBot(httpContext: http);
+
+        bot.BuildWelcomeMessage().Should().Contain("**researcher**");
+    }
+
+    [Fact]
+    public void Welcome_message_falls_back_to_generic_intro_when_no_route_context()
+    {
+        var bot = MakeBot();
+
+        var text = bot.BuildWelcomeMessage();
+
+        text.Should().StartWith("👋 Hi! I'm a Foundry-hosted agent.");
+        text.Should().Contain("`/new`");
+        text.Should().NotContain("/reset");
     }
 
     private static string ResponseCreated(string id)
@@ -343,7 +384,7 @@ public class FoundryBotTests
     private static string ResponseCompleted(string id)
         => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";
 
-    private static SpyFoundryBot MakeBot(TeamsSsoService? sso = null, ILogger<FoundryBot>? logger = null)
+    private static SpyFoundryBot MakeBot(TeamsSsoService? sso = null, ILogger<FoundryBot>? logger = null, IHttpContextAccessor? httpContext = null)
     {
         var agents = TestServices.AgentService(new CatalogHandler("agent-a"));
         var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
@@ -351,7 +392,7 @@ public class FoundryBotTests
             agents,
             store,
             TestServices.Config(),
-            new HttpContextAccessor(),
+            httpContext ?? new HttpContextAccessor(),
             new AgentClientCache(agents),
             sso ?? new FakeSsoService(token: null),
             logger ?? NullLogger<FoundryBot>.Instance);

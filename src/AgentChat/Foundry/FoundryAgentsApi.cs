@@ -135,6 +135,27 @@ public static class FoundryAgentsApi
         return perAgentEndpoint.Substring(0, idx);
     }
 
+    /// <summary>
+    /// Inverse of <see cref="ComposeAgentEndpoint"/>: return the agent slug
+    /// (e.g. "joe") from a per-agent Foundry endpoint URL. Returns null if
+    /// the URL isn't shaped like one we composed.
+    /// </summary>
+    public static string? AgentNameFor(string? perAgentEndpoint)
+    {
+        if (string.IsNullOrEmpty(perAgentEndpoint)) return null;
+        const string Marker = "/agents/";
+        var idx = perAgentEndpoint.IndexOf(Marker, StringComparison.OrdinalIgnoreCase);
+        if (idx < 0) return null;
+        const string TailSuffix = "/endpoint/protocols/openai/v1";
+        var tail = perAgentEndpoint.Substring(idx + Marker.Length);
+        if (!tail.EndsWith(TailSuffix, StringComparison.OrdinalIgnoreCase))
+            return null;
+        var agentName = tail.Substring(0, tail.Length - TailSuffix.Length);
+        if (string.IsNullOrWhiteSpace(agentName) || agentName.Contains('/'))
+            return null;
+        return agentName;
+    }
+
     private static string Truncate(string s, int max)
         => s.Length > max ? s.Substring(0, max) + "…" : s;
 }

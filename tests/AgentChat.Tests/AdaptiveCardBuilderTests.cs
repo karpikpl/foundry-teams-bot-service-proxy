@@ -23,7 +23,7 @@ public class AdaptiveCardBuilderTests
     public void ApprovalCard_uses_attention_style_to_signal_security_action()
     {
         var att = MakeApproval();
-        var json = (JObject)att.Content;
+        var json = CardJson(att);
         StylesIn(json).Should().Contain("attention");
     }
 
@@ -36,7 +36,7 @@ public class AdaptiveCardBuilderTests
             approvalRequestId: "mcpr_123", conversationId: "conv_456");
 
         att.ContentType.Should().Be(AdaptiveCard.ContentType);
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var actions = (JArray)(CardJson(att))["actions"]!;
         actions.Should().HaveCount(2);
 
         actions.Select(a => ((JObject)a["data"]!)["approve"]!.Value<bool>())
@@ -56,7 +56,7 @@ public class AdaptiveCardBuilderTests
     public void ApprovalCard_action_titles_match_approve_flag(bool approve, string titleContains)
     {
         var att = MakeApproval();
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var actions = (JArray)(CardJson(att))["actions"]!;
         var act = actions.First(a => ((JObject)a["data"]!)["approve"]!.Value<bool>() == approve);
         act["title"]!.ToString().Should().Contain(titleContains);
     }
@@ -72,7 +72,7 @@ public class AdaptiveCardBuilderTests
     public void ApprovalCard_marks_approve_action_positive_and_deny_destructive()
     {
         var att = MakeApproval();
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var actions = (JArray)(CardJson(att))["actions"]!;
         var approve = actions.First(a => ((JObject)a["data"]!)["approve"]!.Value<bool>());
         var deny    = actions.First(a => !((JObject)a["data"]!)["approve"]!.Value<bool>());
 
@@ -143,7 +143,7 @@ public class AdaptiveCardBuilderTests
         ((JArray)input!["choices"]!).Should().HaveCount(3);
         input["value"]!.ToString().Should().Be("b");
 
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var actions = (JArray)(CardJson(att))["actions"]!;
         actions.Should().HaveCount(1);
         ((JObject)actions[0]!["data"]!)["action"]!.ToString().Should().Be("select_agent");
     }
@@ -175,7 +175,7 @@ public class AdaptiveCardBuilderTests
     public void CancelCard_has_cancel_action_with_response_metadata()
     {
         var att = AdaptiveCardBuilder.BuildCancelCard("conv_x", "resp_y");
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var actions = (JArray)(CardJson(att))["actions"]!;
         actions.Should().HaveCount(1);
         var data = (JObject)actions[0]!["data"]!;
         data["action"]!.ToString().Should().Be("cancel");
@@ -190,7 +190,7 @@ public class AdaptiveCardBuilderTests
     public void ConsentCard_uses_warning_style_and_renders_server_label()
     {
         var att = AdaptiveCardBuilder.BuildConsentCard("microsoft_learn", "https://consent.example/x", "conv_1");
-        StylesIn((JToken)att.Content).Should().Contain("warning");
+        StylesIn((JToken)CardJson(att)).Should().Contain("warning");
         AllText(att).Should().Contain(t => t.Contains("microsoft_learn"));
     }
 
@@ -214,7 +214,7 @@ public class AdaptiveCardBuilderTests
     public void ConsentCard_has_continue_and_cancel_submit_actions()
     {
         var att = AdaptiveCardBuilder.BuildConsentCard("srv", "https://consent.example/x", "conv_123");
-        var actions = (JArray)((JObject)att.Content)["actions"]!;
+        var actions = (JArray)(CardJson(att))["actions"]!;
         var submits = actions.OfType<JObject>().Where(a => a["type"]!.ToString() == "Action.Submit").ToList();
         submits.Should().HaveCount(2);
 
@@ -332,7 +332,16 @@ public class AdaptiveCardBuilderTests
         {
             att.ContentType.Should().Be(AdaptiveCard.ContentType);
             att.Content.Should().NotBeNull();
-            ((JObject)att.Content)["type"]!.ToString().Should().Be("AdaptiveCard");
+            (CardJson(att))["type"]!.ToString().Should().Be("AdaptiveCard");
+
+            // Regression: the outgoing activity is serialized by the M365
+            // Agents SDK via System.Text.Json. If Content is a Newtonsoft
+            // JObject/JToken, STJ emits its type shape (HasValues, Count, …)
+            // instead of the card JSON and Bot Service replies 400.
+            att.Content.Should().BeAssignableTo<System.Text.Json.Nodes.JsonNode>();
+            var stj = System.Text.Json.JsonSerializer.Serialize(att.Content);
+            stj.Should().Contain("\"type\":\"AdaptiveCard\"");
+            stj.Should().NotContain("HasValues");
         }
     }
 
@@ -369,7 +378,7 @@ public class AdaptiveCardBuilderTests
         {
             new("MCP", "x", "srv", "{}", "y", false)
         });
-        var root    = (JObject)att.Content;
+        var root    = CardJson(att);
         var details = FindById(root, "reasoningDetails");
         details.Should().NotBeNull();
         details!["isVisible"]!.Value<bool>().Should().BeFalse();
@@ -391,7 +400,7 @@ public class AdaptiveCardBuilderTests
         {
             new("MCP", "x", "srv", "{}", "y", false)
         });
-        var showBar = FindById((JObject)att.Content, "showStepsBar")!;
+        var showBar = FindById(CardJson(att), "showStepsBar")!;
         var act     = (JObject)((JArray)showBar["actions"]!)[0];
         act["type"]!.ToString().Should().Be("Action.ToggleVisibility");
         var targets = ((JArray)act["targetElements"]!).Cast<JObject>().ToList();
@@ -460,7 +469,7 @@ public class AdaptiveCardBuilderTests
         {
             new("MCP", "x", "srv", "{}", "ok", false)
         });
-        StylesIn((JToken)att.Content).Should().Contain("default");
+        StylesIn((JToken)CardJson(att)).Should().Contain("default");
     }
 
     private static JObject? FindById(JObject root, string id)
@@ -490,10 +499,18 @@ public class AdaptiveCardBuilderTests
     // ============================================================ helpers
 
     /// <summary>Recursively collects every visible text string from a card.</summary>
+    /// <summary>
+    /// Re-parses the outgoing card content (a <c>System.Text.Json.Nodes.JsonNode</c>)
+    /// through <c>Newtonsoft.Json</c> so existing tests can keep using the
+    /// familiar <c>JObject</c>/<c>JArray</c>/<c>JToken</c> API.
+    /// </summary>
+    private static JObject CardJson(Attachment att)
+        => JObject.Parse(((System.Text.Json.Nodes.JsonNode)att.Content!).ToJsonString());
+
     private static List<string> AllText(Attachment att)
     {
         var results = new List<string>();
-        Walk((JToken)att.Content, results);
+        Walk((JToken)CardJson(att), results);
         return results;
 
         static void Walk(JToken node, List<string> sink)
@@ -516,7 +533,7 @@ public class AdaptiveCardBuilderTests
     private static JObject? FindFirst(Attachment att, string adaptiveType)
     {
         JObject? hit = null;
-        Walk((JToken)att.Content);
+        Walk((JToken)CardJson(att));
         return hit;
 
         void Walk(JToken node)

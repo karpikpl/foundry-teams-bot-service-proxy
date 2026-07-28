@@ -6,7 +6,6 @@ using AgentChat.Passthrough;
 using AgentChat.Services;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.Agents.Authentication;
-using Microsoft.Agents.Authentication.Model;
 using Microsoft.Agents.Authentication.Msal;
 using Microsoft.Agents.Builder;
 using Microsoft.Agents.Hosting.AspNetCore;
@@ -74,46 +73,32 @@ builder.Services.AddSingleton<IStorage>(sp =>
 builder.Services.AddSingleton<ConversationStore>();
 
 // -----------------------------------------------------------------------------
+// Route registry — the persistent source of truth for which agent names this
+// proxy serves. Seeded from `Bots:Routes` config on first run, then mutable
+// at runtime via the admin registration UI. See Services/CosmosRouteRepository.
+// -----------------------------------------------------------------------------
+builder.Services.AddSingleton<IRouteRepository, CosmosRouteRepository>();
+
+// -----------------------------------------------------------------------------
 // Multi-bot outbound auth via Federated Identity Credentials (no per-bot secrets).
 //
-// We register one FicAccessTokenProvider PER bot appId (parsed from Bots:Routes)
-// and wire them into a programmatic ConfigurationConnections. The SDK's
-// per-outbound-call dispatch resolves the right provider from the claims
-// identity's appId via ConnectionMapItem.Audience matching. See
-// Auth/FicAccessTokenProvider.cs for the FIC flow itself.
+// DynamicConnections materializes one FicAccessTokenProvider per bot appId
+// on demand, keyed off IRouteRepository. This lets us pick up newly-registered
+// bots without a container restart. See Auth/DynamicConnections.cs and
+// Auth/FicAccessTokenProvider.cs for the FIC flow.
 // -----------------------------------------------------------------------------
 builder.Services.AddSingleton<IConnections>(sp =>
 {
     var cfg           = sp.GetRequiredService<IConfiguration>();
     var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
     var httpFactory   = sp.GetRequiredService<IHttpClientFactory>();
+    var routes        = sp.GetRequiredService<IRouteRepository>();
 
     var tenantId = cfg["MicrosoftAppTenantId"] ?? cfg["AZURE_TENANT_ID"]
         ?? throw new InvalidOperationException("MicrosoftAppTenantId not configured.");
     var uamiClientId = cfg["AZURE_CLIENT_ID"];
 
-    var routes = ParseRoutes(cfg["Bots:Routes"]);
-    var providers = new Dictionary<string, IAccessTokenProvider>(StringComparer.OrdinalIgnoreCase);
-    var mapItems  = new List<ConnectionMapItem>();
-    foreach (var r in routes)
-    {
-        var appId = r.EffectiveProxyAppId;
-        if (string.IsNullOrEmpty(appId) || providers.ContainsKey(appId)) continue;
-
-        providers[appId] = new FicAccessTokenProvider(
-            appId,
-            tenantId,
-            uamiClientId,
-            httpFactory.CreateClient(nameof(FicAccessTokenProvider)),
-            loggerFactory.CreateLogger<FicAccessTokenProvider>());
-
-        mapItems.Add(new ConnectionMapItem { Audience = appId, Connection = appId });
-    }
-
-    return new ConfigurationConnections(
-        providers,
-        mapItems,
-        loggerFactory.CreateLogger<ConfigurationConnections>());
+    return new DynamicConnections(routes, tenantId, uamiClientId, httpFactory, loggerFactory);
 });
 
 // Wire the M365 Agents SDK auth pipeline (JWT validation for inbound + token
@@ -160,6 +145,20 @@ app.MapHealthChecks("/health");
 
 var svc = app.Services.GetRequiredService<AgentService>();
 app.Logger.LogInformation("Configured Foundry project: {Endpoint}. Agent catalog will be discovered on first authenticated request.", svc.DefaultProjectEndpoint);
+
+// Hydrate the route registry from Cosmos, seeding from Bots:Routes if the
+// registry is empty. This has to happen after the WebApplication is built
+// so IStorage / ILogger are available, and before the first inbound
+// request reaches BotServiceJwtMiddleware.
+var routeRepo = (CosmosRouteRepository)app.Services.GetRequiredService<IRouteRepository>();
+var seedFromConfig = builder.Configuration.GetValue("Bots:SeedFromConfig", true);
+var seedRoutes = seedFromConfig
+    ? ParseRoutes(builder.Configuration["Bots:Routes"])
+        .Where(r => !string.IsNullOrEmpty(r.AgentName) && !string.IsNullOrEmpty(r.EffectiveProxyAppId))
+        .Select(r => new BotRoute(r.AgentName!, r.EffectiveProxyAppId!, r.DirectAppId))
+        .ToList()
+    : new List<BotRoute>();
+await routeRepo.LoadAsync(seedRoutes);
 
 app.Run();
 

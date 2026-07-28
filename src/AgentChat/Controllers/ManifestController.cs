@@ -25,10 +25,7 @@ public class ManifestController : ControllerBase
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<ManifestController> _logger;
     private readonly Microsoft.Identity.Web.ITokenAcquisition? _tokenAcquisition;
-    // Parsed Bots:Routes — keyed by agent name. Populated once at startup from
-    // the JSON injected by bicep. Lets the UI render Direct + Proxy buttons
-    // per agent without the operator having to copy bot IDs from the portal.
-    private readonly IReadOnlyDictionary<string, BotRoute> _routes;
+    private readonly IRouteRepository _routeRepo;
 
     public ManifestController(
         AgentService agents,
@@ -36,6 +33,7 @@ public class ManifestController : ControllerBase
         IConfiguration config,
         IWebHostEnvironment env,
         ILogger<ManifestController> logger,
+        IRouteRepository routeRepo,
         Microsoft.Identity.Web.ITokenAcquisition? tokenAcquisition = null)
     {
         _agents      = agents;
@@ -43,40 +41,8 @@ public class ManifestController : ControllerBase
         _config      = config;
         _env         = env;
         _logger      = logger;
+        _routeRepo   = routeRepo;
         _tokenAcquisition = tokenAcquisition;
-        _routes      = ParseRoutes(config["Bots:Routes"], logger);
-    }
-
-    private static IReadOnlyDictionary<string, BotRoute> ParseRoutes(string? json, ILogger logger)
-    {
-        var map = new Dictionary<string, BotRoute>(StringComparer.OrdinalIgnoreCase);
-        if (string.IsNullOrWhiteSpace(json)) return map;
-        try
-        {
-            var entries = System.Text.Json.JsonSerializer.Deserialize<List<BotRouteEntry>>(json)
-                          ?? new List<BotRouteEntry>();
-            foreach (var e in entries)
-            {
-                if (string.IsNullOrEmpty(e.AgentName)) continue;
-                var proxy = !string.IsNullOrEmpty(e.ProxyAppId) ? e.ProxyAppId : e.AppId;
-                map[e.AgentName] = new BotRoute(e.AgentName, proxy, e.DirectAppId);
-            }
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Bots:Routes could not be parsed; manifest UI will only show manual flow.");
-        }
-        return map;
-    }
-
-    private sealed record BotRoute(string AgentName, string? ProxyAppId, string? DirectAppId);
-
-    private sealed class BotRouteEntry
-    {
-        public string? AgentName { get; set; }
-        public string? ProxyAppId { get; set; }
-        public string? DirectAppId { get; set; }
-        public string? AppId { get; set; }
     }
 
     private sealed record FoundryUserContext(string ObjectId, string Token);
@@ -184,7 +150,7 @@ public class ManifestController : ControllerBase
         // to the legacy manual-entry form.
         var defaultEndpoint = _config["Foundry:ProjectEndpoint"] ?? "";
         TryDeriveFoundryHostAndProject(defaultEndpoint, out var defaultHost, out var defaultProject);
-        var isDefaultProject = _routes.Count > 0
+        var isDefaultProject = _routeRepo.GetAll().Count > 0
             && string.Equals(foundryHost, defaultHost, StringComparison.OrdinalIgnoreCase)
             && string.Equals(project, defaultProject, StringComparison.OrdinalIgnoreCase);
 
@@ -268,8 +234,9 @@ public class ManifestController : ControllerBase
         if (!IsKnownVariant(variant))
             return BadRequest($"variant must be 'direct' or 'proxy'; got '{variant}'.");
 
-        if (!_routes.TryGetValue(agentName, out var route))
-            return NotFound($"Agent '{agentName}' is not in Bots:Routes; use the manual form instead.");
+        var route = _routeRepo.TryGet(agentName);
+        if (route is null)
+            return NotFound($"Agent '{agentName}' is not registered; use the manual form instead.");
 
         var botId = variant.Equals("direct", StringComparison.OrdinalIgnoreCase)
             ? route.DirectAppId
@@ -488,6 +455,7 @@ public class ManifestController : ControllerBase
     <div class="actions">
       <button class="btn" data-action="chat">Open Browser Chat</button>
       <button class="btn" data-action="manifest">Generate Teams Manifest</button>
+      <a class="btn secondary" href="/admin/register">Register new agent</a>
     </div>
     {{chatAuthNote}}
   </section>
@@ -559,7 +527,7 @@ public class ManifestController : ControllerBase
         var rows = string.Join("", agents.Select(a =>
         {
             var nameSeg = Uri.EscapeDataString(a.Name);
-            _routes.TryGetValue(a.Name, out var route);
+            var route = _routeRepo.TryGet(a.Name);
             var direct = !string.IsNullOrEmpty(route?.DirectAppId)
                 ? $"<a class=\"btn\" href=\"/admin/{hostSeg}/{projSeg}/manifest/{nameSeg}/direct\">Direct ({Html(route!.DirectAppId)})</a>"
                 : "<span class=\"muted\">direct: no bot</span>";

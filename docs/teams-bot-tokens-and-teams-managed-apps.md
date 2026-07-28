@@ -239,27 +239,26 @@ Both jobs could in principle be answered from data already in the request:
 
 The current design keeps explicit per-agent entries because per-agent audience isolation is a real security property and because operations already provisions one AAD app per agent for direct-bot use. A tenant-scoped mode remains an option for future simplification and would be an opt-in flag rather than the default.
 
-Routes are startup-time configuration, not a database:
+Routes live in Cosmos, seeded from `Bots:Routes` on first run:
 
-- `Program.cs` reads `cfg["Bots:Routes"]` once and materializes providers plus the middleware allow-list ([`Program.cs` lines 76-100](../src/AgentChat/Program.cs#L76-L100)).
-- Changing agents means updating the `Bots:Routes` app setting and restarting the container. There is no runtime CRUD API.
+- On startup, `Program.cs` parses `cfg["Bots:Routes"]` into an initial seed and calls `CosmosRouteRepository.LoadAsync(seed)`. If the Cosmos document at key `routes/all` is empty, the seed is written and becomes the initial registry. If it already exists, the seed is ignored — Cosmos is the source of truth from that point on.
+- `BotServiceJwtMiddleware` consults `IRouteRepository.TryGet(agent)` per request, so routes added after startup take effect immediately (no container restart).
+- Outbound reply providers are lazily materialized by `DynamicConnections` (a custom `IConnections` impl): the first outbound reply for a new bot appId spins up a fresh `FicAccessTokenProvider` under a `ConcurrentDictionary.GetOrAdd` and caches it for the process lifetime.
 
-An admin UI that adds agents dynamically would need three pieces beyond what exists today:
+### Runtime registration UI
 
-1. A store for routes with a clear source-of-truth story. The recommended shape: keep the existing `Bots:Routes` JSON as a **seed** used only on first run, copy it into Cosmos, and treat Cosmos as the source of truth from that point on. Later config changes to `Bots:Routes` are ignored unless a re-seed is explicitly requested. Cosmos is already wired for other state, so adding a `Routes` collection is the low-cost path.
-2. `BotServiceJwtMiddleware` and the outbound provider registry rebuilt to resolve routes per request, or an explicit reload hook, so new agents are picked up without a restart.
-3. Automation for the per-agent AAD work: create the app registration, register the Azure Bot (or Teams-managed bot) with the right `messagingEndpoint`, and generate the Teams manifest. `ManifestController` already knows how to emit the manifest, so this is mostly wiring for the AAD/bot provisioning side.
+The admin site at `/admin/register` (guarded by `AdminChatAuthFilter`) lets an authenticated operator add a new agent without touching config. The flow is deliberately two-step:
 
-Every new agent added through the admin UI needs two prerequisites satisfied on the **proxy container's UAMI** before the agent can actually run end to end:
+1. `GET /admin/register` renders the form (agent name, proxy AppId, optional direct AppId, Foundry host/project).
+2. `POST /admin/register/preview` renders a checklist of the manual AAD/Foundry/FIC operations the operator must run themselves (via `az`). No state is changed.
+3. `POST /admin/register/confirm` writes the route to Cosmos via `IRouteRepository.UpsertAsync`, at which point the middleware and `DynamicConnections` start honoring it on the very next request.
 
-- **Foundry access.** The proxy UAMI must hold the right Foundry role on the target project (typically Azure AI User or Azure AI Developer, depending on which Foundry APIs the agent uses). Without it, `FoundryBot` will get 401/403 when calling Foundry as the container identity.
+Registration is a checklist rather than automation because the container UAMI generally does not — and should not — hold `Application.ReadWrite.All`. The two mandatory prerequisites the preview page walks the operator through are:
+
+- **Foundry access.** The proxy UAMI must hold Azure AI User (or equivalent) on the target Foundry project. Turns invoked through the proxy call Foundry as the container identity.
 - **FIC trust from the new bot app registration.** The new bot's AAD app registration must have a federated identity credential trusting this UAMI (`issuer = login.microsoftonline.com/{tenantId}/v2.0`, `subject = <UAMI object id>`, `audiences = [api://AzureADTokenExchange]`). Without it, `FicAccessTokenProvider` cannot mint outbound Bot Framework reply tokens for the new bot, and Teams will see the bot silently fail to respond.
 
-Both prerequisites are one-time, per-agent AAD/RBAC operations. When the registration feature ships, these prerequisites should live in the admin UI itself — inline on the registration form, either automated (using the signed-in admin's OBO token to call Graph and Azure ARM) or surfaced as a checklist with links. Keeping the guidance next to the action that needs it avoids the current split between the config file and separate docs; treat this note as the seed content for that UI copy.
-
-The current admin landing page (`GET /admin`, rendered by `ManifestController.Landing`) intentionally has no agent-registration card yet: agents are provisioned by infra, and the UI only lists what has been discovered. That is the right hook for the future feature.
-
-This is a real feature, not a config toggle, so until it lands the current recommendation is: keep `Bots:Routes` as the source of truth and provision agents through the same infra path that provisions the direct bots today.
+The admin landing page has a "Register new agent" button that links to this flow.
 
 
 

@@ -176,7 +176,8 @@ public class ChatTestController : ControllerBase
     /// the OpenAI SDK shapes:
     ///
     ///   event: text     — text delta chunk (data is the delta string, raw)
-    ///   event: tool     — MCP / function tool call (JSON: { tool, server, output })
+    ///   event: tool     — MCP, web-search, code-interpreter, or function call
+    ///                     (JSON: { kind, tool, server, args, output })
     ///   event: consent  — OAuth consent required (JSON: { serverLabel, consentLink })
     ///   event: approval — MCP tool-call approval required (JSON: { approval_request_id, server_label, tool_name, arguments_summary })
     ///   event: done     — final usage block (JSON: { inputTokens, outputTokens, totalTokens })
@@ -307,9 +308,6 @@ public class ChatTestController : ControllerBase
     {
         var seenIds = new HashSet<string>();
         var responseIdForResume = opts.PreviousResponseId;
-        var sawMcpToolCall = false;
-        var sawTextDelta = false;
-        var startedFromApprovalResponse = clearsPendingApproval;
         await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
         {
             switch (update)
@@ -328,14 +326,12 @@ public class ChatTestController : ControllerBase
                     break;
 
                 case StreamingResponseOutputTextDeltaUpdate d when !string.IsNullOrEmpty(d.Delta):
-                    sawTextDelta = true;
                     await WriteSseAsync("text", d.Delta!, ct);
                     break;
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     var item = done.Item;
                     if (item.Id is { } id && !seenIds.Add(id)) break;
-                    if (item is McpToolCallItem) sawMcpToolCall = true;
                     if (await HandleItemAsync(item, pendingKey, responseIdForResume, ct)) return new StreamStep(true);
                     break;
 
@@ -377,9 +373,11 @@ public class ChatTestController : ControllerBase
             }
         }
 
-        return sawMcpToolCall || (startedFromApprovalResponse && !sawTextDelta)
-            ? new StreamStep(false)
-            : new StreamStep(true);
+        // MCP tools execute server-side within this response. Once Foundry
+        // completes the stream, another POST would have no input and fail
+        // with missing_required_parameter. Only explicit approval responses
+        // start a new request, handled by StreamMessage before this call.
+        return new StreamStep(true);
     }
 
     private async Task<bool> HandleItemAsync(ResponseItem item, string pendingKey, string? responseIdForResume, CancellationToken ct)
@@ -397,6 +395,26 @@ public class ChatTestController : ControllerBase
                     tool   = mcp.ToolName,
                     server = mcp.ServerLabel,
                     output = Truncate(mcp.ToolOutput ?? mcp.Error?.ToString() ?? "(no output)", 2000)
+                }), ct);
+                return false;
+
+            case WebSearchCallResponseItem webSearch:
+                await WriteSseAsync("tool", JsonSerializer.Serialize(new
+                {
+                    kind = "web_search",
+                    tool = "web_search",
+                    args = ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
+                }), ct);
+                return false;
+
+            case CodeInterpreterCallResponseItem codeInterpreter:
+                var (code, output) = ExtractCodeInterpreterDetails(codeInterpreter);
+                await WriteSseAsync("tool", JsonSerializer.Serialize(new
+                {
+                    kind = "code_interpreter",
+                    tool = "code_interpreter",
+                    args = code ?? "(code unavailable)",
+                    output = output
                 }), ct);
                 return false;
 
@@ -422,6 +440,30 @@ public class ChatTestController : ControllerBase
                 }
                 return false;
         }
+    }
+
+    private static string? ExtractWebSearchQuery(WebSearchCallResponseItem item)
+    {
+        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
+        if (!doc.RootElement.TryGetProperty("action", out var action)) return null;
+        if (action.TryGetProperty("query", out var query) && query.ValueKind == JsonValueKind.String)
+            return query.GetString();
+        if (action.TryGetProperty("search_query", out var searchQuery) && searchQuery.ValueKind == JsonValueKind.String)
+            return searchQuery.GetString();
+        return null;
+    }
+
+    private static (string? Code, string? Output) ExtractCodeInterpreterDetails(CodeInterpreterCallResponseItem item)
+    {
+        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
+        var root = doc.RootElement;
+        var code = root.TryGetProperty("code", out var codeElement) && codeElement.ValueKind == JsonValueKind.String
+            ? codeElement.GetString()
+            : null;
+        var output = root.TryGetProperty("outputs", out var outputs) && outputs.ValueKind == JsonValueKind.Array
+            ? Truncate(outputs.GetRawText(), 2000)
+            : null;
+        return (code, output);
     }
 
     public static string PendingKey(string agentKey, string conversationId) => $"{agentKey}\n{conversationId}";

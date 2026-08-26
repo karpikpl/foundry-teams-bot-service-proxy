@@ -1,6 +1,7 @@
 using System.Net;
 using System.Security.Claims;
 using System.Text;
+using System.Text.Json;
 using AgentChat.Auth;
 using AgentChat.Controllers;
 using AgentChat.Foundry;
@@ -108,11 +109,11 @@ public class ChatTestControllerTests
             ResponseCompleted("resp_approval"));
         foundry.EnqueueSse(
             ResponseCreated("resp_tool_result"),
-            ResponseCompleted("resp_tool_result"));
-        foundry.EnqueueSse(
-            ResponseCreated("resp_final"),
+            WebSearchDone("ws_1", "dog breeds and characteristics"),
+            McpToolDone("mcp_1", "lookup", "srv", "tool says ok"),
+            CodeInterpreterDone("ci_1", "print('created dogs.pptx')", "created dogs.pptx"),
             TextDelta("tool says ok"),
-            ResponseCompleted("resp_final"));
+            ResponseCompleted("resp_tool_result"));
         var controller = MakeController(catalog, withHttpContext: true, clientCache: foundry.ToClientCache(service), service: service);
 
         await controller.StreamMessage(new ChatTestController.MessageRequest("agent-a", "conv-approval", "needs tool"), CancellationToken.None);
@@ -128,15 +129,24 @@ public class ChatTestControllerTests
         var second = await ReadResponseAsync(controller);
 
         second.Should().Contain("tool says ok");
+        var toolEvents = SseEventData(second, "tool")
+            .Select(data => JsonSerializer.Deserialize<Dictionary<string, string?>>(data)!)
+            .ToList();
+        toolEvents.Should().Contain(tool =>
+            tool["kind"] == "web_search" &&
+            tool["args"] == "dog breeds and characteristics");
+        toolEvents.Should().Contain(tool =>
+            tool["kind"] == "code_interpreter" &&
+            tool["args"] == "print('created dogs.pptx')" &&
+            tool["output"]!.Contains("created dogs.pptx"));
         var responseRequests = foundry.Requests.Where(r => r.Method == "POST" && r.Url.Contains("/responses")).ToList();
-        responseRequests.Should().HaveCount(3);
+        responseRequests.Should().HaveCount(2);
         responseRequests[0].Body.Should().Contain("conversation");
         responseRequests[0].Body.Should().Contain("needs tool");
         responseRequests[1].Body.Should().Contain("previous_response_id");
         responseRequests[1].Body.Should().Contain("resp_approval");
         responseRequests[1].Body.Should().Contain("mcp_approval_response");
-        responseRequests[2].Body.Should().Contain("previous_response_id");
-        responseRequests[2].Body.Should().Contain("resp_tool_result");
+        responseRequests[1].Body.Should().Contain("\"input\"");
     }
 
     [Fact]
@@ -311,11 +321,32 @@ public class ChatTestControllerTests
         return await reader.ReadToEndAsync();
     }
 
+    private static IEnumerable<string> SseEventData(string response, string eventName)
+    {
+        foreach (var block in response.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+        {
+            var lines = block.Split('\n');
+            if (!lines.Contains($"event: {eventName}")) continue;
+            yield return string.Join('\n', lines
+                .Where(line => line.StartsWith("data: ", StringComparison.Ordinal))
+                .Select(line => line[6..]));
+        }
+    }
+
     private static string ResponseCreated(string id)
         => $"{{\"type\":\"response.created\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"in_progress\",\"output\":[]}}}}";
 
     private static string TextDelta(string text)
         => $"{{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\"}}";
+
+    private static string McpToolDone(string id, string tool, string server, string output)
+        => $"{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{id}\",\"type\":\"mcp_call\",\"name\":\"{tool}\",\"server_label\":\"{server}\",\"arguments\":\"{{}}\",\"output\":\"{output}\"}}}}";
+
+    private static string WebSearchDone(string id, string query)
+        => $"{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{id}\",\"type\":\"web_search_call\",\"status\":\"completed\",\"action\":{{\"type\":\"search\",\"query\":\"{query}\"}}}}}}";
+
+    private static string CodeInterpreterDone(string id, string code, string output)
+        => $"{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{id}\",\"type\":\"code_interpreter_call\",\"status\":\"completed\",\"container_id\":\"cntr_1\",\"code\":\"{code.Replace("'", "\\u0027")}\",\"outputs\":[{{\"type\":\"logs\",\"logs\":\"{output}\"}}]}}}}";
 
     private static string ResponseCompleted(string id)
         => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";

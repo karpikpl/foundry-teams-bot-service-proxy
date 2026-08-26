@@ -335,6 +335,16 @@
         scrollToBottom();
         break;
       }
+      case 'file_error': {
+        const f = JSON.parse(data);
+        const warning = document.createElement('div');
+        warning.className = 'bubble agent err';
+        warning.textContent = `⚠️ ${String(f.message || 'The generated file could not be downloaded.')}` +
+          (f.fileName ? ` (${String(f.fileName)})` : '');
+        messages.insertBefore(warning, agentBubble.parentElement);
+        scrollToBottom();
+        break;
+      }
       case 'error':
         agentBubble.classList.add('err');
         agentBubble.textContent = data;

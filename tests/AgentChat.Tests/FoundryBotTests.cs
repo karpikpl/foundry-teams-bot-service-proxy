@@ -212,7 +212,7 @@ public class FoundryBotTests
         attachment.ContentUrl.Should().StartWith("https://proxy.example/api/files/");
         foundry.Requests.Should().Contain(r =>
             r.Method == "GET" &&
-            r.Url.Contains("/containers/cntr_teams/files/cfile_teams/content"));
+            r.Url.Contains("/api/projects/default-project/openai/v1/containers/cntr_teams/files/cfile_teams/content"));
     }
 
     [Fact]

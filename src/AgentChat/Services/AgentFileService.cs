@@ -221,7 +221,7 @@ public sealed class AgentFileService
             BufferResponse = false,
             CancellationToken = cancellationToken
         };
-        var result = await foundry.OpenAI.GetContainerClient()
+        var result = await foundry.ProjectOpenAI.GetContainerClient()
             .DownloadContainerFileAsync(annotation.ContainerId, annotation.FileId, options);
         using var response = result.GetRawResponse();
         if (response.Headers.TryGetValue("Content-Length", out var contentLength) &&

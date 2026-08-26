@@ -494,12 +494,29 @@ public class ChatTestController : ControllerBase
                             continue;
                         }
 
-                        var generatedFile = await _files.CaptureContainerFileAsync(
-                            foundry,
-                            file,
-                            AgentFileService.PublicBaseUri(HttpContext?.Request),
-                            ct);
-                        await WriteSseAsync("file", JsonSerializer.Serialize(generatedFile), ct);
+                        try
+                        {
+                            var generatedFile = await _files.CaptureContainerFileAsync(
+                                foundry,
+                                file,
+                                AgentFileService.PublicBaseUri(HttpContext?.Request),
+                                ct);
+                            await WriteSseAsync("file", JsonSerializer.Serialize(generatedFile), ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(
+                                ex,
+                                "Could not capture generated container file {FileName} ({ContainerId}/{FileId})",
+                                file.Filename,
+                                file.ContainerId,
+                                file.FileId);
+                            await WriteSseAsync("file_error", JsonSerializer.Serialize(new
+                            {
+                                fileName = file.Filename,
+                                message = "The generated file could not be downloaded."
+                            }), ct);
+                        }
                     }
                 }
                 return false;

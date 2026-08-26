@@ -233,12 +233,41 @@ public class ChatTestControllerTests
         downloadUrl.Host.Should().Be("chat.example");
         foundry.Requests.Should().Contain(r =>
             r.Method == "GET" &&
-            r.Url.Contains("/containers/cntr_1/files/cfile_1/content"));
+            r.Url.Contains("/api/projects/default-project/openai/v1/containers/cntr_1/files/cfile_1/content"));
 
         var token = downloadUrl.Segments[^2].Trim('/');
         fileService.TryGetDownload(token, out var download).Should().BeTrue();
         download.Content.Should().Equal(generatedBytes);
         download.ContentType.Should().Be("application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    }
+
+    [Fact]
+    public async Task Generated_file_download_failure_does_not_discard_completed_response()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueSse(
+            ResponseCreated("resp_generated"),
+            TextDelta("Your presentation is ready."),
+            GeneratedFileMessageDone("msg_generated", "cntr_missing", "cfile_missing", "slides.pptx"),
+            ResponseCompleted("resp_generated"));
+        foundry.EnqueueJson(HttpStatusCode.NotFound, "{\"error\":{\"message\":\"not found\"}}");
+        var controller = MakeController(
+            catalog,
+            withHttpContext: true,
+            clientCache: foundry.ToClientCache(service),
+            service: service);
+
+        await controller.StreamMessage(
+            new ChatTestController.MessageRequest("agent-a", "conv-file-404", "create slides"),
+            CancellationToken.None);
+
+        var sse = await ReadResponseAsync(controller);
+        sse.Should().Contain("event: text\ndata: Your presentation is ready.");
+        sse.Should().Contain("event: file_error");
+        sse.Should().Contain("event: done");
+        sse.Should().NotContain("event: error");
     }
 
     [Fact]

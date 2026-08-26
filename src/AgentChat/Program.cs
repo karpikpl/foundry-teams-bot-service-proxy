@@ -41,12 +41,19 @@ if (adminChatAuth.Enabled)
 }
 builder.Services.AddApplicationInsightsTelemetry();
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient(nameof(TeamsAttachmentService))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false
+    });
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddHealthChecks();
 
 builder.Services.AddSingleton<AgentService>();
 builder.Services.AddSingleton<AgentClientCache>();
 builder.Services.AddSingleton<TeamsSsoService>();
+builder.Services.AddSingleton<AgentFileService>();
+builder.Services.AddSingleton<ITeamsAttachmentService, TeamsAttachmentService>();
 // IStorage — Cosmos serverless via AAD (no keys).
 builder.Services.AddSingleton<IStorage>(sp =>
 {
@@ -185,4 +192,3 @@ internal sealed class RouteEntry
     public string? EffectiveProxyAppId =>
         !string.IsNullOrEmpty(ProxyAppId) ? ProxyAppId : AppId;
 }
-

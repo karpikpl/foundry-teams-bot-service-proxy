@@ -44,6 +44,7 @@ public class ChatTestController : ControllerBase
 
     private readonly AgentService _agents;
     private readonly AgentClientCache _clientCache;
+    private readonly AgentFileService _files;
     private readonly IWebHostEnvironment _env;
     private readonly ILogger<ChatTestController> _logger;
     private readonly AdminChatAuthOptions _adminChatAuth;
@@ -52,6 +53,7 @@ public class ChatTestController : ControllerBase
     public ChatTestController(
         AgentService agents,
         AgentClientCache clientCache,
+        AgentFileService files,
         IWebHostEnvironment env,
         ILogger<ChatTestController> logger,
         AdminChatAuthOptions? adminChatAuth = null,
@@ -59,6 +61,7 @@ public class ChatTestController : ControllerBase
     {
         _agents           = agents;
         _clientCache      = clientCache;
+        _files            = files;
         _env              = env;
         _logger           = logger;
         _adminChatAuth    = adminChatAuth ?? new AdminChatAuthOptions();
@@ -168,6 +171,15 @@ public class ChatTestController : ControllerBase
 
     public sealed record ApprovalRequest(string RequestId, bool Approve);
     public sealed record MessageRequest(string AgentKey, string ConversationId, string? Message, string? FoundryHost = null, string? Project = null, ApprovalRequest? Approval = null);
+    public sealed class FileMessageRequest
+    {
+        public string AgentKey { get; init; } = "";
+        public string ConversationId { get; init; } = "";
+        public string? Message { get; init; }
+        public string? FoundryHost { get; init; }
+        public string? Project { get; init; }
+        public List<IFormFile> Files { get; init; } = [];
+    }
 
     /// <summary>
     /// POST the user's message and stream the response back as Server-Sent
@@ -180,19 +192,54 @@ public class ChatTestController : ControllerBase
     ///                     (JSON: { kind, tool, server, args, output })
     ///   event: consent  — OAuth consent required (JSON: { serverLabel, consentLink })
     ///   event: approval — MCP tool-call approval required (JSON: { approval_request_id, server_label, tool_name, arguments_summary })
+    ///   event: file     — generated file (JSON: { fileName, contentType, size, url })
     ///   event: done     — final usage block (JSON: { inputTokens, outputTokens, totalTokens })
     ///   event: error    — error (data: human-readable message)
     /// </summary>
     [HttpPost("messages")]
+    [Consumes("application/json")]
     public async Task StreamMessage([FromBody] MessageRequest body, CancellationToken ct)
+        => await StreamMessageCoreAsync(body, [], ct);
+
+    [HttpPost("messages")]
+    [Consumes("multipart/form-data")]
+    [RequestSizeLimit(60L * 1024 * 1024)]
+    public async Task StreamMessageWithFiles([FromForm] FileMessageRequest body, CancellationToken ct)
+    {
+        try
+        {
+            var inputFiles = await _files.ReadFormFilesAsync(body.Files, ct);
+            await StreamMessageCoreAsync(
+                new MessageRequest(
+                    body.AgentKey,
+                    body.ConversationId,
+                    body.Message,
+                    body.FoundryHost,
+                    body.Project),
+                inputFiles,
+                ct);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Response.Headers["Content-Type"] = "text/event-stream";
+            await WriteSseAsync("error", ex.Message, ct);
+        }
+    }
+
+    private async Task StreamMessageCoreAsync(
+        MessageRequest body,
+        IReadOnlyList<AgentInputFile> inputFiles,
+        CancellationToken ct)
     {
         Response.Headers["Content-Type"]      = "text/event-stream";
         Response.Headers["Cache-Control"]     = "no-cache";
         Response.Headers["X-Accel-Buffering"] = "no";
 
-        if (string.IsNullOrEmpty(body?.AgentKey) || string.IsNullOrEmpty(body.ConversationId) || (string.IsNullOrEmpty(body.Message) && body.Approval is null))
+        if (string.IsNullOrEmpty(body?.AgentKey) ||
+            string.IsNullOrEmpty(body.ConversationId) ||
+            (string.IsNullOrWhiteSpace(body.Message) && body.Approval is null && inputFiles.Count == 0))
         {
-            await WriteSseAsync("error", "agentKey, conversationId, and either message or approval are required", ct);
+            await WriteSseAsync("error", "agentKey, conversationId, and a message, attachment, or approval are required", ct);
             return;
         }
 
@@ -236,7 +283,7 @@ public class ChatTestController : ControllerBase
         }
         else
         {
-            inputItems = new[] { ResponseItem.CreateUserMessageItem(body.Message!) };
+            inputItems = new[] { _files.CreateUserMessage(body.Message, inputFiles) };
         }
 
         // Stream the response. A user turn binds the Foundry conversation only
@@ -255,7 +302,7 @@ public class ChatTestController : ControllerBase
                 }
 
                 var opts = BuildResponseOptions(body.ConversationId, pendingKey, inputItems, firstPreviousResponseId);
-                var step = await StreamFoundryOnceAsync(responses, opts, pendingKey, clearApprovalOnNextStream, ct);
+                var step = await StreamFoundryOnceAsync(foundry, responses, opts, pendingKey, clearApprovalOnNextStream, ct);
                 clearApprovalOnNextStream = false;
                 if (step.Stop) return;
                 inputItems = step.NextInputItems;
@@ -300,6 +347,7 @@ public class ChatTestController : ControllerBase
     }
 
     private async Task<StreamStep> StreamFoundryOnceAsync(
+        FoundryClient foundry,
         ResponsesClient responses,
         CreateResponseOptions opts,
         string pendingKey,
@@ -307,6 +355,7 @@ public class ChatTestController : ControllerBase
         CancellationToken ct)
     {
         var seenIds = new HashSet<string>();
+        var seenFiles = new HashSet<string>(StringComparer.Ordinal);
         var responseIdForResume = opts.PreviousResponseId;
         await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
         {
@@ -332,7 +381,8 @@ public class ChatTestController : ControllerBase
                 case StreamingResponseOutputItemDoneUpdate done:
                     var item = done.Item;
                     if (item.Id is { } id && !seenIds.Add(id)) break;
-                    if (await HandleItemAsync(item, pendingKey, responseIdForResume, ct)) return new StreamStep(true);
+                    if (await HandleItemAsync(foundry, item, pendingKey, responseIdForResume, seenFiles, ct))
+                        return new StreamStep(true);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -380,7 +430,13 @@ public class ChatTestController : ControllerBase
         return new StreamStep(true);
     }
 
-    private async Task<bool> HandleItemAsync(ResponseItem item, string pendingKey, string? responseIdForResume, CancellationToken ct)
+    private async Task<bool> HandleItemAsync(
+        FoundryClient foundry,
+        ResponseItem item,
+        string pendingKey,
+        string? responseIdForResume,
+        HashSet<string> seenFiles,
+        CancellationToken ct)
     {
         switch (item)
         {
@@ -425,6 +481,27 @@ public class ChatTestController : ControllerBase
                     tool = fc.FunctionName,
                     args = fc.FunctionArguments?.ToString() ?? "{}"
                 }), ct);
+                return false;
+
+            case MessageResponseItem message:
+                foreach (var part in message.Content)
+                {
+                    foreach (var annotation in part.OutputTextAnnotations ?? [])
+                    {
+                        if (annotation is not ContainerFileCitationMessageAnnotation file ||
+                            !seenFiles.Add($"{file.ContainerId}\n{file.FileId}"))
+                        {
+                            continue;
+                        }
+
+                        var generatedFile = await _files.CaptureContainerFileAsync(
+                            foundry,
+                            file,
+                            AgentFileService.PublicBaseUri(HttpContext?.Request),
+                            ct);
+                        await WriteSseAsync("file", JsonSerializer.Serialize(generatedFile), ct);
+                    }
+                }
                 return false;
 
             default:

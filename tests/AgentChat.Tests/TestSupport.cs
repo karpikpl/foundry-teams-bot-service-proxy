@@ -83,6 +83,17 @@ internal sealed class RecordingFoundryHandler : HttpMessageHandler
             };
         });
 
+    public void EnqueueBinary(byte[] content, string contentType = "application/octet-stream")
+        => _responders.Enqueue(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new ByteArrayContent(content)
+            };
+            response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue(contentType);
+            return response;
+        });
+
     public AgentClientCache ToClientCache(AgentService agents)
         => new(agents, endpoint => new FoundryClient(
             endpoint,

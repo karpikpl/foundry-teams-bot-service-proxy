@@ -146,7 +146,7 @@ public class BotServiceJwtMiddlewareTests
     }
 
     [Fact]
-    public async Task Disabled_when_expected_aud_not_configured()
+    public async Task Empty_registry_rejects_unknown_agent_with_404()
     {
         var nextCalled = false;
         var ctx = MakeContext(MessagesPath, authHeader: null);
@@ -154,7 +154,8 @@ public class BotServiceJwtMiddlewareTests
 
         await m.InvokeAsync(ctx);
 
-        nextCalled.Should().BeTrue();
+        nextCalled.Should().BeFalse();
+        ctx.Response.StatusCode.Should().Be(StatusCodes.Status404NotFound);
     }
 
     // --- helpers ---
@@ -165,12 +166,18 @@ public class BotServiceJwtMiddlewareTests
         {
             ["MicrosoftAppTenantId"] = TenantId,
         };
-        if (expectedAud != null) settings["Bots:Routes"] = RoutesJson;
         var cfg = new ConfigurationBuilder().AddInMemoryCollection(settings).Build();
+
+        var routes = new InMemoryRouteRepository();
+        if (expectedAud != null)
+        {
+            routes.AddSync(new AgentChat.Services.BotRoute("agent1", expectedAud));
+        }
 
         return new BotServiceJwtMiddleware(
             next ?? (_ => Task.CompletedTask),
             cfg,
+            routes,
             NullLogger<BotServiceJwtMiddleware>.Instance);
     }
 

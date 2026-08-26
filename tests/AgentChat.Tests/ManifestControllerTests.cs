@@ -93,6 +93,7 @@ public class ManifestControllerTests
             TestServices.Config(),
             env.Object,
             NullLogger<ManifestController>.Instance,
+            new InMemoryRouteRepository(),
             tokenAcquisition.Object);
         controller.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() };
         controller.HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity(new[]

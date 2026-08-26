@@ -152,13 +152,41 @@ app.Logger.LogInformation("Configured Foundry project: {Endpoint}. Agent catalog
 // request reaches BotServiceJwtMiddleware.
 var routeRepo = (CosmosRouteRepository)app.Services.GetRequiredService<IRouteRepository>();
 var seedFromConfig = builder.Configuration.GetValue("Bots:SeedFromConfig", true);
+// Fall back to the default project when a Bots:Routes entry doesn't
+// specify FoundryHost/ProjectName — most deployments have all agents in
+// one project, and the admin UI needs *something* to show.
+var defaultProjectEndpoint = builder.Configuration["Foundry:ProjectEndpoint"];
+TryDeriveDefaultHostAndProject(defaultProjectEndpoint, out var defaultHost, out var defaultProject);
 var seedRoutes = seedFromConfig
     ? ParseRoutes(builder.Configuration["Bots:Routes"])
         .Where(r => !string.IsNullOrEmpty(r.AgentName) && !string.IsNullOrEmpty(r.EffectiveProxyAppId))
-        .Select(r => new BotRoute(r.AgentName!, r.EffectiveProxyAppId!, r.DirectAppId))
+        .Select(r => new BotRoute(
+            r.AgentName!,
+            r.EffectiveProxyAppId!,
+            r.DirectAppId,
+            FoundryHost: string.IsNullOrEmpty(r.FoundryHost) ? defaultHost : r.FoundryHost,
+            ProjectName: string.IsNullOrEmpty(r.ProjectName) ? defaultProject : r.ProjectName))
         .ToList()
     : new List<BotRoute>();
 await routeRepo.LoadAsync(seedRoutes);
+
+// Backfill: rows persisted before Bots:Routes carried project metadata
+// have empty FoundryHost/ProjectName. Fill them in-place from the default
+// so the admin UI has something to display and manifest links resolve.
+if (!string.IsNullOrEmpty(defaultHost) && !string.IsNullOrEmpty(defaultProject))
+{
+    foreach (var r in routeRepo.GetAll())
+    {
+        if (string.IsNullOrEmpty(r.FoundryHost) || string.IsNullOrEmpty(r.ProjectName))
+        {
+            await routeRepo.UpsertAsync(r with
+            {
+                FoundryHost = string.IsNullOrEmpty(r.FoundryHost) ? defaultHost : r.FoundryHost,
+                ProjectName = string.IsNullOrEmpty(r.ProjectName) ? defaultProject : r.ProjectName,
+            });
+        }
+    }
+}
 
 app.Run();
 
@@ -175,12 +203,30 @@ static List<RouteEntry> ParseRoutes(string? json)
     }
 }
 
+static void TryDeriveDefaultHostAndProject(string? endpoint, out string host, out string project)
+{
+    host = ""; project = "";
+    if (string.IsNullOrWhiteSpace(endpoint)) return;
+    try
+    {
+        var uri = new Uri(endpoint);
+        var dot = uri.Host.IndexOf('.');
+        host = dot > 0 ? uri.Host[..dot] : uri.Host;
+        var segs = uri.AbsolutePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var idx = Array.IndexOf(segs, "projects");
+        if (idx >= 0 && idx + 1 < segs.Length) project = segs[idx + 1];
+    }
+    catch { /* leave as empty */ }
+}
+
 internal sealed class RouteEntry
 {
     public string? AgentName { get; set; }
     public string? ProxyAppId { get; set; }
     public string? DirectAppId { get; set; }
     public string? AppId { get; set; }
+    public string? FoundryHost { get; set; }
+    public string? ProjectName { get; set; }
 
     public string? EffectiveProxyAppId =>
         !string.IsNullOrEmpty(ProxyAppId) ? ProxyAppId : AppId;

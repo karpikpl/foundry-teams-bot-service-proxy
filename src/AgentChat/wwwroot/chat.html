@@ -243,7 +243,8 @@
         card.className = 'tool-card';
         card.innerHTML =
           `<div class="head">🔧 ${t.kind} · ${t.tool}${t.server ? ` <span style="opacity:.6">on ${t.server}</span>` : ''}</div>` +
-          (t.output ? `<pre>${escapeHtml(t.output)}</pre>` : t.args ? `<pre>${escapeHtml(t.args)}</pre>` : '');
+          (t.args ? `<div>Input</div><pre>${escapeHtml(t.args)}</pre>` : '') +
+          (t.output ? `<div>Output</div><pre>${escapeHtml(t.output)}</pre>` : '');
         messages.insertBefore(card, agentBubble.parentElement);
         scrollToBottom();
         break;

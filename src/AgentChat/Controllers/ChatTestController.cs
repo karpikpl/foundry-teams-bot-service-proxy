@@ -176,7 +176,8 @@ public class ChatTestController : ControllerBase
     /// the OpenAI SDK shapes:
     ///
     ///   event: text     — text delta chunk (data is the delta string, raw)
-    ///   event: tool     — MCP / function tool call (JSON: { tool, server, output })
+    ///   event: tool     — MCP, web-search, code-interpreter, or function call
+    ///                     (JSON: { kind, tool, server, args, output })
     ///   event: consent  — OAuth consent required (JSON: { serverLabel, consentLink })
     ///   event: approval — MCP tool-call approval required (JSON: { approval_request_id, server_label, tool_name, arguments_summary })
     ///   event: done     — final usage block (JSON: { inputTokens, outputTokens, totalTokens })
@@ -397,6 +398,26 @@ public class ChatTestController : ControllerBase
                 }), ct);
                 return false;
 
+            case WebSearchCallResponseItem webSearch:
+                await WriteSseAsync("tool", JsonSerializer.Serialize(new
+                {
+                    kind = "web_search",
+                    tool = "web_search",
+                    args = ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
+                }), ct);
+                return false;
+
+            case CodeInterpreterCallResponseItem codeInterpreter:
+                var (code, output) = ExtractCodeInterpreterDetails(codeInterpreter);
+                await WriteSseAsync("tool", JsonSerializer.Serialize(new
+                {
+                    kind = "code_interpreter",
+                    tool = "code_interpreter",
+                    args = code ?? "(code unavailable)",
+                    output = output
+                }), ct);
+                return false;
+
             case FunctionCallResponseItem fc:
                 await WriteSseAsync("tool", JsonSerializer.Serialize(new
                 {
@@ -419,6 +440,30 @@ public class ChatTestController : ControllerBase
                 }
                 return false;
         }
+    }
+
+    private static string? ExtractWebSearchQuery(WebSearchCallResponseItem item)
+    {
+        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
+        if (!doc.RootElement.TryGetProperty("action", out var action)) return null;
+        if (action.TryGetProperty("query", out var query) && query.ValueKind == JsonValueKind.String)
+            return query.GetString();
+        if (action.TryGetProperty("search_query", out var searchQuery) && searchQuery.ValueKind == JsonValueKind.String)
+            return searchQuery.GetString();
+        return null;
+    }
+
+    private static (string? Code, string? Output) ExtractCodeInterpreterDetails(CodeInterpreterCallResponseItem item)
+    {
+        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
+        var root = doc.RootElement;
+        var code = root.TryGetProperty("code", out var codeElement) && codeElement.ValueKind == JsonValueKind.String
+            ? codeElement.GetString()
+            : null;
+        var output = root.TryGetProperty("outputs", out var outputs) && outputs.ValueKind == JsonValueKind.Array
+            ? Truncate(outputs.GetRawText(), 2000)
+            : null;
+        return (code, output);
     }
 
     public static string PendingKey(string agentKey, string conversationId) => $"{agentKey}\n{conversationId}";

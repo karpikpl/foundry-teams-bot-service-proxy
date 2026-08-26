@@ -307,9 +307,6 @@ public class ChatTestController : ControllerBase
     {
         var seenIds = new HashSet<string>();
         var responseIdForResume = opts.PreviousResponseId;
-        var sawMcpToolCall = false;
-        var sawTextDelta = false;
-        var startedFromApprovalResponse = clearsPendingApproval;
         await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
         {
             switch (update)
@@ -328,14 +325,12 @@ public class ChatTestController : ControllerBase
                     break;
 
                 case StreamingResponseOutputTextDeltaUpdate d when !string.IsNullOrEmpty(d.Delta):
-                    sawTextDelta = true;
                     await WriteSseAsync("text", d.Delta!, ct);
                     break;
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     var item = done.Item;
                     if (item.Id is { } id && !seenIds.Add(id)) break;
-                    if (item is McpToolCallItem) sawMcpToolCall = true;
                     if (await HandleItemAsync(item, pendingKey, responseIdForResume, ct)) return new StreamStep(true);
                     break;
 
@@ -377,9 +372,11 @@ public class ChatTestController : ControllerBase
             }
         }
 
-        return sawMcpToolCall || (startedFromApprovalResponse && !sawTextDelta)
-            ? new StreamStep(false)
-            : new StreamStep(true);
+        // MCP tools execute server-side within this response. Once Foundry
+        // completes the stream, another POST would have no input and fail
+        // with missing_required_parameter. Only explicit approval responses
+        // start a new request, handled by StreamMessage before this call.
+        return new StreamStep(true);
     }
 
     private async Task<bool> HandleItemAsync(ResponseItem item, string pendingKey, string? responseIdForResume, CancellationToken ct)

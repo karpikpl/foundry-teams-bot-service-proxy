@@ -1614,11 +1614,25 @@ public class FoundryBot : TeamsActivityHandler
                             continue;
                         }
 
-                        generatedFiles.Add(await _files.CaptureContainerFileAsync(
-                            foundry,
-                            containerFile,
-                            AgentFileService.PublicBaseUri(_httpContext.HttpContext?.Request),
-                            ct));
+                        try
+                        {
+                            generatedFiles.Add(await _files.CaptureContainerFileAsync(
+                                foundry,
+                                containerFile,
+                                AgentFileService.PublicBaseUri(_httpContext.HttpContext?.Request),
+                                ct));
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(
+                                ex,
+                                "Could not capture generated container file {FileName} ({ContainerId}/{FileId})",
+                                containerFile.Filename,
+                                containerFile.ContainerId,
+                                containerFile.FileId);
+                            streaming.AppendDelta(
+                                $"\n\n⚠️ The generated file `{containerFile.Filename}` could not be downloaded.");
+                        }
                     }
                 }
                 break;

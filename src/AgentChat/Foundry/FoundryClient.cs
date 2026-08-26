@@ -132,12 +132,26 @@ public sealed class FoundryClient
 
     public string Endpoint { get; }
     public OpenAIClient OpenAI { get; }
+    public OpenAIClient ProjectOpenAI { get; }
 
     public FoundryClient(string endpoint, TokenCredential credential, string apiVersion = DefaultApiVersion, PipelineTransport? transport = null)
     {
         if (!endpoint.EndsWith("/")) endpoint += "/";
         Endpoint = endpoint;
+        OpenAI = CreateClient(endpoint, credential, transport, apiVersion);
 
+        var projectEndpoint = FoundryAgentsApi.ProjectEndpointFor(endpoint.TrimEnd('/'));
+        ProjectOpenAI = projectEndpoint is null
+            ? OpenAI
+            : CreateClient($"{projectEndpoint.TrimEnd('/')}/openai/v1/", credential, transport, apiVersion: null);
+    }
+
+    private static OpenAIClient CreateClient(
+        string endpoint,
+        TokenCredential credential,
+        PipelineTransport? transport,
+        string? apiVersion)
+    {
         var options = new OpenAIClientOptions
         {
             Endpoint = new Uri(endpoint)
@@ -146,10 +160,11 @@ public sealed class FoundryClient
         {
             options.Transport = transport;
         }
-        options.AddPolicy(new ApiVersionPolicy(apiVersion), PipelinePosition.PerCall);
+        if (!string.IsNullOrEmpty(apiVersion))
+            options.AddPolicy(new ApiVersionPolicy(apiVersion), PipelinePosition.PerCall);
         options.AddPolicy(new UserIdentityHeaderPolicy(),   PipelinePosition.PerCall);
 
-        OpenAI = new OpenAIClient(new EntraIdAuthenticationPolicy(credential, TokenScope), options);
+        return new OpenAIClient(new EntraIdAuthenticationPolicy(credential, TokenScope), options);
     }
 
     /// <summary>Stamps <c>x-ms-user-identity: {oid}</c> on every outgoing

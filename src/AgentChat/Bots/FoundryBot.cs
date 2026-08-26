@@ -32,6 +32,8 @@ public class FoundryBot : TeamsActivityHandler
     private readonly AgentClientCache _clientCache;
     private readonly TeamsSsoService _sso;
     private readonly ILogger<FoundryBot> _logger;
+    private readonly AgentFileService _files;
+    private readonly ITeamsAttachmentService? _attachments;
     // When true, Foundry calls use the container UAMI, not the user's OBO
     // token. Teams SSO is skipped for the whole turn (no sign-in card, no
     // per-user identity in Foundry). Keep this in sync with the same setting
@@ -53,7 +55,9 @@ public class FoundryBot : TeamsActivityHandler
         IHttpContextAccessor httpContext,
         AgentClientCache clientCache,
         TeamsSsoService sso,
-        ILogger<FoundryBot> logger)
+        ILogger<FoundryBot> logger,
+        AgentFileService? files = null,
+        ITeamsAttachmentService? attachments = null)
     {
         _agents      = agents;
         _state       = state;
@@ -62,6 +66,8 @@ public class FoundryBot : TeamsActivityHandler
         _clientCache = clientCache;
         _sso         = sso;
         _logger      = logger;
+        _files       = files ?? new AgentFileService(config);
+        _attachments = attachments;
         _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
         _sendUserIdentityHeader      = config.GetValue("Foundry:SendUserIdentityHeader", false);
     }
@@ -139,7 +145,10 @@ public class FoundryBot : TeamsActivityHandler
             turnContext.Activity.RemoveRecipientMention();
 
         var raw = (turnContext.Activity.Text ?? "").Trim();
-        if (string.IsNullOrEmpty(raw))
+        var hasAttachments = turnContext.Activity.Attachments?.Any(
+            attachment => !string.IsNullOrWhiteSpace(attachment.ContentType) &&
+                          !attachment.ContentType.StartsWith(ContentTypes.Html, StringComparison.OrdinalIgnoreCase)) == true;
+        if (string.IsNullOrEmpty(raw) && !hasAttachments)
         {
             if (turnContext.Activity.Value is not null)
             {
@@ -166,7 +175,39 @@ public class FoundryBot : TeamsActivityHandler
             return;
         }
 
-        await RunAgentTurnAsync(turnContext, state, raw, ct);
+        IReadOnlyList<AgentInputFile> inputFiles = [];
+        if (hasAttachments)
+        {
+            if (_attachments is null)
+            {
+                await turnContext.SendActivityAsync(
+                    MessageFactory.Text("⚠️ File attachments are not configured on this bot."), ct);
+                return;
+            }
+
+            try
+            {
+                inputFiles = await _attachments.DownloadAsync(turnContext, ct);
+                if (inputFiles.Count == 0)
+                {
+                    await turnContext.SendActivityAsync(
+                        MessageFactory.Text("⚠️ I couldn't download the attached files from Teams."), ct);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to download Teams attachments.");
+                await turnContext.SendActivityAsync(
+                    MessageFactory.Text($"⚠️ I couldn't read the attached files: {ex.Message}"), ct);
+                return;
+            }
+        }
+
+        var effectiveText = string.IsNullOrWhiteSpace(raw)
+            ? "Use the attached file(s) to complete this request."
+            : raw;
+        await RunAgentTurnAsync(turnContext, state, effectiveText, ct, inputFiles: inputFiles);
     }
 
     // ---------------------------------------------------------------- commands
@@ -723,7 +764,11 @@ public class FoundryBot : TeamsActivityHandler
     /// re-trigger via the <c>signin/tokenExchange</c> invoke handler.
     /// </summary>
     private async Task<UserAuth> TryAcquireUserAuthAsync(
-        ITurnContext turnContext, ConversationState state, string? pendingMessage, CancellationToken ct)
+        ITurnContext turnContext,
+        ConversationState state,
+        string? pendingMessage,
+        CancellationToken ct,
+        IReadOnlyList<AgentInputFile>? pendingFiles = null)
     {
         if (_useManagedIdentityForAgents)
         {
@@ -767,8 +812,21 @@ public class FoundryBot : TeamsActivityHandler
         // an interactive Sign In button otherwise.
         if (!string.IsNullOrEmpty(pendingMessage))
         {
+            var previousMessage = state.PendingSsoMessage;
             state.PendingSsoMessage = pendingMessage;
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+            try
+            {
+                _files.StorePendingFiles(
+                    turnContext.Activity.Conversation.Id,
+                    pendingFiles ?? []);
+            }
+            catch
+            {
+                state.PendingSsoMessage = previousMessage;
+                await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+                throw;
+            }
             _logger.LogInformation("Stored pending Teams SSO message for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
         }
         _logger.LogInformation("Sending Teams SSO sign-in card for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
@@ -828,23 +886,31 @@ public class FoundryBot : TeamsActivityHandler
         ConversationState state,
         string userText,
         CancellationToken ct,
-        string? userTokenOverride = null)
+        string? userTokenOverride = null,
+        IReadOnlyList<AgentInputFile>? inputFiles = null)
     {
         var activityId = EnsureActivityId(turnContext);
         using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
 
         var auth = string.IsNullOrEmpty(userTokenOverride)
-            ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct)
+            ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct, inputFiles)
             : new UserAuth(false, userTokenOverride, turnContext.Activity.From?.AadObjectId);
-        if (!auth.ShouldProceed) return;
+        if (!auth.ShouldProceed)
+            return;
 
         using (ApplyAuthScope(auth))
         {
-            await RunAgentTurnInnerAsync(turnContext, state, userText, auth, ct);
+            await RunAgentTurnInnerAsync(turnContext, state, userText, inputFiles ?? [], auth, ct);
         }
     }
 
-    private async Task RunAgentTurnInnerAsync(ITurnContext turnContext, ConversationState state, string userText, UserAuth auth, CancellationToken ct)
+    private async Task RunAgentTurnInnerAsync(
+        ITurnContext turnContext,
+        ConversationState state,
+        string userText,
+        IReadOnlyList<AgentInputFile> inputFiles,
+        UserAuth auth,
+        CancellationToken ct)
     {
         var activityId = EnsureActivityId(turnContext);
         using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
@@ -898,7 +964,12 @@ public class FoundryBot : TeamsActivityHandler
 
         _logger.LogInformation("Calling RunAgentTurnAsync for conversation {ConversationId}; current response id: {ResponseId}",
             state.ConversationId, state.CurrentResponseId ?? "(none)");
-        await StreamResponseLoopAsync(turnContext, state, foundry, ct, new[] { ResponseItem.CreateUserMessageItem(userText) });
+        await StreamResponseLoopAsync(
+            turnContext,
+            state,
+            foundry,
+            ct,
+            new[] { _files.CreateUserMessage(userText, inputFiles) });
     }
 
     // ---------------------------------------------------------------- streaming loop
@@ -1064,6 +1135,8 @@ public class FoundryBot : TeamsActivityHandler
         var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
         var citations            = new List<UrlCitation>();
+        var generatedFiles       = new List<GeneratedFileLink>();
+        var seenGeneratedFiles   = new HashSet<string>(StringComparer.Ordinal);
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
@@ -1094,8 +1167,9 @@ public class FoundryBot : TeamsActivityHandler
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
-                        turnContext, state, streaming, done.Item, responseIdForResume,
-                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, citations, ct);
+                        turnContext, state, foundry, streaming, done.Item, responseIdForResume,
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, citations,
+                        generatedFiles, seenGeneratedFiles, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -1401,6 +1475,17 @@ public class FoundryBot : TeamsActivityHandler
             streaming.AppendDelta(sb.ToString());
         }
         await streaming.FinalizeAsync(ct);
+        foreach (var file in generatedFiles)
+        {
+            var activity = MessageFactory.Attachment(new Attachment
+            {
+                Name = file.FileName,
+                ContentType = file.ContentType,
+                ContentUrl = file.Url
+            });
+            activity.Text = $"📄 Generated file: [{file.FileName}]({file.Url})";
+            await turnContext.SendActivityAsync(activity, ct);
+        }
         if (state.ShowUsage && state.LastTotalTokens > 0)
         {
             await turnContext.SendActivityAsync(
@@ -1417,6 +1502,7 @@ public class FoundryBot : TeamsActivityHandler
     private async Task HandleCompletedItemAsync(
         ITurnContext turnContext,
         ConversationState state,
+        Foundry.FoundryClient foundry,
         SdkStreamingMessageHelper streaming,
         ResponseItem item,
         string? responseIdForResume,
@@ -1426,6 +1512,8 @@ public class FoundryBot : TeamsActivityHandler
         HashSet<string> seenIds,
         List<ThinkingStep> steps,
         List<UrlCitation> citations,
+        List<GeneratedFileLink> generatedFiles,
+        HashSet<string> seenGeneratedFiles,
         CancellationToken ct)
     {
         if (item.Id is { } id && !seenIds.Add(id)) return; // de-dup repeated done events for the same item
@@ -1514,6 +1602,24 @@ public class FoundryBot : TeamsActivityHandler
                 catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "Failed to extract citations from MessageResponseItem");
+                }
+
+                foreach (var part in msgItem.Content)
+                {
+                    foreach (var annotation in part.OutputTextAnnotations ?? [])
+                    {
+                        if (annotation is not ContainerFileCitationMessageAnnotation containerFile ||
+                            !seenGeneratedFiles.Add($"{containerFile.ContainerId}\n{containerFile.FileId}"))
+                        {
+                            continue;
+                        }
+
+                        generatedFiles.Add(await _files.CaptureContainerFileAsync(
+                            foundry,
+                            containerFile,
+                            AgentFileService.PublicBaseUri(_httpContext.HttpContext?.Request),
+                            ct));
+                    }
                 }
                 break;
 
@@ -2034,6 +2140,12 @@ public class FoundryBot : TeamsActivityHandler
 
         _logger.LogInformation("Calling RunAgentTurnAsync with replayed message of length {Length}", pending.Length);
         await SendTypingAsync(turnContext, ct);
-        await RunAgentTurnAsync(turnContext, state, pending, ct, userTokenOverride: userToken);
+        await RunAgentTurnAsync(
+            turnContext,
+            state,
+            pending,
+            ct,
+            userTokenOverride: userToken,
+            inputFiles: _files.TakePendingFiles(convId));
     }
 }

@@ -42,12 +42,19 @@
   .approval-card .deny{background:#cf222e;color:#fff}
   .err{color:#cf222e;font-size:13px;background:#ffebe9;border:1px solid #ff8182;border-radius:6px;padding:8px 12px;margin:8px 0}
   .usage{font-size:11px;color:#8b949e;text-align:center;margin:8px 0}
-  .composer{display:flex;gap:8px;padding:12px 20px;border-top:1px solid #d0d7de;background:#fff;flex-shrink:0}
+  .file-card{background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:10px 14px;margin:8px 0;font-size:13px}
+  .file-card a{color:#0969da;font-weight:600;text-decoration:none}
+  .file-card a:hover{text-decoration:underline}
+  .composer{display:flex;gap:8px;padding:12px 20px;border-top:1px solid #d0d7de;background:#fff;flex-shrink:0;align-items:flex-end}
   .composer textarea{flex:1;padding:10px 12px;border:1px solid #d0d7de;border-radius:8px;font-size:14px;font-family:inherit;resize:none;height:44px;max-height:160px;line-height:1.4}
   .composer textarea:focus{outline:none;border-color:#0969da}
   .composer button{background:#0969da;color:#fff;border:0;padding:0 20px;border-radius:8px;font-weight:600;cursor:pointer;font-size:14px}
   .composer button:hover{background:#0550ae}
   .composer button:disabled{background:#d0d7de;color:#8b949e;cursor:not-allowed}
+  .attach{border:1px solid #d0d7de;border-radius:8px;padding:10px 12px;cursor:pointer;font-size:18px;line-height:22px;background:#f6f8fa}
+  .attach:hover{background:#eef1f4}
+  .attach input{display:none}
+  .selected-files{padding:0 20px 8px;color:#57606a;font-size:12px;background:#fff}
   .empty{text-align:center;color:#8b949e;padding:40px;font-size:14px}
 </style>
 </head>
@@ -69,8 +76,10 @@
   <div class="messages" id="messages">
     <div class="empty">Pick an agent and send a message to start.</div>
   </div>
+  <div class="selected-files" id="selectedFiles"></div>
   <form class="composer" id="composer">
-    <textarea id="input" placeholder="Type a message…" required></textarea>
+    <label class="attach" title="Attach files">📎<input id="fileInput" type="file" multiple></label>
+    <textarea id="input" placeholder="Type a message or attach files…"></textarea>
     <button type="submit" id="sendBtn">Send</button>
   </form>
 </div>
@@ -82,6 +91,8 @@
   const composer = document.getElementById('composer');
   const input    = document.getElementById('input');
   const sendBtn  = document.getElementById('sendBtn');
+  const fileInput = document.getElementById('fileInput');
+  const selectedFiles = document.getElementById('selectedFiles');
   const resetBtn = document.getElementById('resetBtn');
   const userChip = document.getElementById('userChip');
   const userName = document.getElementById('userName');
@@ -166,7 +177,8 @@
   composer.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = input.value.trim();
-    if (!text) return;
+    const files = Array.from(fileInput.files || []);
+    if (!text && files.length === 0) return;
     if (pendingApproval) {
       appendError('MCP approval pending — please Approve or Deny first.');
       return;
@@ -174,21 +186,36 @@
     const agentKey = picker.value;
     sendBtn.disabled = true;
     input.value = '';
+    fileInput.value = '';
+    updateSelectedFiles();
 
     // Clear placeholder
     if (messages.querySelector('.empty')) messages.innerHTML = '';
 
-    appendUser(text);
+    appendUser(text, files);
     const agentBubble = appendAgentPlaceholder();
 
     try {
       await ensureConversation(agentKey);
 
-      const r = await fetch('/admin/chat/messages', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ agentKey, conversationId: convState.conversationId, message: text, ...scopePayload })
-      });
+      let request;
+      if (files.length > 0) {
+        const form = new FormData();
+        form.append('agentKey', agentKey);
+        form.append('conversationId', convState.conversationId);
+        if (text) form.append('message', text);
+        if (foundryHost) form.append('foundryHost', foundryHost);
+        if (project) form.append('project', project);
+        files.forEach(file => form.append('files', file, file.name));
+        request = { method: 'POST', body: form };
+      } else {
+        request = {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ agentKey, conversationId: convState.conversationId, message: text, ...scopePayload })
+        };
+      }
+      const r = await fetch('/admin/chat/messages', request);
 
       if (!r.ok || !r.body) {
         agentBubble.classList.add('err');
@@ -295,6 +322,19 @@
         scrollToBottom();
         break;
       }
+      case 'file': {
+        const f = JSON.parse(data);
+        const card = document.createElement('div');
+        card.className = 'file-card';
+        const size = Number(f.Size || f.size || 0);
+        const name = String(f.FileName || f.fileName || 'download');
+        const url = String(f.Url || f.url || '');
+        card.innerHTML = `📄 <a href="${escapeAttr(url)}" download="${escapeAttr(name)}">${escapeHtml(name)}</a>` +
+          (size ? ` <span style="color:#8b949e">(${formatBytes(size)})</span>` : '');
+        messages.insertBefore(card, agentBubble.parentElement);
+        scrollToBottom();
+        break;
+      }
       case 'error':
         agentBubble.classList.add('err');
         agentBubble.textContent = data;
@@ -348,10 +388,12 @@
     }
   }
 
-  function appendUser(text) {
+  function appendUser(text, files = []) {
     const m = document.createElement('div');
     m.className = 'msg user';
-    m.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
+    const fileText = files.length ? files.map(f => `📎 ${f.name}`).join('\n') : '';
+    const content = [text, fileText].filter(Boolean).join('\n');
+    m.innerHTML = `<div class="bubble">${escapeHtml(content)}</div>`;
     messages.appendChild(m);
     scrollToBottom();
   }
@@ -380,7 +422,19 @@
   }
   function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function escapeAttr(s) { return escapeHtml(s); }
+  function formatBytes(bytes) {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  }
+  function updateSelectedFiles() {
+    const files = Array.from(fileInput.files || []);
+    selectedFiles.textContent = files.length
+      ? files.map(f => `${f.name} (${formatBytes(f.size)})`).join(' · ')
+      : '';
+  }
 
+  fileInput.addEventListener('change', updateSelectedFiles);
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();

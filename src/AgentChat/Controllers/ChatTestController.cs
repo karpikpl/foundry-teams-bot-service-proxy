@@ -450,6 +450,7 @@ public class ChatTestController : ControllerBase
                     kind   = "mcp",
                     tool   = mcp.ToolName,
                     server = mcp.ServerLabel,
+                    args   = mcp.ToolArguments?.ToString() ?? "{}",
                     output = Truncate(mcp.ToolOutput ?? mcp.Error?.ToString() ?? "(no output)", 2000)
                 }), ct);
                 return false;
@@ -459,12 +460,12 @@ public class ChatTestController : ControllerBase
                 {
                     kind = "web_search",
                     tool = "web_search",
-                    args = ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
+                    args = ToolCallPresentation.ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
                 }), ct);
                 return false;
 
             case CodeInterpreterCallResponseItem codeInterpreter:
-                var (code, output) = ExtractCodeInterpreterDetails(codeInterpreter);
+                var (code, output) = ToolCallPresentation.ExtractCodeInterpreterDetails(codeInterpreter);
                 await WriteSseAsync("tool", JsonSerializer.Serialize(new
                 {
                     kind = "code_interpreter",
@@ -534,30 +535,6 @@ public class ChatTestController : ControllerBase
                 }
                 return false;
         }
-    }
-
-    private static string? ExtractWebSearchQuery(WebSearchCallResponseItem item)
-    {
-        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
-        if (!doc.RootElement.TryGetProperty("action", out var action)) return null;
-        if (action.TryGetProperty("query", out var query) && query.ValueKind == JsonValueKind.String)
-            return query.GetString();
-        if (action.TryGetProperty("search_query", out var searchQuery) && searchQuery.ValueKind == JsonValueKind.String)
-            return searchQuery.GetString();
-        return null;
-    }
-
-    private static (string? Code, string? Output) ExtractCodeInterpreterDetails(CodeInterpreterCallResponseItem item)
-    {
-        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
-        var root = doc.RootElement;
-        var code = root.TryGetProperty("code", out var codeElement) && codeElement.ValueKind == JsonValueKind.String
-            ? codeElement.GetString()
-            : null;
-        var output = root.TryGetProperty("outputs", out var outputs) && outputs.ValueKind == JsonValueKind.Array
-            ? Truncate(outputs.GetRawText(), 2000)
-            : null;
-        return (code, output);
     }
 
     public static string PendingKey(string agentKey, string conversationId) => $"{agentKey}\n{conversationId}";

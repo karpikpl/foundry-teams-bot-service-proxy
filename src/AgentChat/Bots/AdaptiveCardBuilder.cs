@@ -26,6 +26,7 @@ namespace AgentChat.Bots;
 /// </summary>
 public static class AdaptiveCardBuilder
 {
+    private const int MaxToolArgumentsInCard = 3500;
     private const int MaxToolOutputInCard = 800;
     private static readonly AdaptiveSchemaVersion Schema = new(1, 4);
 
@@ -74,6 +75,7 @@ public static class AdaptiveCardBuilder
         {
             "Function"        => ("🛠️", "Function"),
             "CodeInterpreter" => ("🐍", "Code Interpreter"),
+            "WebSearch"       => ("🔎", "Web Search"),
             _                 => ("🔧", "MCP tool")
         };
 
@@ -91,8 +93,10 @@ public static class AdaptiveCardBuilder
 
         if (!string.IsNullOrEmpty(arguments))
         {
-            card.Body.Add(SubtleLabel("Arguments"));
-            card.Body.Add(CodeBlock(PrettyJson(arguments)));
+            var formattedArguments = PrettyJson(arguments);
+            var truncated = formattedArguments.Length > MaxToolArgumentsInCard;
+            card.Body.Add(SubtleLabel(truncated ? "Arguments (truncated)" : "Arguments"));
+            card.Body.Add(CodeBlock(Truncate(formattedArguments, MaxToolArgumentsInCard)));
         }
         if (!string.IsNullOrEmpty(output))
         {
@@ -397,6 +401,8 @@ public static class AdaptiveCardBuilder
         {
             "Function"        => ("🛠️", "Function"),
             "CodeInterpreter" => ("🐍", "Code Interpreter"),
+            "WebSearch"       => ("🔎", "Web Search"),
+            "FileSearch"      => ("📚", "File Search"),
             _                 => ("🔧", "MCP")
         };
         if (step.IsError) icon = "⚠️";

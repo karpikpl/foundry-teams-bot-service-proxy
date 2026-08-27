@@ -6,6 +6,7 @@ using AgentChat.Foundry;
 using AgentChat.Services;
 using Microsoft.Agents.Builder;
 using Microsoft.Agents.Extensions.Teams.Compat;
+using Microsoft.Agents.Extensions.Teams.Models;
 using Microsoft.Agents.Authentication;
 using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json;
@@ -34,6 +35,7 @@ public class FoundryBot : TeamsActivityHandler
     private readonly ILogger<FoundryBot> _logger;
     private readonly AgentFileService _files;
     private readonly ITeamsAttachmentService? _attachments;
+    private readonly ITeamsFileService? _teamsFiles;
     // When true, Foundry calls use the container UAMI, not the user's OBO
     // token. Teams SSO is skipped for the whole turn (no sign-in card, no
     // per-user identity in Foundry). Keep this in sync with the same setting
@@ -57,7 +59,8 @@ public class FoundryBot : TeamsActivityHandler
         TeamsSsoService sso,
         ILogger<FoundryBot> logger,
         AgentFileService? files = null,
-        ITeamsAttachmentService? attachments = null)
+        ITeamsAttachmentService? attachments = null,
+        ITeamsFileService? teamsFiles = null)
     {
         _agents      = agents;
         _state       = state;
@@ -68,6 +71,7 @@ public class FoundryBot : TeamsActivityHandler
         _logger      = logger;
         _files       = files ?? new AgentFileService(config);
         _attachments = attachments;
+        _teamsFiles   = teamsFiles;
         _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
         _sendUserIdentityHeader      = config.GetValue("Foundry:SendUserIdentityHeader", false);
     }
@@ -1477,6 +1481,14 @@ public class FoundryBot : TeamsActivityHandler
         await streaming.FinalizeAsync(ct);
         foreach (var file in generatedFiles)
         {
+            if (_teamsFiles?.SupportsNativeFiles(turnContext.Activity) == true)
+            {
+                var consent = MessageFactory.Attachment(_teamsFiles.CreateConsentCard(file));
+                consent.Text = $"📄 Generated file: {file.FileName}";
+                await turnContext.SendActivityAsync(consent, ct);
+                continue;
+            }
+
             var activity = MessageFactory.Attachment(new Attachment
             {
                 Name = file.FileName,
@@ -1497,6 +1509,48 @@ public class FoundryBot : TeamsActivityHandler
                 ct);
         }
         return new StreamStep(true);
+    }
+
+    protected override async Task OnTeamsFileConsentAcceptAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        FileConsentCardResponse fileConsentCardResponse,
+        CancellationToken cancellationToken)
+    {
+        if (_teamsFiles is null)
+        {
+            await turnContext.SendActivityAsync(
+                MessageFactory.Text("The generated-file upload service is unavailable."),
+                cancellationToken);
+            return;
+        }
+
+        try
+        {
+            var attachment = await _teamsFiles.UploadAsync(
+                fileConsentCardResponse,
+                cancellationToken);
+            var activity = MessageFactory.Attachment(attachment);
+            activity.Text = $"📄 Generated file: {attachment.Name}";
+            await turnContext.SendActivityAsync(activity, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not upload generated file to Teams");
+            await turnContext.SendActivityAsync(
+                MessageFactory.Text($"⚠️ Could not upload the generated file: {ex.Message}"),
+                cancellationToken);
+        }
+    }
+
+    protected override async Task OnTeamsFileConsentDeclineAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        FileConsentCardResponse fileConsentCardResponse,
+        CancellationToken cancellationToken)
+    {
+        _teamsFiles?.Discard(fileConsentCardResponse);
+        await turnContext.SendActivityAsync(
+            MessageFactory.Text("Generated file download canceled."),
+            cancellationToken);
     }
 
     private async Task HandleCompletedItemAsync(

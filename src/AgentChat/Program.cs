@@ -46,6 +46,11 @@ builder.Services.AddHttpClient(nameof(TeamsAttachmentService))
     {
         AllowAutoRedirect = false
     });
+builder.Services.AddHttpClient(nameof(TeamsFileService))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false
+    });
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddHealthChecks();
 
@@ -54,6 +59,7 @@ builder.Services.AddSingleton<AgentClientCache>();
 builder.Services.AddSingleton<TeamsSsoService>();
 builder.Services.AddSingleton<AgentFileService>();
 builder.Services.AddSingleton<ITeamsAttachmentService, TeamsAttachmentService>();
+builder.Services.AddSingleton<ITeamsFileService, TeamsFileService>();
 // IStorage — Cosmos serverless via AAD (no keys).
 builder.Services.AddSingleton<IStorage>(sp =>
 {

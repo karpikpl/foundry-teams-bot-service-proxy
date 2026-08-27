@@ -72,7 +72,7 @@ public static class ManifestBuilder
         {
             ["botId"]              = botId,
             ["scopes"]             = new JArray("personal", "team", "groupChat"),
-            ["supportsFiles"]      = false,
+            ["supportsFiles"]      = true,
             ["isNotificationOnly"] = false,
             ["commandLists"] = new JArray
             {

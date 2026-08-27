@@ -7,11 +7,13 @@ using Microsoft.Agents.Storage;
 using Microsoft.Agents.Builder.Testing;
 using Microsoft.Agents.Connector;
 using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Extensions.Teams.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Net;
 using Newtonsoft.Json.Linq;
+using System.Text.Json;
 using Xunit;
 using ConversationState = AgentChat.Bots.ConversationState;
 
@@ -195,10 +197,13 @@ public class FoundryBotTests
             foundry.ToClientCache(agents),
             new FakeSsoService(token: "foundry-user-token", enabled: true),
             NullLogger<FoundryBot>.Instance,
-            new AgentFileService(TestServices.Config()));
+            new AgentFileService(TestServices.Config()),
+            teamsFiles: new FakeTeamsFileService());
         var adapter = new TestAdapter();
 
-        await bot.InvokeAsync(MakeMessageTurn(adapter, "create a spreadsheet", convId: "conv-generated-file"));
+        var turn = MakeMessageTurn(adapter, "create a spreadsheet", convId: "conv-generated-file");
+        turn.Activity.Conversation.ConversationType = "personal";
+        await bot.InvokeAsync(turn);
 
         var replies = new List<IActivity>();
         IActivity? reply;
@@ -208,11 +213,94 @@ public class FoundryBotTests
         var fileReply = replies.Single(activity =>
             activity.Attachments?.Any(attachment => attachment.Name == "report.xlsx") == true);
         var attachment = fileReply.Attachments!.Single();
-        attachment.ContentType.Should().Be("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-        attachment.ContentUrl.Should().StartWith("https://proxy.example/api/files/");
+        attachment.ContentType.Should().Be(FileConsentCard.ContentType);
+        attachment.Content.Should().BeOfType<FileConsentCard>();
         foundry.Requests.Should().Contain(r =>
             r.Method == "GET" &&
             r.Url.Contains("/api/projects/default-project/openai/v1/containers/cntr_teams/files/cfile_teams/content"));
+    }
+
+    [Fact]
+    public async Task Teams_file_consent_accept_uploads_generated_file_and_sends_file_info_card()
+    {
+        var upload = new RecordingUploadHandler();
+        var files = new AgentFileService(TestServices.Config());
+        var generated = files.CacheGeneratedFile(
+            "report.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx bytes"u8.ToArray(),
+            new Uri("https://proxy.example"));
+        var teamsFiles = new TeamsFileService(
+            new HandlerHttpClientFactory(upload),
+            files,
+            TestServices.Config());
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(logger: logger, files: files, teamsFiles: teamsFiles);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(
+            adapter,
+            "conv-file-consent",
+            "fileConsent/invoke",
+            JsonSerializer.SerializeToElement(new
+            {
+                action = "accept",
+                context = new { token = generated.Token },
+                uploadInfo = new
+                {
+                    name = "report.xlsx",
+                    uploadUrl = "https://tenant.sharepoint.com/upload/session",
+                    contentUrl = "https://tenant.sharepoint.com/files/report.xlsx",
+                    uniqueId = "drive-item-id",
+                    fileType = "xlsx"
+                }
+            }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        upload.RequestCount.Should().Be(
+            1,
+            string.Join(" | ", logger.Messages.Select(message =>
+                $"{message.Message}: {message.Exception?.Message}")));
+        upload.Body.Should().Equal("xlsx bytes"u8.ToArray());
+        var reply = adapter.GetNextReply();
+        reply.Attachments.Should().ContainSingle();
+        var attachment = reply.Attachments.Single();
+        attachment.Name.Should().Be("report.xlsx");
+        attachment.ContentType.Should().Be(FileInfoCard.ContentType);
+        attachment.ContentUrl.Should().Be("https://tenant.sharepoint.com/files/report.xlsx");
+    }
+
+    [Fact]
+    public async Task Teams_file_consent_decline_does_not_upload_generated_file()
+    {
+        var upload = new RecordingUploadHandler();
+        var files = new AgentFileService(TestServices.Config());
+        var generated = files.CacheGeneratedFile(
+            "report.txt",
+            "text/plain",
+            "report"u8.ToArray(),
+            new Uri("https://proxy.example"));
+        var teamsFiles = new TeamsFileService(
+            new HandlerHttpClientFactory(upload),
+            files,
+            TestServices.Config());
+        var bot = MakeBot(files: files, teamsFiles: teamsFiles);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(
+            adapter,
+            "conv-file-decline",
+            "fileConsent/invoke",
+            JsonSerializer.SerializeToElement(new
+            {
+                action = "decline",
+                context = new { token = generated.Token }
+            }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        upload.RequestCount.Should().Be(0);
+        adapter.GetNextReply().Text.Should().Contain("canceled");
+        files.TryGetDownload(generated.Token, out _).Should().BeFalse();
     }
 
     [Fact]
@@ -641,7 +729,9 @@ public class FoundryBotTests
         TeamsSsoService? sso = null,
         ILogger<FoundryBot>? logger = null,
         IHttpContextAccessor? httpContext = null,
-        ITeamsAttachmentService? attachments = null)
+        ITeamsAttachmentService? attachments = null,
+        AgentFileService? files = null,
+        ITeamsFileService? teamsFiles = null)
     {
         var agents = TestServices.AgentService(new CatalogHandler("agent-a"));
         var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
@@ -653,8 +743,9 @@ public class FoundryBotTests
             new AgentClientCache(agents),
             sso ?? new FakeSsoService(token: null),
             logger ?? NullLogger<FoundryBot>.Instance,
-            new AgentFileService(TestServices.Config()),
-            attachments);
+            files ?? new AgentFileService(TestServices.Config()),
+            attachments,
+            teamsFiles);
     }
 
     private static ITurnContext MakeMessageTurn(TestAdapter adapter, string text, object? value = null, string convId = "conv-1")
@@ -694,8 +785,9 @@ public class FoundryBotTests
             TeamsSsoService sso,
             ILogger<FoundryBot> logger,
             AgentFileService? files = null,
-            ITeamsAttachmentService? attachments = null)
-            : base(agents, state, config, httpContext, clientCache, sso, logger, files, attachments)
+            ITeamsAttachmentService? attachments = null,
+            ITeamsFileService? teamsFiles = null)
+            : base(agents, state, config, httpContext, clientCache, sso, logger, files, attachments, teamsFiles)
         {
         }
 
@@ -719,8 +811,9 @@ public class FoundryBotTests
             TeamsSsoService sso,
             ILogger<FoundryBot> logger,
             AgentFileService? files = null,
-            ITeamsAttachmentService? attachments = null)
-            : base(agents, state, config, httpContext, clientCache, sso, logger, files, attachments)
+            ITeamsAttachmentService? attachments = null,
+            ITeamsFileService? teamsFiles = null)
+            : base(agents, state, config, httpContext, clientCache, sso, logger, files, attachments, teamsFiles)
         {
             Store = state;
         }
@@ -752,6 +845,44 @@ public class FoundryBotTests
             ITurnContext turnContext,
             CancellationToken cancellationToken)
             => Task.FromResult<IReadOnlyList<AgentInputFile>>(files);
+    }
+
+    private sealed class FakeTeamsFileService : ITeamsFileService
+    {
+        public bool SupportsNativeFiles(IActivity activity) => true;
+
+        public Attachment CreateConsentCard(GeneratedFileLink file) => new()
+        {
+            Name = file.FileName,
+            ContentType = FileConsentCard.ContentType,
+            Content = new FileConsentCard("Download", file.Size, new { token = file.Token }, new { token = file.Token })
+        };
+
+        public Task<Attachment> UploadAsync(
+            FileConsentCardResponse response,
+            CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public void Discard(FileConsentCardResponse response)
+        {
+        }
+    }
+
+    private sealed class RecordingUploadHandler : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+        public byte[] Body { get; private set; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            Body = request.Content is null
+                ? []
+                : await request.Content.ReadAsByteArrayAsync(cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
     }
 
     private sealed class FakeSsoService : TeamsSsoService

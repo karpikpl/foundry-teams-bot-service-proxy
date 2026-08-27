@@ -13,7 +13,10 @@ public sealed record GeneratedFileLink(
     string FileName,
     string ContentType,
     long Size,
-    string Url);
+    string Url)
+{
+    internal string Token { get; init; } = "";
+}
 
 public sealed class AgentFileService
 {
@@ -114,10 +117,25 @@ public sealed class AgentFileService
         CancellationToken cancellationToken)
     {
         var bytes = await DownloadContainerFileAsync(foundry, annotation, cancellationToken);
+        return CacheGeneratedFile(
+            annotation.Filename,
+            NormalizeContentType(null, annotation.Filename),
+            bytes,
+            publicBaseUri);
+    }
+
+    internal GeneratedFileLink CacheGeneratedFile(
+        string fileName,
+        string contentType,
+        byte[] bytes,
+        Uri publicBaseUri)
+    {
+        if (bytes.LongLength > _maxFileBytes)
+            throw new InvalidOperationException($"Generated file '{SafeFileName(fileName)}' exceeds the {_maxFileBytes / 1024 / 1024} MB download limit.");
 
         var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
-        var fileName = SafeFileName(annotation.Filename);
-        var contentType = NormalizeContentType(null, fileName);
+        fileName = SafeFileName(fileName);
+        contentType = NormalizeContentType(contentType, fileName);
         var cached = new CachedDownload(
             fileName,
             contentType,
@@ -139,7 +157,10 @@ public sealed class AgentFileService
             fileName,
             contentType,
             cached.Content.LongLength,
-            new Uri(publicBaseUri, path).ToString());
+            new Uri(publicBaseUri, path).ToString())
+        {
+            Token = token
+        };
     }
 
     public bool TryGetDownload(string token, out GeneratedFileDownload download)
@@ -158,6 +179,15 @@ public sealed class AgentFileService
 
             download = new GeneratedFileDownload(cached.FileName, cached.ContentType, cached.Content);
             return true;
+        }
+    }
+
+    public void RemoveDownload(string token)
+    {
+        lock (_cacheGate)
+        {
+            if (_downloads.TryGetValue(token, out var cached))
+                RemoveDownloadLocked(token, cached);
         }
     }
 

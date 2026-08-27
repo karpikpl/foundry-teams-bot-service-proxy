@@ -9,6 +9,7 @@ using Microsoft.Agents.Extensions.Teams.Compat;
 using Microsoft.Agents.Extensions.Teams.Models;
 using Microsoft.Agents.Authentication;
 using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Core.Serialization;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Responses;
@@ -1994,7 +1995,10 @@ public class FoundryBot : TeamsActivityHandler
         string body;
         try
         {
-            body = JsonConvert.SerializeObject(value, Formatting.None) ?? "(empty)";
+            body = value is JsonElement element
+                ? element.GetRawText()
+                : JsonConvert.SerializeObject(value, Formatting.None) ?? "(empty)";
+            body = RedactActivityValue(body);
         }
         catch (Exception ex)
         {
@@ -2002,6 +2006,24 @@ public class FoundryBot : TeamsActivityHandler
         }
 
         return body.Length <= maxChars ? body : body.Substring(0, maxChars);
+    }
+
+    private static string RedactActivityValue(string body)
+    {
+        var json = JToken.Parse(body);
+        foreach (var property in json is JContainer container
+                     ? container.Descendants().OfType<JProperty>()
+                     : Enumerable.Empty<JProperty>())
+        {
+            if (string.Equals(property.Name, "token", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(property.Name, "accessToken", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(property.Name, "uploadUrl", StringComparison.OrdinalIgnoreCase))
+            {
+                property.Value = "[redacted]";
+            }
+        }
+
+        return json.ToString(Formatting.None);
     }
 
     protected override async Task<InvokeResponse> OnInvokeActivityAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
@@ -2065,6 +2087,15 @@ public class FoundryBot : TeamsActivityHandler
         if (value is null) return new TokenExchangeInvokePayload(null, null, null);
         try
         {
+            if (value is JsonElement element)
+            {
+                var properties = ProtocolJsonSerializer.ToJsonElements(element);
+                return new TokenExchangeInvokePayload(
+                    ProtocolJsonSerializer.ToObject<TokenExchangeRequest>(element),
+                    ReadStringProperty(properties, "id"),
+                    ReadStringProperty(properties, "connectionName"));
+            }
+
             var data = value as JObject ?? JObject.FromObject(value);
             return new TokenExchangeInvokePayload(
                 data.ToObject<TokenExchangeRequest>(),
@@ -2077,6 +2108,11 @@ public class FoundryBot : TeamsActivityHandler
             return new TokenExchangeInvokePayload(null, null, null);
         }
     }
+
+    private static string? ReadStringProperty(IDictionary<string, JsonElement> properties, string name)
+        => properties.TryGetValue(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     private static InvokeResponse CreateTokenExchangeInvokeResponse(TokenExchangeInvokePayload payload, TeamsSignInResult result)
         => new()

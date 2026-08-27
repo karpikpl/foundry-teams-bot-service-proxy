@@ -358,6 +358,37 @@ public class FoundryBotTests
     }
 
     [Fact]
+    public async Task Signin_token_exchange_parses_activity_protocol_json_element()
+    {
+        var sso = new FakeSsoService(token: "foundry-user-token");
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(sso, logger: logger);
+        var adapter = new TestAdapter();
+        var convId = "conv-sso-json-element";
+        await bot.Store.SaveAsync(convId, new ConversationState { PendingSsoMessage = "pending question" });
+
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        });
+        var turn = MakeInvokeTurn(adapter, convId, "signin/tokenExchange", value);
+
+        await bot.InvokeSignInAsync(turn);
+
+        sso.ExchangeCalls.Should().Be(1);
+        sso.LastExchangeRequest.Should().NotBeNull();
+        sso.LastExchangeRequest!.Token.Should().Be("teams-token");
+        bot.AgentTurns.Should().ContainSingle().Which.Should().Be("pending question");
+        bot.AgentTurnTokens.Should().ContainSingle().Which.Should().Be("foundry-user-token");
+        (await bot.Store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
+        logger.Messages.Should().Contain(m =>
+            m.Message.Contains("\"token\":\"[redacted]\"")
+            && !m.Message.Contains("teams-token"));
+    }
+
+    [Fact]
     public async Task OnSignInInvokeAsync_SurfacesError_When_TokenExchangeThrows()
     {
         var sso = new FakeSsoService(token: null, exchangeException: new InvalidOperationException("test failure"));
@@ -423,6 +454,31 @@ public class FoundryBotTests
             m.Level == LogLevel.Error
             && m.Message.Contains("Teams SSO signin/failure received")
             && m.Message.Contains("full diagnostic body"));
+    }
+
+    [Fact]
+    public async Task Signin_failure_preserves_activity_protocol_json_element_diagnostic()
+    {
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(logger: logger);
+        var adapter = new TestAdapter();
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            code = "invokeerror",
+            message = "Invoke error occurred",
+            details = "actual Teams diagnostic"
+        });
+        var turn = MakeInvokeTurn(adapter, "conv-signin-failure-json-element", "signin/failure", value);
+
+        await bot.InvokeSignInAsync(turn);
+
+        var reply = adapter.GetNextReply().Text;
+        reply.Should().Contain("\"details\":\"actual Teams diagnostic\"");
+        reply.Should().NotContain("\"ValueKind\":1");
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Error
+            && m.Message.Contains("\"details\":\"actual Teams diagnostic\"")
+            && !m.Message.Contains("\"ValueKind\":1"));
     }
 
     [Fact]
@@ -891,6 +947,7 @@ public class FoundryBotTests
         private readonly Exception? _exchangeException;
         private readonly SignInResource? _signInResource;
         public int ExchangeCalls { get; private set; }
+        public TokenExchangeRequest? LastExchangeRequest { get; private set; }
 
         public FakeSsoService(string? token, bool enabled = true, Exception? exchangeException = null, SignInResource? signInResource = null)
             : base(enabled
@@ -911,6 +968,7 @@ public class FoundryBotTests
         public override Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
         {
             ExchangeCalls++;
+            LastExchangeRequest = request;
             if (_exchangeException is not null)
             {
                 return Task.FromException<TokenResponse?>(_exchangeException);

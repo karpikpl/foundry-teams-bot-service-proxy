@@ -1,0 +1,26 @@
+<policies>
+  <inbound>
+    <base />
+    <authentication-managed-identity resource="https://ml.azure.com"
+                                     output-token-variable-name="foundry-token"
+                                     ignore-error="false" />
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["foundry-token"])</value>
+    </set-header>
+    <set-query-parameter name="api-version" exists-action="override">
+      <value>v1</value>
+    </set-query-parameter>
+    <set-backend-service base-url="FOUNDRY_PROJECT_ENDPOINT" />
+    <rewrite-uri template="/agents/AGENT_NAME/endpoint/protocols/invocations"
+                 copy-unmatched-params="true" />
+  </inbound>
+  <backend>
+    <forward-request timeout="120" />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

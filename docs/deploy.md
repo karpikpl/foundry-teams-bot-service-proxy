@@ -1,5 +1,8 @@
 # Deployment notes
 
+For the Foundry-hosted deployment that routes Azure Bot traffic through APIM,
+see [`hosted-infra/apim`](../hosted-infra/apim/README.md).
+
 This walks through deploying the bot to **Azure App Service for Containers** with **Cosmos serverless** for state and **Bot Service** as the Teams front door. Everything is AAD-only (no keys).
 
 Reference your own Terraform/Bicep — this is a checklist, not a copy-pasteable script.

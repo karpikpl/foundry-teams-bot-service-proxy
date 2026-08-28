@@ -1,0 +1,41 @@
+<policies>
+  <inbound>
+    <base />
+    <validate-jwt header-name="Authorization"
+                  require-scheme="Bearer"
+                  failed-validation-httpcode="401"
+                  failed-validation-error-message="Invalid Bot Framework token.">
+      <openid-config url="https://login.botframework.com/v1/.well-known/openidconfiguration" />
+      <audiences>
+        <audience>BOT_APP_ID</audience>
+      </audiences>
+    </validate-jwt>
+    <set-header name="x-client-bot-authorization" exists-action="override">
+      <value>@(context.Request.Headers.GetValueOrDefault("Authorization", ""))</value>
+    </set-header>
+    <authentication-managed-identity resource="https://ml.azure.com"
+                                     output-token-variable-name="foundry-token"
+                                     ignore-error="false" />
+    <set-header name="Authorization" exists-action="override">
+      <value>@("Bearer " + (string)context.Variables["foundry-token"])</value>
+    </set-header>
+    <set-query-parameter name="api-version" exists-action="override">
+      <value>v1</value>
+    </set-query-parameter>
+    <set-query-parameter name="agent_session_id" exists-action="override">
+      <value>{{csharp-foundry-agent-session-id}}</value>
+    </set-query-parameter>
+    <set-backend-service base-url="FOUNDRY_PROJECT_ENDPOINT" />
+    <rewrite-uri template="/agents/AGENT_NAME/endpoint/protocols/invocations"
+                 copy-unmatched-params="true" />
+  </inbound>
+  <backend>
+    <forward-request timeout="600" />
+  </backend>
+  <outbound>
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+  </on-error>
+</policies>

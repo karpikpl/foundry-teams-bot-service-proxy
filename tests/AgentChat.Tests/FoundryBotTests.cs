@@ -331,6 +331,20 @@ public class FoundryBotTests
     }
 
     [Fact]
+    public async Task JsonElement_card_submit_from_invocations_is_routed_without_agent_turn()
+    {
+        var bot = MakeBot();
+        var adapter = new TestAdapter();
+        using var document = JsonDocument.Parse("""{"action":"cancel"}""");
+        var turn = MakeMessageTurn(adapter, "", value: document.RootElement.Clone());
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().BeEmpty();
+        adapter.GetNextReply().Text.Should().Be("Nothing is running right now.");
+    }
+
+    [Fact]
     public async Task JsonElement_consent_continue_submit_is_routed()
     {
         var bot = MakeBot();

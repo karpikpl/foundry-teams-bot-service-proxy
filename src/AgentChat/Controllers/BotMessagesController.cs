@@ -26,6 +26,13 @@ public class BotMessagesController : ControllerBase
     public Task PostDefaultAsync() => ProcessAsync();
 
     /// <summary>
+    /// Foundry hosted-agent Activity protocol container route. The Foundry
+    /// front door authenticates Bot Service and forwards the Activity here.
+    /// </summary>
+    [HttpPost("/activity/messages")]
+    public Task PostHostedActivityAsync() => ProcessAsync();
+
+    /// <summary>
     /// URL-routed endpoint: the path tells the bot which Foundry agent to use.
     ///
     /// Shape:

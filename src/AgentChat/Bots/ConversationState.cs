@@ -36,6 +36,9 @@ public class ConversationState : IStoreItem
     /// pending consent card was shown; cleared on the next user reply.</summary>
     public string? PendingConsentResponseId { get; set; }
 
+    /// <summary>Generated files offered through Teams file-consent cards.</summary>
+    public Dictionary<string, PendingFileDelivery> PendingFiles { get; set; } = new(StringComparer.Ordinal);
+
     /// <summary>User's pending message when an SSO sign-in card was shown.
     /// Replayed automatically after the user completes Teams SSO via the
     /// <c>signin/tokenExchange</c> invoke handler.</summary>
@@ -108,3 +111,8 @@ public class ConversationState : IStoreItem
     /// <summary>IStoreItem eTag for optimistic concurrency.</summary>
     public string ETag { get; set; } = "*";
 }
+
+public sealed record PendingFileDelivery(
+    string Name,
+    string SourceUrl,
+    DateTime ExpiresUtc);

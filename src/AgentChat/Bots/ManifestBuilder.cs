@@ -42,7 +42,8 @@ public static class ManifestBuilder
         string botId,
         Guid? manifestId = null,
         string? ssoAadAppId = null,
-        string? ssoResource = null)
+        string? ssoResource = null,
+        string? tabContentUrl = null)
     {
         if (string.IsNullOrWhiteSpace(agentName))
             throw new ArgumentException("agentName is required", nameof(agentName));
@@ -122,7 +123,112 @@ public static class ManifestBuilder
             manifest["permissions"] = new JArray("identity", "messageTeamMembers");
         }
 
+        if (!string.IsNullOrWhiteSpace(tabContentUrl))
+        {
+            if (!Uri.TryCreate(tabContentUrl, UriKind.Absolute, out var tabUri)
+                || tabUri.Scheme != Uri.UriSchemeHttps)
+                throw new ArgumentException("tabContentUrl must be an absolute HTTPS URL", nameof(tabContentUrl));
+
+            manifest["staticTabs"] = new JArray
+            {
+                new JObject
+                {
+                    ["entityId"] = "foundry-agent-chat",
+                    ["name"] = "Chat",
+                    ["contentUrl"] = tabUri.AbsoluteUri,
+                    ["websiteUrl"] = tabUri.AbsoluteUri,
+                    ["scopes"] = new JArray("personal")
+                }
+            };
+
+            var validDomains = (JArray)manifest["validDomains"]!;
+            if (!validDomains.Any(domain =>
+                    string.Equals(domain.ToString(), tabUri.Host, StringComparison.OrdinalIgnoreCase)))
+            {
+                validDomains.Add(tabUri.Host);
+            }
+        }
+
         return manifest;
+    }
+
+    public static JObject BuildTab(
+        string agentName,
+        string agentDescription,
+        string tabContentUrl,
+        string ssoAadAppId,
+        string ssoResource,
+        Guid? manifestId = null)
+    {
+        if (string.IsNullOrWhiteSpace(agentName))
+            throw new ArgumentException("agentName is required", nameof(agentName));
+        if (!Uri.TryCreate(tabContentUrl, UriKind.Absolute, out var tabUri)
+            || tabUri.Scheme != Uri.UriSchemeHttps)
+            throw new ArgumentException("tabContentUrl must be an absolute HTTPS URL", nameof(tabContentUrl));
+        if (string.IsNullOrWhiteSpace(ssoAadAppId))
+            throw new ArgumentException("ssoAadAppId is required", nameof(ssoAadAppId));
+        if (string.IsNullOrWhiteSpace(ssoResource))
+            throw new ArgumentException("ssoResource is required", nameof(ssoResource));
+
+        var shortDescription = string.IsNullOrWhiteSpace(agentDescription)
+            ? $"Chat with Foundry agent {agentName}"
+            : agentDescription;
+        if (shortDescription.Length > MaxShortDescChars)
+            shortDescription = shortDescription[..(MaxShortDescChars - 3)] + "...";
+
+        var fullDescription = string.IsNullOrWhiteSpace(agentDescription)
+            ? $"Chat with the Foundry agent '{agentName}' in a Teams personal tab."
+            : agentDescription;
+        if (fullDescription.Length > MaxFullDescChars)
+            fullDescription = fullDescription[..MaxFullDescChars];
+
+        var shortName = agentName.Length > MaxShortNameChars
+            ? agentName[..MaxShortNameChars]
+            : agentName;
+        var fullName = $"Foundry: {agentName}";
+        if (fullName.Length > MaxFullNameChars)
+            fullName = fullName[..MaxFullNameChars];
+
+        return new JObject
+        {
+            ["$schema"] = SchemaUrl,
+            ["manifestVersion"] = ManifestVersion,
+            ["version"] = AppVersion,
+            ["id"] = (manifestId ?? Guid.NewGuid()).ToString(),
+            ["developer"] = new JObject
+            {
+                ["name"] = "Foundry POC",
+                ["websiteUrl"] = "https://www.example.com",
+                ["privacyUrl"] = "https://www.example.com/privacy",
+                ["termsOfUseUrl"] = "https://www.example.com/terms"
+            },
+            ["icons"] = new JObject { ["color"] = "color.png", ["outline"] = "outline.png" },
+            ["name"] = new JObject { ["short"] = shortName, ["full"] = fullName },
+            ["description"] = new JObject
+            {
+                ["short"] = shortDescription,
+                ["full"] = fullDescription
+            },
+            ["accentColor"] = "#5B67D1",
+            ["staticTabs"] = new JArray
+            {
+                new JObject
+                {
+                    ["entityId"] = "foundry-agent-chat",
+                    ["name"] = "Chat",
+                    ["contentUrl"] = tabUri.AbsoluteUri,
+                    ["websiteUrl"] = tabUri.AbsoluteUri,
+                    ["scopes"] = new JArray("personal")
+                }
+            },
+            ["validDomains"] = new JArray(tabUri.Host),
+            ["permissions"] = new JArray("identity"),
+            ["webApplicationInfo"] = new JObject
+            {
+                ["id"] = ssoAadAppId,
+                ["resource"] = ssoResource
+            }
+        };
     }
 
     /// <summary>

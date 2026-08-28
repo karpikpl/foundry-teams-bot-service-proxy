@@ -1168,7 +1168,7 @@ public class FoundryBot : TeamsActivityHandler
         var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
         var citations            = new List<UrlCitation>();
-        var generatedFiles       = new List<GeneratedFileLink>();
+        var generatedFiles       = new List<AgentChat.Services.GeneratedFileLink>();
         var seenGeneratedFiles   = new HashSet<string>(StringComparer.Ordinal);
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
@@ -1604,7 +1604,7 @@ public class FoundryBot : TeamsActivityHandler
         HashSet<string> seenIds,
         List<ThinkingStep> steps,
         List<UrlCitation> citations,
-        List<GeneratedFileLink> generatedFiles,
+        List<AgentChat.Services.GeneratedFileLink> generatedFiles,
         HashSet<string> seenGeneratedFiles,
         CancellationToken ct)
     {

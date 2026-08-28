@@ -117,6 +117,20 @@ public class SdkStreamingMessageHelperTests
     }
 
     [Fact]
+    public async Task Finalize_informative_only_stream_uses_status_instead_of_sdk_placeholder()
+    {
+        var sent = new List<IActivity>();
+        var s = new SdkStreamingMessageHelper(MakeContext("msteams", "personal", sent));
+
+        await s.SendInformativeAsync("Waiting for approval", default);
+        await s.FinalizeAsync(default);
+
+        sent.Last().Type.Should().Be(ActivityTypes.Message);
+        ((Activity)sent.Last()).Text.Should().Be("Waiting for approval");
+        ((Activity)sent.Last()).Text.Should().NotBe("No text was streamed");
+    }
+
+    [Fact]
     public async Task Finalize_with_attachments_only_in_non_streaming_channel_sends_placeholder_message()
     {
         // The card path in FoundryBot always finalizes with attachments;

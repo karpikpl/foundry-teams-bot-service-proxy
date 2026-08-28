@@ -220,7 +220,8 @@ public class ManifestController : ControllerBase
 
     /// <summary>
     /// Auto-resolved download for default-project agents. variant must be
-    /// "direct" or "proxy"; the matching appId + SSO settings are looked up
+    /// "direct", "proxy", or "tab"; bot app ids are looked up for bot
+    /// variants while the tab uses the shared backend app registration.
     /// from Bots:Routes (proxy) and the agent's own appId (direct).
     /// </summary>
     [HttpGet("{foundryHost}/{project}/manifest/{agentName}/{variant}")]
@@ -232,7 +233,10 @@ public class ManifestController : ControllerBase
         CancellationToken ct)
     {
         if (!IsKnownVariant(variant))
-            return BadRequest($"variant must be 'direct' or 'proxy'; got '{variant}'.");
+            return BadRequest($"variant must be 'direct', 'proxy', or 'tab'; got '{variant}'.");
+
+        if (variant.Equals("tab", StringComparison.OrdinalIgnoreCase))
+            return await BuildTabDownloadAsync(foundryHost, project, agentName, ct);
 
         var route = _routeRepo.TryGet(agentName);
         if (route is null)
@@ -249,7 +253,8 @@ public class ManifestController : ControllerBase
 
     private static bool IsKnownVariant(string v) =>
         string.Equals(v, "direct", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(v, "proxy", StringComparison.OrdinalIgnoreCase);
+        || string.Equals(v, "proxy", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(v, "tab", StringComparison.OrdinalIgnoreCase);
 
     private async Task<IActionResult> BuildVariantDownloadAsync(
         string foundryHost, string project, string agentName, string variant, string botId, CancellationToken ct)
@@ -264,9 +269,7 @@ public class ManifestController : ControllerBase
             ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
             : agent.Description;
 
-        // Direct manifest does silent SSO against the agent's own app reg
-        // (resource = https://ai.azure.com). Proxy manifest does silent SSO
-        // against the shared backend reg (resource = api://<backendId>).
+        // Bot manifests keep their existing bot-specific SSO identities.
         string? ssoAppId; string? ssoResource;
         if (variant.Equals("direct", StringComparison.OrdinalIgnoreCase))
         {
@@ -275,12 +278,55 @@ public class ManifestController : ControllerBase
         }
         else
         {
-            ssoAppId    = _config["TeamsApp:BackendAppId"]  ?? _config["TeamsSso:AadAppId"];
-            ssoResource = _config["TeamsApp:IdentifierUri"] ?? _config["TeamsSso:Resource"];
+            ssoAppId = botId;
+            ssoResource = $"api://botid-{botId}";
         }
 
-        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId, ssoAppId, ssoResource, ct);
+        var zipBytes = await BuildManifestZipAsync(
+            agent.Name,
+            description,
+            botId,
+            ssoAppId,
+            ssoResource,
+            tabContentUrl: null,
+            ct);
         return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}-{variant.ToLowerInvariant()}.zip");
+    }
+
+    private async Task<IActionResult> BuildTabDownloadAsync(
+        string foundryHost,
+        string project,
+        string agentName,
+        CancellationToken ct)
+    {
+        var options = TeamsTabAuthOptions.FromConfiguration(_config);
+        if (!options.Enabled
+            || string.IsNullOrWhiteSpace(options.ClientId)
+            || string.IsNullOrWhiteSpace(options.NormalizedAudience))
+        {
+            return NotFound("Teams tab authentication is not configured.");
+        }
+
+        var agents = await LoadAgentsAsync(foundryHost, project, ct);
+        if (agents.ErrorHtml is not null) return HtmlResult(agents.ErrorHtml, 502);
+        var agent = agents.Agents!.FirstOrDefault(candidate =>
+            string.Equals(candidate.Name, agentName, StringComparison.OrdinalIgnoreCase));
+        if (agent is null)
+            return NotFound($"Agent '{agentName}' not found in project {FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project)}.");
+
+        var tabContentUrl = BuildTeamsTabUrl(foundryHost, project, agent.Name)
+            ?? throw new InvalidOperationException("Teams tab public origin is not configured.");
+        var description = string.IsNullOrWhiteSpace(agent.Description)
+            ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
+            : agent.Description;
+        var manifest = ManifestBuilder.BuildTab(
+            agent.Name,
+            description,
+            tabContentUrl,
+            options.ClientId,
+            options.NormalizedAudience);
+        var zipBytes = await PackManifestZipAsync(manifest, ct);
+        return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}-tab.zip");
     }
 
     private async Task<IActionResult> ManifestDownloadManual(
@@ -305,12 +351,18 @@ public class ManifestController : ControllerBase
             ? (agent.Model is null ? "Foundry agent" : $"Foundry agent ({agent.Model})")
             : agent.Description;
 
-        // Manual flow defaults to the proxy-variant SSO wiring (shared
-        // backend reg) since that's the original behavior.
-        var ssoAppId    = _config["TeamsApp:BackendAppId"]  ?? _config["TeamsSso:AadAppId"];
-        var ssoResource = _config["TeamsApp:IdentifierUri"] ?? _config["TeamsSso:Resource"];
+        // Manual bot manifests keep the per-bot SSO identity.
+        var ssoAppId = botId;
+        var ssoResource = $"api://botid-{botId}";
 
-        var zipBytes = await BuildManifestZipAsync(agent.Name, description, botId!, ssoAppId, ssoResource, ct);
+        var zipBytes = await BuildManifestZipAsync(
+            agent.Name,
+            description,
+            botId!,
+            ssoAppId,
+            ssoResource,
+            tabContentUrl: null,
+            ct);
         return File(zipBytes, "application/zip", $"{Sanitize(agent.Name)}.zip");
     }
 
@@ -384,13 +436,19 @@ public class ManifestController : ControllerBase
 
     private async Task<byte[]> BuildManifestZipAsync(
         string agentName, string agentDescription, string botId,
-        string? ssoAppId, string? ssoResource, CancellationToken ct)
+        string? ssoAppId, string? ssoResource, string? tabContentUrl, CancellationToken ct)
     {
         var manifest = ManifestBuilder.Build(
             agentName, agentDescription, botId,
             ssoAadAppId: ssoAppId,
-            ssoResource: ssoResource);
+            ssoResource: ssoResource,
+            tabContentUrl: tabContentUrl);
 
+        return await PackManifestZipAsync(manifest, ct);
+    }
+
+    private async Task<byte[]> PackManifestZipAsync(JObject manifest, CancellationToken ct)
+    {
         var colorPath   = Path.Combine(_env.WebRootPath, "color.png");
         var outlinePath = Path.Combine(_env.WebRootPath, "outline.png");
 
@@ -403,6 +461,13 @@ public class ManifestController : ControllerBase
         }
         ms.Position = 0;
         return ms.ToArray();
+    }
+
+    private string? BuildTeamsTabUrl(string foundryHost, string project, string agentName)
+    {
+        var options = TeamsTabAuthOptions.FromConfiguration(_config);
+        if (!options.Enabled || string.IsNullOrWhiteSpace(options.PublicOrigin)) return null;
+        return $"{options.PublicOrigin}/chat/{Uri.EscapeDataString(foundryHost)}/{Uri.EscapeDataString(project)}/{Uri.EscapeDataString(agentName)}/ui";
     }
 
     private static async Task AddTextEntryAsync(ZipArchive zip, string entryName, string content, CancellationToken ct)
@@ -523,6 +588,7 @@ public class ManifestController : ControllerBase
         var projectEndpoint = FoundryAgentsApi.ComposeProjectEndpoint(foundryHost, project);
         var hostSeg = Uri.EscapeDataString(foundryHost);
         var projSeg = Uri.EscapeDataString(project);
+        var tabEnabled = TeamsTabAuthOptions.FromConfiguration(_config).Enabled;
 
         var rows = string.Join("", agents.Select(a =>
         {
@@ -534,8 +600,11 @@ public class ManifestController : ControllerBase
             var proxy = !string.IsNullOrEmpty(route?.ProxyAppId)
                 ? $"<a class=\"btn secondary\" href=\"/admin/{hostSeg}/{projSeg}/manifest/{nameSeg}/proxy\">Proxy ({Html(route!.ProxyAppId)})</a>"
                 : "<span class=\"muted\">proxy: no bot</span>";
+            var tab = tabEnabled
+                ? $"<a class=\"btn secondary\" href=\"/admin/{hostSeg}/{projSeg}/manifest/{nameSeg}/tab\">Web tab</a>"
+                : "<span class=\"muted\">tab: disabled</span>";
             var desc = string.IsNullOrWhiteSpace(a.Description) ? "" : $"<div class=\"desc\">{Html(a.Description)}</div>";
-            return $"<tr><td><strong>{Html(a.Name)}</strong>{desc}</td><td class=\"actions\">{direct} {proxy}</td></tr>";
+            return $"<tr><td><strong>{Html(a.Name)}</strong>{desc}</td><td class=\"actions\">{direct} {proxy} {tab}</td></tr>";
         }));
         if (string.IsNullOrEmpty(rows))
             rows = "<tr><td colspan=\"2\">No active agents in this project.</td></tr>";

@@ -49,17 +49,25 @@ public sealed class RegisterController : ControllerBase
     [Produces("text/html")]
     public IActionResult Form()
     {
+        var defaultHost = TryDeriveFoundryHost(_config["Foundry:ProjectEndpoint"]) ?? "";
+        var defaultProject = TryDeriveProject(_config["Foundry:ProjectEndpoint"]) ?? "";
+
         var existing = _routes.GetAll()
             .OrderBy(r => r.AgentName, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        static string Cell(string? value, string fallback) =>
+            !string.IsNullOrEmpty(value)
+                ? H(value)
+                : (!string.IsNullOrEmpty(fallback)
+                    ? $"<span class=\"muted\" title=\"defaulted from Foundry:ProjectEndpoint\">{H(fallback)}</span>"
+                    : "<span class=\"muted\">—</span>");
+
         var existingHtml = existing.Count == 0
             ? "<p class=\"muted\">No agents registered yet — routes seeded from <code>Bots:Routes</code> will appear here on first use.</p>"
             : $"<table><thead><tr><th>Agent</th><th>Proxy AppId</th><th>Direct AppId</th><th>Foundry</th><th>Project</th></tr></thead><tbody>{
-                string.Join("", existing.Select(r => $"<tr><td><strong>{H(r.AgentName)}</strong></td><td><code>{H(r.ProxyAppId)}</code></td><td>{(string.IsNullOrEmpty(r.DirectAppId) ? "<span class=\"muted\">—</span>" : $"<code>{H(r.DirectAppId!)}</code>")}</td><td>{H(r.FoundryHost ?? "")}</td><td>{H(r.ProjectName ?? "")}</td></tr>"))
+                string.Join("", existing.Select(r => $"<tr><td><strong>{H(r.AgentName)}</strong></td><td><code>{H(r.ProxyAppId)}</code></td><td>{(string.IsNullOrEmpty(r.DirectAppId) ? "<span class=\"muted\">—</span>" : $"<code>{H(r.DirectAppId!)}</code>")}</td><td>{Cell(r.FoundryHost, defaultHost)}</td><td>{Cell(r.ProjectName, defaultProject)}</td></tr>"))
               }</tbody></table>";
-
-        var defaultHost = TryDeriveFoundryHost(_config["Foundry:ProjectEndpoint"]) ?? "";
-        var defaultProject = TryDeriveProject(_config["Foundry:ProjectEndpoint"]) ?? "";
 
         return Html($@"<!doctype html>
 <html><head><meta charset=""utf-8""><title>Register agent</title>{Styles()}</head>

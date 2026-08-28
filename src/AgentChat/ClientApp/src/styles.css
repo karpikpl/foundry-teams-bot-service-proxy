@@ -1,0 +1,159 @@
+html,
+body,
+#root,
+.provider {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 280px;
+  background: var(--colorNeutralBackground1);
+  color: var(--colorNeutralForeground1);
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--colorNeutralStroke2);
+}
+
+.app-header > div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.center,
+.auth-panel,
+.empty {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  text-align: center;
+}
+
+.auth-panel {
+  max-width: 560px;
+  margin: auto;
+}
+
+.transcript {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  padding: 20px max(16px, calc((100% - 820px) / 2));
+}
+
+.message {
+  max-width: min(78%, 680px);
+  padding: 10px 14px;
+  border-radius: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.45;
+}
+
+.message.user {
+  align-self: flex-end;
+  background: var(--colorBrandBackground);
+  color: var(--colorNeutralForegroundOnBrand);
+}
+
+.message.assistant {
+  align-self: flex-start;
+  background: var(--colorNeutralBackground3);
+}
+
+.message.error {
+  align-self: flex-start;
+  background: var(--colorPaletteRedBackground1);
+  color: var(--colorPaletteRedForeground1);
+}
+
+.tool-card,
+.approval-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: min(90%, 720px);
+  padding: 12px 14px;
+  border: 1px solid var(--colorNeutralStroke1);
+  border-radius: 10px;
+  background: var(--colorNeutralBackground2);
+}
+
+.approval-card {
+  border-color: var(--colorPaletteYellowBorder1);
+}
+
+pre {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--colorNeutralBackground4);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.usage {
+  align-self: center;
+  color: var(--colorNeutralForeground3);
+}
+
+.composer {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  padding: 12px max(16px, calc((100% - 820px) / 2));
+  border-top: 1px solid var(--colorNeutralStroke2);
+  background: var(--colorNeutralBackground1);
+}
+
+.composer textarea {
+  min-height: 44px;
+  max-height: 180px;
+}
+
+@media (max-width: 480px) {
+  .app-header {
+    padding: 10px 12px;
+  }
+
+  .transcript,
+  .composer {
+    padding-right: 12px;
+    padding-left: 12px;
+  }
+
+  .message {
+    max-width: 90%;
+  }
+}

@@ -224,6 +224,57 @@ public class ManifestBuilderTests
     }
 
     [Fact]
+    public void Build_emits_personal_static_tab_and_adds_its_host_to_valid_domains()
+    {
+        var m = ManifestBuilder.Build(
+            "Agent",
+            "Desc",
+            BotId,
+            ssoAadAppId: "00000000-0000-0000-0000-deadbeef0001",
+            ssoResource: "api://backend",
+            tabContentUrl: "https://proxy.example.com/chat/host/project/Agent/ui");
+
+        var tab = ((JArray)m["staticTabs"]!).Should().ContainSingle().Subject;
+        tab["entityId"]!.ToString().Should().Be("foundry-agent-chat");
+        tab["name"]!.ToString().Should().Be("Chat");
+        tab["contentUrl"]!.ToString().Should().Be("https://proxy.example.com/chat/host/project/Agent/ui");
+        ((JArray)tab["scopes"]!).Select(scope => scope.ToString()).Should().Equal("personal");
+        ((JArray)m["validDomains"]!).Select(domain => domain.ToString())
+            .Should().Contain("proxy.example.com");
+    }
+
+    [Fact]
+    public void Build_rejects_non_https_tab_url()
+    {
+        var act = () => ManifestBuilder.Build(
+            "Agent",
+            "Desc",
+            BotId,
+            tabContentUrl: "http://proxy.example.com/chat/host/project/Agent/ui");
+
+        act.Should().Throw<ArgumentException>().WithMessage("*HTTPS*");
+    }
+
+    [Fact]
+    public void BuildTab_emits_tab_only_manifest_with_shared_sso_app()
+    {
+        var m = ManifestBuilder.BuildTab(
+            "Agent",
+            "Desc",
+            "https://proxy.example.com/chat/host/project/Agent/ui",
+            "00000000-0000-0000-0000-deadbeef0001",
+            "api://shared-backend");
+
+        m["bots"].Should().BeNull();
+        ((JArray)m["staticTabs"]!).Should().ContainSingle();
+        m["webApplicationInfo"]!["id"]!.ToString()
+            .Should().Be("00000000-0000-0000-0000-deadbeef0001");
+        m["webApplicationInfo"]!["resource"]!.ToString().Should().Be("api://shared-backend");
+        ((JArray)m["validDomains"]!).Select(domain => domain.ToString())
+            .Should().Equal("proxy.example.com");
+    }
+
+    [Fact]
     public void Build_does_not_emit_botEndpointPath_when_omitted_or_default()
     {
         // x-foundryBotEndpointPath was removed entirely — Teams' manifest

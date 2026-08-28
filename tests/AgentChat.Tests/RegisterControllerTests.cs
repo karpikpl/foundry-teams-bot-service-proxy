@@ -135,12 +135,28 @@ public class RegisterControllerTests
         repo.GetAll().Should().BeEmpty();
     }
 
-    private static RegisterController MakeController(IRouteRepository repo)
+    [Fact]
+    public void Form_falls_back_to_default_project_when_route_metadata_missing()
+    {
+        var repo = new InMemoryRouteRepository();
+        // Legacy row seeded before FoundryHost/ProjectName were captured.
+        repo.AddSync(new BotRoute("legacy-bot", ProxyId));
+        var c = MakeController(repo, defaultEndpoint: "https://aif-abc.services.ai.azure.com/api/projects/proj-abc");
+
+        var r = (ContentResult)c.Form();
+
+        r.Content.Should().Contain("aif-abc");
+        r.Content.Should().Contain("proj-abc");
+        r.Content.Should().Contain("defaulted from Foundry:ProjectEndpoint");
+    }
+
+    private static RegisterController MakeController(IRouteRepository repo, string? defaultEndpoint = null)
     {
         var cfg = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
         {
             ["MicrosoftAppTenantId"] = "tenant-guid",
             ["AZURE_CLIENT_ID"] = "uami-guid",
+            ["Foundry:ProjectEndpoint"] = defaultEndpoint,
         }).Build();
         var c = new RegisterController(repo, cfg, NullLogger<RegisterController>.Instance);
         c.ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() };

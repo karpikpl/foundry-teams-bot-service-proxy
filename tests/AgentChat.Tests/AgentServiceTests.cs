@@ -170,6 +170,18 @@ public class AgentServiceTests
         await act.Should().ThrowAsync<InvalidOperationException>().WithMessage("*No active agents*");
     }
 
+    [Fact]
+    public async Task DefaultAsync_prefers_the_configured_agent_over_catalog_order()
+    {
+        var svc = MakeService(
+            new() { ["Foundry:AgentName"] = "Alice" },
+            new HandlerHttpClientFactory(new MultiAgentCatalogHandler()));
+
+        var result = await svc.DefaultAsync("user-a", "obo-token-a");
+
+        result.Name.Should().Be("Alice");
+    }
+
     // -------------------------- helpers --------------------------
 
     private sealed class SimpleHttpClientFactory : IHttpClientFactory
@@ -222,6 +234,45 @@ public class AgentServiceTests
                       "description": "Agent for {{projectName}}",
                       "status": "active",
                       "definition": { "model": "gpt-4o" }
+                    }
+                  }
+                }
+              ]
+            }
+            """;
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(json)
+            });
+        }
+    }
+
+    private sealed class MultiAgentCatalogHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            const string json = """
+            {
+              "data": [
+                {
+                  "name": "teams-invocations-agent-csharp",
+                  "versions": {
+                    "latest": {
+                      "version": "7",
+                      "status": "active",
+                      "definition": { "model": "gpt-5.2" }
+                    }
+                  }
+                },
+                {
+                  "name": "Alice",
+                  "versions": {
+                    "latest": {
+                      "version": "14",
+                      "status": "active",
+                      "definition": { "model": "gpt-5.2" }
                     }
                   }
                 }

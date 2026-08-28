@@ -1,0 +1,87 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+
+requiredVersions:
+  extensions:
+    azure.ai.agents: ">=1.0.0-beta.11"
+    azure.ai.projects: ">=1.0.0-beta.4"
+
+name: foundry-teams-csharp-hosted-agent
+
+services:
+  existing-project:
+    host: azure.ai.project
+    endpoint: https://ai-foundry-oqnqbhm7jwxsc.services.ai.azure.com/api/projects/ai-project-oqnqbhm7jwxsc-1
+
+  teams-invocations-agent-csharp:
+    host: azure.ai.agent
+    project: src/AgentChat
+    language: csharp
+    uses:
+      - existing-project
+    codeConfiguration:
+      dependencyResolution: bundled
+      runtime: dotnet_10
+      entryPoint: AgentChat.dll
+    container:
+      resources:
+        cpu: "0.5"
+        memory: 1Gi
+    sessionConfiguration:
+      idleTimeoutSeconds: 300
+    environmentVariables:
+      - name: AZURE_CLIENT_ID
+        value: ${HOSTED_AGENT_CLIENT_ID}
+      - name: HostedAgent__Enabled
+        value: "true"
+      - name: MicrosoftAppId
+        value: ${HOSTED_AGENT_CLIENT_ID}
+      - name: MicrosoftAppType
+        value: UserAssignedMSI
+      - name: Foundry__ProjectEndpoint
+        value: ${FOUNDRY_PROJECT_ENDPOINT}
+      - name: Foundry__AgentName
+        value: ${FOUNDRY_TARGET_AGENT_NAME=Alice}
+      - name: Foundry__UseManagedIdentityForAgents
+        value: "true"
+      - name: Cosmos__Endpoint
+        value: ${COSMOS_ENDPOINT}
+      - name: Cosmos__Database
+        value: ${COSMOS_DATABASE=botstate}
+      - name: Cosmos__Container
+        value: ${COSMOS_CONTAINER=conversations}
+      - name: MicrosoftAppTenantId
+        value: ${BOT_TENANT_ID}
+      - name: TeamsApp__SsoConnectionName
+        value: ${TEAMS_SSO_CONNECTION_NAME=foundry-sso}
+      - name: JwtValidation__Enabled
+        value: "false"
+    kind: hosted
+    name: teams-invocations-agent-csharp
+    displayName: Teams Invocations Agent (.NET)
+    description: C# hosted agent reusing the production Teams proxy streaming, cards, OAuth, commands, and Cosmos state.
+    protocols:
+      - protocol: activity
+        version: 2.0.0
+      - protocol: invocations
+        version: 2.0.0
+      - protocol: responses
+        version: 2.0.0
+    agentEndpoint:
+      protocols:
+        - activity
+        - invocations
+        - responses
+      authorizationSchemes:
+        - type: BotServiceRbac
+        - type: Entra
+
+infra:
+  provider: microsoft.foundry
+
+hooks:
+  postdeploy:
+    posix:
+      shell: sh
+      run: ./scripts/configure-hosted-identity.sh
+      interactive: false
+      continueOnError: false

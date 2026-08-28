@@ -1,5 +1,8 @@
 # Deployment notes
 
+For the Foundry-hosted deployment that routes Azure Bot traffic through APIM,
+see [`hosted-infra/apim`](../hosted-infra/apim/README.md).
+
 This walks through deploying the bot to **Azure App Service for Containers** with **Cosmos serverless** for state and **Bot Service** as the Teams front door. Everything is AAD-only (no keys).
 
 Reference your own Terraform/Bicep — this is a checklist, not a copy-pasteable script.
@@ -140,6 +143,40 @@ When you want each Teams user's identity to flow through to Foundry (and from th
 - The user's tenant must match the Foundry project's tenant — Foundry doesn't support cross-tenant OAuth identity passthrough.
 - On the user's first message, Teams attempts silent SSO via the `webApplicationInfo` configuration. If consent is missing, an OAuthCard renders; on click the user signs in, then the bot replays the original message.
 - For MCP tools configured with OAuth identity passthrough, Foundry surfaces a sign-in card the first time the user hits the tool (the bot renders it as an Adaptive Card with the consent link). One-time per user per MCP server.
+
+## Personal Teams chat tab
+
+The proxy manifest can also include a fixed-agent personal tab backed by:
+
+`/chat/{foundryHost}/{project}/{agent}/ui`
+
+The tab uses `@microsoft/teams-js` silent SSO to obtain an access token for the shared backend app, sends that token to the proxy API, and the proxy exchanges it through OBO for `https://ai.azure.com/.default`. The tab never calls Foundry directly and does not use the `/admin` OIDC cookie.
+
+Configure:
+
+- `TeamsTab__Enabled = true`
+- `TeamsTab__PublicOrigin = https://<public-proxy-host>`
+- `TeamsApp__TenantId`
+- `TeamsApp__BackendAppId`
+- `TeamsApp__BackendSecret`
+- `TeamsApp__IdentifierUri = api://<backend-app-id>`
+
+The backend app registration must:
+
+1. Expose delegated scope `access_as_user`.
+2. Pre-authorize the Teams desktop and Teams web/mobile client IDs listed above.
+3. Include delegated Azure AI Foundry access and have tenant consent.
+4. Register the exact popup redirect URI:
+   `https://<public-proxy-host>/chat/auth/callback`
+
+Generate or deploy the tab as a separate **tab-only** Teams package. It
+contains a personal `staticTabs` entry and the shared backend
+`webApplicationInfo`, but no `bots` capability. Existing direct and proxy bot
+packages remain bot-only and continue to use their agent-specific identities.
+The same fixed-agent tab package can be installed by every user; Teams SSO and
+Foundry OBO still run independently under each signed-in user's identity.
+
+The React tab uses Fluent UI React v9 and follows Teams light, dark, and high-contrast theme changes. `dotnet publish` runs `npm ci` and builds the checked-in frontend workspace under `src/AgentChat/ClientApp`.
 
 ### What happens without Teams SSO
 

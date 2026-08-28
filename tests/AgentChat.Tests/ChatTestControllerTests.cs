@@ -166,6 +166,111 @@ public class ChatTestControllerTests
     }
 
     [Fact]
+    public async Task StreamMessageWithFiles_embeds_file_in_responses_input()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueSse(ResponseCreated("resp_file"), TextDelta("done"), ResponseCompleted("resp_file"));
+        var controller = MakeController(
+            catalog,
+            withHttpContext: true,
+            clientCache: foundry.ToClientCache(service),
+            service: service);
+        var bytes = Encoding.UTF8.GetBytes("hello from the attachment");
+        var formFile = new FormFile(new MemoryStream(bytes), 0, bytes.Length, "files", "notes.txt")
+        {
+            Headers = new HeaderDictionary(),
+            ContentType = "text/plain"
+        };
+
+        await controller.StreamMessageWithFiles(new ChatTestController.FileMessageRequest
+        {
+            AgentKey = "agent-a",
+            ConversationId = "conv-file",
+            Message = "Summarize this",
+            Files = [formFile]
+        }, CancellationToken.None);
+
+        var request = foundry.Requests.Single(r => r.Method == "POST" && r.Url.Contains("/responses"));
+        request.Body.Should().Contain("\"type\":\"input_file\"");
+        request.Body.Should().Contain("\"filename\":\"notes.txt\"");
+        request.Body.Should().Contain(Convert.ToBase64String(bytes));
+        (await ReadResponseAsync(controller)).Should().Contain("done");
+    }
+
+    [Fact]
+    public async Task StreamMessage_emits_download_for_generated_container_file()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueSse(
+            ResponseCreated("resp_generated"),
+            GeneratedFileMessageDone("msg_generated", "cntr_1", "cfile_1", "slides.pptx"),
+            ResponseCompleted("resp_generated"));
+        var generatedBytes = Encoding.UTF8.GetBytes("pptx bytes");
+        foundry.EnqueueBinary(generatedBytes);
+        var fileService = new AgentFileService(TestServices.Config());
+        var controller = MakeController(
+            catalog,
+            withHttpContext: true,
+            clientCache: foundry.ToClientCache(service),
+            service: service,
+            fileService: fileService);
+        controller.Request.Scheme = "https";
+        controller.Request.Host = new HostString("chat.example");
+
+        await controller.StreamMessage(
+            new ChatTestController.MessageRequest("agent-a", "conv-generated", "create slides"),
+            CancellationToken.None);
+
+        var sse = await ReadResponseAsync(controller);
+        var fileEvent = SseEventData(sse, "file").Should().ContainSingle().Subject;
+        using var payload = JsonDocument.Parse(fileEvent);
+        payload.RootElement.GetProperty("FileName").GetString().Should().Be("slides.pptx");
+        var downloadUrl = new Uri(payload.RootElement.GetProperty("Url").GetString()!);
+        downloadUrl.Host.Should().Be("chat.example");
+        foundry.Requests.Should().Contain(r =>
+            r.Method == "GET" &&
+            r.Url.Contains("/api/projects/default-project/openai/v1/containers/cntr_1/files/cfile_1/content"));
+
+        var token = downloadUrl.Segments[^2].Trim('/');
+        fileService.TryGetDownload(token, out var download).Should().BeTrue();
+        download.Content.Should().Equal(generatedBytes);
+        download.ContentType.Should().Be("application/vnd.openxmlformats-officedocument.presentationml.presentation");
+    }
+
+    [Fact]
+    public async Task Generated_file_download_failure_does_not_discard_completed_response()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var service = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueSse(
+            ResponseCreated("resp_generated"),
+            TextDelta("Your presentation is ready."),
+            GeneratedFileMessageDone("msg_generated", "cntr_missing", "cfile_missing", "slides.pptx"),
+            ResponseCompleted("resp_generated"));
+        foundry.EnqueueJson(HttpStatusCode.NotFound, "{\"error\":{\"message\":\"not found\"}}");
+        var controller = MakeController(
+            catalog,
+            withHttpContext: true,
+            clientCache: foundry.ToClientCache(service),
+            service: service);
+
+        await controller.StreamMessage(
+            new ChatTestController.MessageRequest("agent-a", "conv-file-404", "create slides"),
+            CancellationToken.None);
+
+        var sse = await ReadResponseAsync(controller);
+        sse.Should().Contain("event: text\ndata: Your presentation is ready.");
+        sse.Should().Contain("event: file_error");
+        sse.Should().Contain("event: done");
+        sse.Should().NotContain("event: error");
+    }
+
+    [Fact]
     public async Task Admin_chat_auth_filter_allows_anonymous_when_disabled()
     {
         var context = MakeAuthorizationContext(new ClaimsPrincipal(new ClaimsIdentity()));
@@ -256,7 +361,8 @@ public class ChatTestControllerTests
         AgentClientCache? clientCache = null,
         AgentService? service = null,
         AdminChatAuthOptions? adminChatAuth = null,
-        ITokenAcquisition? tokenAcquisition = null)
+        ITokenAcquisition? tokenAcquisition = null,
+        AgentFileService? fileService = null)
     {
         service ??= TestServices.AgentService(handler);
         var env = new Mock<IWebHostEnvironment>();
@@ -264,6 +370,7 @@ public class ChatTestControllerTests
         var controller = new ChatTestController(
             service,
             clientCache ?? new AgentClientCache(service),
+            fileService ?? new AgentFileService(TestServices.Config()),
             env.Object,
             NullLogger<ChatTestController>.Instance,
             adminChatAuth ?? new AdminChatAuthOptions { Enabled = true },
@@ -347,6 +454,40 @@ public class ChatTestControllerTests
 
     private static string CodeInterpreterDone(string id, string code, string output)
         => $"{{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{{\"id\":\"{id}\",\"type\":\"code_interpreter_call\",\"status\":\"completed\",\"container_id\":\"cntr_1\",\"code\":\"{code.Replace("'", "\\u0027")}\",\"outputs\":[{{\"type\":\"logs\",\"logs\":\"{output}\"}}]}}}}";
+
+    private static string GeneratedFileMessageDone(string id, string containerId, string fileId, string fileName)
+        => JsonSerializer.Serialize(new
+        {
+            type = "response.output_item.done",
+            output_index = 0,
+            item = new
+            {
+                id,
+                type = "message",
+                role = "assistant",
+                status = "completed",
+                content = new[]
+                {
+                    new
+                    {
+                        type = "output_text",
+                        text = "Download the generated file.",
+                        annotations = new[]
+                        {
+                            new
+                            {
+                                type = "container_file_citation",
+                                container_id = containerId,
+                                file_id = fileId,
+                                start_index = 0,
+                                end_index = 8,
+                                filename = fileName
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
     private static string ResponseCompleted(string id)
         => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";

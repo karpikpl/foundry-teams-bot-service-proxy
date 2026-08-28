@@ -40,10 +40,12 @@ public class ChatTestController : ControllerBase
     private readonly AdminChatAuthOptions _adminChatAuth;
     private readonly ITokenAcquisition? _tokenAcquisition;
     private readonly ChatSessionService _chatSessions;
+    private readonly AgentFileService _files;
 
     public ChatTestController(
         AgentService agents,
         AgentClientCache clientCache,
+        AgentFileService files,
         IWebHostEnvironment env,
         ILogger<ChatTestController> logger,
         AdminChatAuthOptions? adminChatAuth = null,
@@ -53,10 +55,12 @@ public class ChatTestController : ControllerBase
         _env              = env;
         _adminChatAuth    = adminChatAuth ?? new AdminChatAuthOptions();
         _tokenAcquisition = tokenAcquisition;
+        _files            = files;
         _chatSessions     = chatSessions ?? new ChatSessionService(
             agents,
             clientCache,
-            Microsoft.Extensions.Logging.Abstractions.NullLogger<ChatSessionService>.Instance);
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ChatSessionService>.Instance,
+            files);
     }
 
     // ====================================================== HTML page
@@ -157,6 +161,15 @@ public class ChatTestController : ControllerBase
 
     public sealed record ApprovalRequest(string RequestId, bool Approve);
     public sealed record MessageRequest(string AgentKey, string ConversationId, string? Message, string? FoundryHost = null, string? Project = null, ApprovalRequest? Approval = null);
+    public sealed class FileMessageRequest
+    {
+        public string AgentKey { get; init; } = "";
+        public string ConversationId { get; init; } = "";
+        public string? Message { get; init; }
+        public string? FoundryHost { get; init; }
+        public string? Project { get; init; }
+        public List<IFormFile> Files { get; init; } = [];
+    }
 
     /// <summary>
     /// POST the user's message and stream the response back as Server-Sent
@@ -173,15 +186,49 @@ public class ChatTestController : ControllerBase
     ///   event: error    — error (data: human-readable message)
     /// </summary>
     [HttpPost("messages")]
+    [Consumes("application/json")]
     public async Task StreamMessage([FromBody] MessageRequest body, CancellationToken ct)
+        => await StreamMessageCoreAsync(body, [], ct);
+
+    [HttpPost("messages")]
+    [Consumes("multipart/form-data")]
+    [RequestSizeLimit(60L * 1024 * 1024)]
+    public async Task StreamMessageWithFiles([FromForm] FileMessageRequest body, CancellationToken ct)
+    {
+        try
+        {
+            var inputFiles = await _files.ReadFormFilesAsync(body.Files, ct);
+            await StreamMessageCoreAsync(
+                new MessageRequest(
+                    body.AgentKey,
+                    body.ConversationId,
+                    body.Message,
+                    body.FoundryHost,
+                    body.Project),
+                inputFiles,
+                ct);
+        }
+        catch (InvalidOperationException ex)
+        {
+            Response.Headers["Content-Type"] = "text/event-stream";
+            await WriteSseAsync("error", ex.Message, ct);
+        }
+    }
+
+    private async Task StreamMessageCoreAsync(
+        MessageRequest body,
+        IReadOnlyList<AgentInputFile> inputFiles,
+        CancellationToken ct)
     {
         Response.Headers["Content-Type"]      = "text/event-stream";
         Response.Headers["Cache-Control"]     = "no-cache";
         Response.Headers["X-Accel-Buffering"] = "no";
 
-        if (string.IsNullOrEmpty(body?.AgentKey) || string.IsNullOrEmpty(body.ConversationId) || (string.IsNullOrEmpty(body.Message) && body.Approval is null))
+        if (string.IsNullOrEmpty(body?.AgentKey)
+            || string.IsNullOrEmpty(body.ConversationId)
+            || (string.IsNullOrWhiteSpace(body.Message) && body.Approval is null && inputFiles.Count == 0))
         {
-            await WriteSseAsync("error", "agentKey, conversationId, and either message or approval are required", ct);
+            await WriteSseAsync("error", "agentKey, conversationId, and a message, attachment, or approval are required", ct);
             return;
         }
 
@@ -200,7 +247,11 @@ public class ChatTestController : ControllerBase
                 body.Message,
                 body.Approval is null
                     ? null
-                    : new ChatSessionService.Approval(body.Approval.RequestId, body.Approval.Approve)),
+                    : new ChatSessionService.Approval(body.Approval.RequestId, body.Approval.Approve),
+                inputFiles,
+                HttpContext?.Request.Host.HasValue == true
+                    ? AgentFileService.PublicBaseUri(HttpContext.Request)
+                    : null),
             projectEndpoint,
             ToChatUser(user),
             WriteSseAsync,

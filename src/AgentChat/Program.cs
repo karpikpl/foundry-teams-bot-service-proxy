@@ -107,6 +107,16 @@ builder.Services.AddAuthorization(options =>
 });
 builder.Services.AddApplicationInsightsTelemetry();
 builder.Services.AddHttpClient();
+builder.Services.AddHttpClient(nameof(TeamsAttachmentService))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false
+    });
+builder.Services.AddHttpClient(nameof(TeamsFileService))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
+    {
+        AllowAutoRedirect = false
+    });
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddHealthChecks();
 if (builder.Configuration.GetValue("HostedAgent:Enabled", false))
@@ -119,6 +129,9 @@ builder.Services.AddSingleton<AgentService>();
 builder.Services.AddSingleton<AgentClientCache>();
 builder.Services.AddSingleton<TeamsSsoService>();
 builder.Services.AddSingleton<ChatSessionService>();
+builder.Services.AddSingleton<AgentFileService>();
+builder.Services.AddSingleton<ITeamsAttachmentService, TeamsAttachmentService>();
+builder.Services.AddSingleton<ITeamsFileService, TeamsFileService>();
 // IStorage — Cosmos serverless via AAD (no keys).
 builder.Services.AddSingleton<IStorage>(sp =>
 {

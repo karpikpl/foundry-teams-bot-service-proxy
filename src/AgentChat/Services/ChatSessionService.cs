@@ -15,21 +15,29 @@ public sealed class ChatSessionService
     private readonly AgentService _agents;
     private readonly AgentClientCache _clientCache;
     private readonly ILogger<ChatSessionService> _logger;
+    private readonly AgentFileService? _files;
 
     public ChatSessionService(
         AgentService agents,
         AgentClientCache clientCache,
-        ILogger<ChatSessionService> logger)
+        ILogger<ChatSessionService> logger,
+        AgentFileService? files = null)
     {
         _agents = agents;
         _clientCache = clientCache;
         _logger = logger;
+        _files = files;
     }
 
     public sealed record UserContext(string ObjectId, string Token);
     public sealed record Conversation(string ConversationId, string AgentName, string Endpoint);
     public sealed record Approval(string RequestId, bool Approve);
-    public sealed record Message(string ConversationId, string? Text, Approval? Approval = null);
+    public sealed record Message(
+        string ConversationId,
+        string? Text,
+        Approval? Approval = null,
+        IReadOnlyList<AgentInputFile>? Files = null,
+        Uri? PublicBaseUri = null);
 
     public enum AgentLookup
     {
@@ -95,7 +103,9 @@ public sealed class ChatSessionService
     {
         if (string.IsNullOrWhiteSpace(agentIdentifier)
             || string.IsNullOrWhiteSpace(message.ConversationId)
-            || (string.IsNullOrWhiteSpace(message.Text) && message.Approval is null))
+            || (string.IsNullOrWhiteSpace(message.Text)
+                && message.Approval is null
+                && message.Files?.Count is not > 0))
         {
             await writeEvent("error", "agent, conversationId, and either message or approval are required", ct);
             return;
@@ -132,10 +142,14 @@ public sealed class ChatSessionService
         }
         else
         {
-            inputItems = [ResponseItem.CreateUserMessageItem(message.Text!)];
+            inputItems = message.Files?.Count is > 0
+                ? [_files?.CreateUserMessage(message.Text, message.Files)
+                    ?? throw new InvalidOperationException("File handling is not configured.")]
+                : [ResponseItem.CreateUserMessageItem(message.Text!)];
         }
 
-        var responses = _clientCache.For(agent.Endpoint).OpenAI.GetResponsesClient();
+        var foundry = _clientCache.For(agent.Endpoint);
+        var responses = foundry.OpenAI.GetResponsesClient();
         try
         {
             var safety = 0;
@@ -154,10 +168,12 @@ public sealed class ChatSessionService
                     inputItems,
                     firstPreviousResponseId);
                 var step = await StreamFoundryOnceAsync(
+                    foundry,
                     responses,
                     options,
                     pendingKey,
                     clearApprovalOnNextStream,
+                    message.PublicBaseUri,
                     writeEvent,
                     ct);
                 clearApprovalOnNextStream = false;
@@ -231,14 +247,17 @@ public sealed class ChatSessionService
     }
 
     private async Task<StreamStep> StreamFoundryOnceAsync(
+        FoundryClient foundry,
         ResponsesClient responses,
         CreateResponseOptions options,
         string pendingKey,
         bool clearsPendingApproval,
+        Uri? publicBaseUri,
         Func<string, string, CancellationToken, Task> writeEvent,
         CancellationToken ct)
     {
         var seenIds = new HashSet<string>();
+        var seenFiles = new HashSet<string>(StringComparer.Ordinal);
         var responseIdForResume = options.PreviousResponseId;
         await foreach (var update in responses.CreateResponseStreamingAsync(options, ct))
         {
@@ -262,7 +281,15 @@ public sealed class ChatSessionService
                 case StreamingResponseOutputItemDoneUpdate done:
                     var item = done.Item;
                     if (item.Id is { } id && !seenIds.Add(id)) break;
-                    if (await HandleItemAsync(item, pendingKey, responseIdForResume, writeEvent, ct))
+                    if (await HandleItemAsync(
+                            foundry,
+                            item,
+                            pendingKey,
+                            responseIdForResume,
+                            seenFiles,
+                            publicBaseUri,
+                            writeEvent,
+                            ct))
                         return new StreamStep(true);
                     break;
 
@@ -309,9 +336,12 @@ public sealed class ChatSessionService
     }
 
     private async Task<bool> HandleItemAsync(
+        FoundryClient foundry,
         ResponseItem item,
         string pendingKey,
         string? responseIdForResume,
+        HashSet<string> seenFiles,
+        Uri? publicBaseUri,
         Func<string, string, CancellationToken, Task> writeEvent,
         CancellationToken ct)
     {
@@ -331,6 +361,7 @@ public sealed class ChatSessionService
                     kind = "mcp",
                     tool = mcp.ToolName,
                     server = mcp.ServerLabel,
+                    args = mcp.ToolArguments?.ToString() ?? "{}",
                     output = Truncate(mcp.ToolOutput ?? mcp.Error?.ToString() ?? "(no output)", 2000)
                 }), ct);
                 return false;
@@ -340,12 +371,12 @@ public sealed class ChatSessionService
                 {
                     kind = "web_search",
                     tool = "web_search",
-                    args = ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
+                    args = ToolCallPresentation.ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
                 }), ct);
                 return false;
 
             case CodeInterpreterCallResponseItem codeInterpreter:
-                var (code, output) = ExtractCodeInterpreterDetails(codeInterpreter);
+                var (code, output) = ToolCallPresentation.ExtractCodeInterpreterDetails(codeInterpreter);
                 await writeEvent("tool", JsonSerializer.Serialize(new
                 {
                     kind = "code_interpreter",
@@ -353,6 +384,46 @@ public sealed class ChatSessionService
                     args = code ?? "(code unavailable)",
                     output
                 }), ct);
+                return false;
+
+            case MessageResponseItem message:
+                if (_files is null) return false;
+                foreach (var part in message.Content)
+                {
+                    foreach (var annotation in part.OutputTextAnnotations ?? [])
+                    {
+                        if (annotation is not ContainerFileCitationMessageAnnotation file
+                            || !seenFiles.Add($"{file.ContainerId}\n{file.FileId}"))
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            var generated = await _files.CaptureContainerFileAsync(
+                                foundry,
+                                file,
+                                publicBaseUri
+                                    ?? throw new InvalidOperationException("The public file-download origin is unavailable."),
+                                ct);
+                            await writeEvent("file", JsonSerializer.Serialize(generated), ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(
+                                ex,
+                                "Could not capture generated container file {FileName} ({ContainerId}/{FileId})",
+                                file.Filename,
+                                file.ContainerId,
+                                file.FileId);
+                            await writeEvent("file_error", JsonSerializer.Serialize(new
+                            {
+                                fileName = file.Filename,
+                                message = "The generated file could not be downloaded."
+                            }), ct);
+                        }
+                    }
+                }
                 return false;
 
             case FunctionCallResponseItem function:
@@ -390,30 +461,6 @@ public sealed class ChatSessionService
     {
         PendingApprovals[pendingKey] = approval;
         await writeEvent("approval", SerializeApprovalEventPayload(approval), ct);
-    }
-
-    private static string? ExtractWebSearchQuery(WebSearchCallResponseItem item)
-    {
-        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
-        if (!doc.RootElement.TryGetProperty("action", out var action)) return null;
-        if (action.TryGetProperty("query", out var query) && query.ValueKind == JsonValueKind.String)
-            return query.GetString();
-        if (action.TryGetProperty("search_query", out var searchQuery) && searchQuery.ValueKind == JsonValueKind.String)
-            return searchQuery.GetString();
-        return null;
-    }
-
-    private static (string? Code, string? Output) ExtractCodeInterpreterDetails(CodeInterpreterCallResponseItem item)
-    {
-        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
-        var root = doc.RootElement;
-        var code = root.TryGetProperty("code", out var codeElement) && codeElement.ValueKind == JsonValueKind.String
-            ? codeElement.GetString()
-            : null;
-        var output = root.TryGetProperty("outputs", out var outputs) && outputs.ValueKind == JsonValueKind.Array
-            ? Truncate(outputs.GetRawText(), 2000)
-            : null;
-        return (code, output);
     }
 
     private bool TryParseApproval(ResponseItem item, string? responseIdForResume, out PendingMcpApproval approval)

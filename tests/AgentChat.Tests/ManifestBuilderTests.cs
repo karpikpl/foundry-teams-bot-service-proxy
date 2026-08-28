@@ -50,6 +50,14 @@ public class ManifestBuilderTests
     }
 
     [Fact]
+    public void Build_enables_Teams_file_apis()
+    {
+        var m = ManifestBuilder.Build("Agent", "Desc", BotId);
+
+        m["bots"]![0]!["supportsFiles"]!.Value<bool>().Should().BeTrue();
+    }
+
+    [Fact]
     public void Build_truncates_long_descriptions()
     {
         var longDesc = new string('x', 200);

@@ -1,7 +1,6 @@
 using System.ClientModel;
 using System.Diagnostics;
 using System.Net;
-using System.Net.Http.Headers;
 using System.Text.Json;
 using AgentChat.Foundry;
 using AgentChat.Services;
@@ -10,6 +9,7 @@ using Microsoft.Agents.Extensions.Teams.Compat;
 using Microsoft.Agents.Extensions.Teams.Models;
 using Microsoft.Agents.Authentication;
 using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Core.Serialization;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using OpenAI.Responses;
@@ -33,8 +33,10 @@ public class FoundryBot : TeamsActivityHandler
     private readonly IHttpContextAccessor _httpContext;
     private readonly AgentClientCache _clientCache;
     private readonly TeamsSsoService _sso;
-    private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<FoundryBot> _logger;
+    private readonly AgentFileService _files;
+    private readonly ITeamsAttachmentService? _attachments;
+    private readonly ITeamsFileService? _teamsFiles;
     // When true, Foundry calls use the container UAMI, not the user's OBO
     // token. Teams SSO is skipped for the whole turn (no sign-in card, no
     // per-user identity in Foundry). Keep this in sync with the same setting
@@ -56,8 +58,10 @@ public class FoundryBot : TeamsActivityHandler
         IHttpContextAccessor httpContext,
         AgentClientCache clientCache,
         TeamsSsoService sso,
-        IHttpClientFactory httpClientFactory,
-        ILogger<FoundryBot> logger)
+        ILogger<FoundryBot> logger,
+        AgentFileService? files = null,
+        ITeamsAttachmentService? attachments = null,
+        ITeamsFileService? teamsFiles = null)
     {
         _agents      = agents;
         _state       = state;
@@ -65,8 +69,10 @@ public class FoundryBot : TeamsActivityHandler
         _httpContext = httpContext;
         _clientCache = clientCache;
         _sso         = sso;
-        _httpClientFactory = httpClientFactory;
         _logger      = logger;
+        _files       = files ?? new AgentFileService(config);
+        _attachments = attachments;
+        _teamsFiles   = teamsFiles;
         _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
         _sendUserIdentityHeader      = config.GetValue("Foundry:SendUserIdentityHeader", false);
     }
@@ -144,7 +150,10 @@ public class FoundryBot : TeamsActivityHandler
             turnContext.Activity.RemoveRecipientMention();
 
         var raw = (turnContext.Activity.Text ?? "").Trim();
-        if (string.IsNullOrEmpty(raw))
+        var hasAttachments = turnContext.Activity.Attachments?.Any(
+            attachment => !string.IsNullOrWhiteSpace(attachment.ContentType) &&
+                          !attachment.ContentType.StartsWith(ContentTypes.Html, StringComparison.OrdinalIgnoreCase)) == true;
+        if (string.IsNullOrEmpty(raw) && !hasAttachments)
         {
             if (turnContext.Activity.Value is not null)
             {
@@ -171,7 +180,39 @@ public class FoundryBot : TeamsActivityHandler
             return;
         }
 
-        await RunAgentTurnAsync(turnContext, state, raw, ct);
+        IReadOnlyList<AgentInputFile> inputFiles = [];
+        if (hasAttachments)
+        {
+            if (_attachments is null)
+            {
+                await turnContext.SendActivityAsync(
+                    MessageFactory.Text("⚠️ File attachments are not configured on this bot."), ct);
+                return;
+            }
+
+            try
+            {
+                inputFiles = await _attachments.DownloadAsync(turnContext, ct);
+                if (inputFiles.Count == 0)
+                {
+                    await turnContext.SendActivityAsync(
+                        MessageFactory.Text("⚠️ I couldn't download the attached files from Teams."), ct);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to download Teams attachments.");
+                await turnContext.SendActivityAsync(
+                    MessageFactory.Text($"⚠️ I couldn't read the attached files: {ex.Message}"), ct);
+                return;
+            }
+        }
+
+        var effectiveText = string.IsNullOrWhiteSpace(raw)
+            ? "Use the attached file(s) to complete this request."
+            : raw;
+        await RunAgentTurnAsync(turnContext, state, effectiveText, ct, inputFiles: inputFiles);
     }
 
     // ---------------------------------------------------------------- commands
@@ -190,7 +231,7 @@ public class FoundryBot : TeamsActivityHandler
                         ("/agent",         "Show active agent + endpoint"),
                         ("/tokens",        "Show token usage for this conversation"),
                         ("/usage on|off",  "Toggle the per-run usage footer"),
-                        ("/tools on|off",  "Show or hide tool-call cards (off by default)"),
+                        ("/tools on|off",  "Show or hide tool-call cards (on by default)"),
                         ("/thinking on|off", "Show or hide live thinking status (on by default)"),
                         ("/auto list|clear", "Manage auto-approved MCP tools"),
                         ("/signout",       "Sign out (clears cached Teams SSO token)"),
@@ -336,10 +377,11 @@ public class FoundryBot : TeamsActivityHandler
         if (newValue is null)
         {
             await turnContext.SendActivityAsync(MessageFactory.Text(
-                $"Tool-call cards are currently **{(state.ShowToolCalls ? "on" : "off")}**. Use `/tools on` to show them (handy for troubleshooting) or `/tools off` to hide them."), ct);
+                $"Tool-call cards are currently **{(state.ShouldShowToolCalls() ? "on" : "off")}**. Use `/tools on` to show them or `/tools off` to hide them."), ct);
             return;
         }
         state.ShowToolCalls = newValue.Value;
+        state.ToolCallDisplayPreferenceSet = true;
         await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
         await turnContext.SendActivityAsync(MessageFactory.Text(
             newValue.Value
@@ -457,39 +499,21 @@ public class FoundryBot : TeamsActivityHandler
 
     private static bool IsKnownCardSubmit(object value)
     {
-        return TryGetCardData(value, out var data)
-            && data.Value<string>("action") is { } action
-            && KnownCardActions.Contains(action);
-    }
-
-    private static bool TryGetCardData(object value, out JObject data)
-    {
         try
         {
-            data = value switch
-            {
-                JObject jobject => jobject,
-                JsonElement element when element.ValueKind == JsonValueKind.Object
-                    => JObject.Parse(element.GetRawText()),
-                _ => JObject.FromObject(value)
-            };
-            return true;
+            var data = ReadCardSubmit(value);
+            var action = data.Value<string>("action");
+            return !string.IsNullOrWhiteSpace(action) && KnownCardActions.Contains(action);
         }
         catch
         {
-            data = null!;
             return false;
         }
     }
 
     private async Task HandleCardSubmitAsync(ITurnContext turnContext, CancellationToken ct)
     {
-        if (!TryGetCardData(turnContext.Activity.Value!, out var data))
-        {
-            _logger.LogWarning("Ignoring malformed card submit payload.");
-            return;
-        }
-
+        var data   = ReadCardSubmit(turnContext.Activity.Value!);
         var action = data.Value<string>("action") ?? "";
         var state  = await _state.GetOrCreateAsync(turnContext.Activity.Conversation.Id, ct);
         await _state.TouchAsync(turnContext.Activity.Conversation.Id, turnContext.Activity.GetConversationReference(), ct);
@@ -522,6 +546,14 @@ public class FoundryBot : TeamsActivityHandler
                 break;
         }
     }
+
+    private static JObject ReadCardSubmit(object value)
+        => value switch
+        {
+            JObject data => data,
+            JsonElement element when element.ValueKind == JsonValueKind.Object => JObject.Parse(element.GetRawText()),
+            _ => JObject.FromObject(value)
+        };
 
     /// <summary>
     /// User clicked "I've signed in" on a consent card. Re-stream the previously
@@ -746,7 +778,11 @@ public class FoundryBot : TeamsActivityHandler
     /// re-trigger via the <c>signin/tokenExchange</c> invoke handler.
     /// </summary>
     private async Task<UserAuth> TryAcquireUserAuthAsync(
-        ITurnContext turnContext, ConversationState state, string? pendingMessage, CancellationToken ct)
+        ITurnContext turnContext,
+        ConversationState state,
+        string? pendingMessage,
+        CancellationToken ct,
+        IReadOnlyList<AgentInputFile>? pendingFiles = null)
     {
         if (_useManagedIdentityForAgents)
         {
@@ -790,8 +826,21 @@ public class FoundryBot : TeamsActivityHandler
         // an interactive Sign In button otherwise.
         if (!string.IsNullOrEmpty(pendingMessage))
         {
+            var previousMessage = state.PendingSsoMessage;
             state.PendingSsoMessage = pendingMessage;
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+            try
+            {
+                _files.StorePendingFiles(
+                    turnContext.Activity.Conversation.Id,
+                    pendingFiles ?? []);
+            }
+            catch
+            {
+                state.PendingSsoMessage = previousMessage;
+                await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
+                throw;
+            }
             _logger.LogInformation("Stored pending Teams SSO message for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
         }
         _logger.LogInformation("Sending Teams SSO sign-in card for conversation {ConversationId}.", turnContext.Activity.Conversation.Id);
@@ -851,23 +900,31 @@ public class FoundryBot : TeamsActivityHandler
         ConversationState state,
         string userText,
         CancellationToken ct,
-        string? userTokenOverride = null)
+        string? userTokenOverride = null,
+        IReadOnlyList<AgentInputFile>? inputFiles = null)
     {
         var activityId = EnsureActivityId(turnContext);
         using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
 
         var auth = string.IsNullOrEmpty(userTokenOverride)
-            ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct)
+            ? await TryAcquireUserAuthAsync(turnContext, state, pendingMessage: userText, ct, inputFiles)
             : new UserAuth(false, userTokenOverride, turnContext.Activity.From?.AadObjectId);
-        if (!auth.ShouldProceed) return;
+        if (!auth.ShouldProceed)
+            return;
 
         using (ApplyAuthScope(auth))
         {
-            await RunAgentTurnInnerAsync(turnContext, state, userText, auth, ct);
+            await RunAgentTurnInnerAsync(turnContext, state, userText, inputFiles ?? [], auth, ct);
         }
     }
 
-    private async Task RunAgentTurnInnerAsync(ITurnContext turnContext, ConversationState state, string userText, UserAuth auth, CancellationToken ct)
+    private async Task RunAgentTurnInnerAsync(
+        ITurnContext turnContext,
+        ConversationState state,
+        string userText,
+        IReadOnlyList<AgentInputFile> inputFiles,
+        UserAuth auth,
+        CancellationToken ct)
     {
         var activityId = EnsureActivityId(turnContext);
         using var scope = _logger.BeginScope(new Dictionary<string, object> { ["activityId"] = activityId });
@@ -921,7 +978,12 @@ public class FoundryBot : TeamsActivityHandler
 
         _logger.LogInformation("Calling RunAgentTurnAsync for conversation {ConversationId}; current response id: {ResponseId}",
             state.ConversationId, state.CurrentResponseId ?? "(none)");
-        await StreamResponseLoopAsync(turnContext, state, foundry, ct, new[] { ResponseItem.CreateUserMessageItem(userText) });
+        await StreamResponseLoopAsync(
+            turnContext,
+            state,
+            foundry,
+            ct,
+            new[] { _files.CreateUserMessage(userText, inputFiles) });
     }
 
     // ---------------------------------------------------------------- streaming loop
@@ -1012,7 +1074,7 @@ public class FoundryBot : TeamsActivityHandler
 
     private static IList<Attachment>? BuildReasoningAttachments(ConversationState state, IList<ThinkingStep> steps)
     {
-        if (!state.ShowThinking || steps.Count == 0) return null;
+        if (!state.ShowThinking || state.ShouldShowToolCalls() || steps.Count == 0) return null;
         return new List<Attachment> { AdaptiveCardBuilder.BuildReasoningCard(steps) };
     }
 
@@ -1068,7 +1130,26 @@ public class FoundryBot : TeamsActivityHandler
     }
 
     /// <summary>Pending OAuth consent request surfaced by Foundry's MCP passthrough.</summary>
-    private sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
+    internal sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
+
+    internal static IReadOnlyList<PendingConsent> DeduplicateConsents(IEnumerable<PendingConsent> consents)
+    {
+        var unique = new List<PendingConsent>();
+        foreach (var consent in consents)
+        {
+            if (unique.Any(existing =>
+                    (!string.Equals(consent.Id, "?", StringComparison.Ordinal)
+                     && string.Equals(existing.Id, consent.Id, StringComparison.Ordinal))
+                    || string.Equals(existing.ConsentLink, consent.ConsentLink, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            unique.Add(consent);
+        }
+
+        return unique;
+    }
 
     /// <returns>Whether the loop should stop, or the input items for the next response hop.</returns>
     private async Task<StreamStep> ProcessStreamAsync(
@@ -1087,6 +1168,8 @@ public class FoundryBot : TeamsActivityHandler
         var pendingConsents      = new List<PendingConsent>();
         var seenIds              = new HashSet<string>();
         var citations            = new List<UrlCitation>();
+        var generatedFiles       = new List<AgentChat.Services.GeneratedFileLink>();
+        var seenGeneratedFiles   = new HashSet<string>(StringComparer.Ordinal);
         var responseIdForResume  = opts.PreviousResponseId ?? state.CurrentResponseId;
         var clearsPendingApprovalOnStart = opts.InputItems.Any(i => i is McpToolCallApprovalResponseItem);
         bool hadError = false;
@@ -1117,8 +1200,9 @@ public class FoundryBot : TeamsActivityHandler
 
                 case StreamingResponseOutputItemDoneUpdate done:
                     await HandleCompletedItemAsync(
-                        turnContext, state, streaming, done.Item, responseIdForResume,
-                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, citations, ct);
+                        turnContext, state, foundry, streaming, done.Item, responseIdForResume,
+                        pendingFunctionCalls, pendingApprovals, pendingConsents, seenIds, steps, citations,
+                        generatedFiles, seenGeneratedFiles, ct);
                     break;
 
                 case StreamingResponseCompletedUpdate completed:
@@ -1322,7 +1406,7 @@ public class FoundryBot : TeamsActivityHandler
                 var argsStr = fc.FunctionArguments?.ToString() ?? "{}";
                 var result  = await FunctionToolDispatcher.ExecuteAsync(fc.FunctionName, argsStr, ct);
 
-                if (state.ShowToolCalls)
+                if (state.ShouldShowToolCalls())
                 {
                     // Same Bot Connector size limit applies to function-tool cards.
                     const int previewMax = 800;
@@ -1359,19 +1443,25 @@ public class FoundryBot : TeamsActivityHandler
         //    mcp_approval_response input item chained to the response that asked.
         if (pendingApprovals.Count > 0)
         {
-            await streaming.FinalizeAsync(ct);
             var req = pendingApprovals[0];
             McpApproval.Store(state, req);
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-            await turnContext.SendActivityAsync(
-                MessageFactory.Attachment(AdaptiveCardBuilder.BuildApprovalCard(
+            if (!streaming.HasText)
+            {
+                streaming.AppendDelta("Approval required to continue.");
+            }
+            await streaming.FinalizeAsync(
+                ct,
+                new List<Attachment>
+                {
+                    AdaptiveCardBuilder.BuildApprovalCard(
                     toolName: req.ToolName,
                     serverLabel: req.ServerLabel,
                     arguments: req.ArgumentsSummary,
                     approvalRequestId: req.ApprovalRequestId,
-                    conversationId: state.ConversationId!)),
-                ct);
+                    conversationId: state.ConversationId!)
+                });
             return new StreamStep(true); // pause for user
         }
 
@@ -1381,17 +1471,20 @@ public class FoundryBot : TeamsActivityHandler
         //     same response with previous_response_id.
         if (pendingConsents.Count > 0)
         {
-            await streaming.FinalizeAsync(ct);
             state.PendingConsentResponseId = state.CurrentResponseId;
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-            foreach (var c in DeduplicateConsents(pendingConsents))
+            var consentCards = DeduplicateConsents(pendingConsents)
+                .Select(c => AdaptiveCardBuilder.BuildConsentCard(
+                    serverLabel: c.ServerLabel,
+                    consentLink: c.ConsentLink,
+                    conversationId: state.ConversationId!))
+                .ToList();
+            if (!streaming.HasText)
             {
-                await turnContext.SendActivityAsync(
-                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildConsentCard(
-                        serverLabel: c.ServerLabel, consentLink: c.ConsentLink, conversationId: state.ConversationId!)),
-                    ct);
+                streaming.AppendDelta("Sign-in required to continue.");
             }
+            await streaming.FinalizeAsync(ct, consentCards);
             return new StreamStep(true); // pause for user
         }
 
@@ -1423,9 +1516,26 @@ public class FoundryBot : TeamsActivityHandler
             if (citations.Count > 10) sb.Append($"…and {citations.Count - 10} more.\n");
             streaming.AppendDelta(sb.ToString());
         }
-        var completedText = streaming.BufferedText;
         await streaming.FinalizeAsync(ct);
-        await OfferGeneratedFilesAsync(turnContext, state, completedText, ct);
+        foreach (var file in generatedFiles)
+        {
+            if (_teamsFiles?.SupportsNativeFiles(turnContext.Activity) == true)
+            {
+                var consent = MessageFactory.Attachment(_teamsFiles.CreateConsentCard(file));
+                consent.Text = $"📄 Generated file: {file.FileName}";
+                await turnContext.SendActivityAsync(consent, ct);
+                continue;
+            }
+
+            var activity = MessageFactory.Attachment(new Attachment
+            {
+                Name = file.FileName,
+                ContentType = file.ContentType,
+                ContentUrl = file.Url
+            });
+            activity.Text = $"📄 Generated file: [{file.FileName}]({file.Url})";
+            await turnContext.SendActivityAsync(activity, ct);
+        }
         if (state.ShowUsage && state.LastTotalTokens > 0)
         {
             await turnContext.SendActivityAsync(
@@ -1439,123 +1549,35 @@ public class FoundryBot : TeamsActivityHandler
         return new StreamStep(true);
     }
 
-    private async Task OfferGeneratedFilesAsync(
-        ITurnContext turnContext,
-        ConversationState state,
-        string responseText,
-        CancellationToken ct)
-    {
-        if (!string.Equals(turnContext.Activity.ChannelId, "msteams", StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(turnContext.Activity.Conversation?.ConversationType, "personal", StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-        var conversationId = turnContext.Activity.Conversation?.Id
-            ?? throw new InvalidOperationException("Teams message activity has no conversation ID.");
-
-        var files = GeneratedFileLinkParser.Extract(responseText);
-        if (files.Count == 0) return;
-
-        var now = DateTime.UtcNow;
-        state.PendingFiles ??= new Dictionary<string, PendingFileDelivery>(StringComparer.Ordinal);
-        foreach (var expired in state.PendingFiles
-                     .Where(pair => pair.Value.ExpiresUtc <= now)
-                     .Select(pair => pair.Key)
-                     .ToArray())
-        {
-            state.PendingFiles.Remove(expired);
-        }
-
-        foreach (var file in files)
-        {
-            if (!UrlSafety.TryValidatePublicHttpsUrl(file.Url, out _, out var reason))
-            {
-                _logger.LogWarning("Skipping generated file URL {Url}: {Reason}", file.Url, reason);
-                continue;
-            }
-
-            if (state.PendingFiles.Values.Any(existing =>
-                    string.Equals(existing.SourceUrl, file.Url, StringComparison.Ordinal)))
-            {
-                continue;
-            }
-
-            var fileId = Guid.NewGuid().ToString("N");
-            state.PendingFiles[fileId] = new PendingFileDelivery(
-                file.Name,
-                file.Url,
-                now.AddMinutes(30));
-
-            var context = new { fileId };
-            await turnContext.SendActivityAsync(
-                MessageFactory.Attachment(new Attachment
-                {
-                    Name = file.Name,
-                    ContentType = FileConsentCard.ContentType,
-                    Content = new FileConsentCard(
-                        $"Upload {file.Name} to this Teams chat.",
-                        null,
-                        context,
-                        context)
-                }),
-                ct);
-        }
-
-        await _state.SaveAsync(conversationId, state, ct);
-    }
-
     protected override async Task OnTeamsFileConsentAcceptAsync(
         ITurnContext<IInvokeActivity> turnContext,
         FileConsentCardResponse fileConsentCardResponse,
         CancellationToken cancellationToken)
     {
-        var conversationId = turnContext.Activity.Conversation?.Id
-            ?? throw new InvalidOperationException("Teams file consent activity has no conversation ID.");
-        var state = await _state.GetOrCreateAsync(conversationId, cancellationToken);
-        state.PendingFiles ??= new Dictionary<string, PendingFileDelivery>(StringComparer.Ordinal);
-        var fileId = ReadFileId(fileConsentCardResponse.Context);
-        if (fileId is null
-            || !state.PendingFiles.TryGetValue(fileId, out var pending)
-            || pending.ExpiresUtc <= DateTime.UtcNow)
+        if (_teamsFiles is null)
         {
             await turnContext.SendActivityAsync(
-                MessageFactory.Text("That file offer has expired. Ask me to create the file again."),
+                MessageFactory.Text("The generated-file upload service is unavailable."),
                 cancellationToken);
             return;
         }
 
-        var upload = fileConsentCardResponse.UploadInfo
-            ?? throw new InvalidOperationException("Teams did not provide file upload information.");
-        if (!IsAllowedTeamsUploadUrl(upload.UploadUrl))
+        try
         {
-            throw new InvalidOperationException("Teams returned an unexpected file upload URL.");
+            var attachment = await _teamsFiles.UploadAsync(
+                fileConsentCardResponse,
+                cancellationToken);
+            var activity = MessageFactory.Attachment(attachment);
+            activity.Text = $"📄 Generated file: {attachment.Name}";
+            await turnContext.SendActivityAsync(activity, cancellationToken);
         }
-        var uploadUrl = upload.UploadUrl!;
-
-        var client = _httpClientFactory.CreateClient();
-        var bytes = await DownloadGeneratedFileAsync(client, pending.SourceUrl, cancellationToken);
-        using var content = new ByteArrayContent(bytes);
-        content.Headers.ContentLength = bytes.Length;
-        content.Headers.ContentRange = new ContentRangeHeaderValue(0, bytes.Length - 1, bytes.Length);
-        using var uploadResponse = await client.PutAsync(uploadUrl, content, cancellationToken);
-        uploadResponse.EnsureSuccessStatusCode();
-
-        state.PendingFiles.Remove(fileId);
-        await _state.SaveAsync(conversationId, state, cancellationToken);
-
-        await turnContext.SendActivityAsync(
-            MessageFactory.Attachment(new Attachment
-            {
-                Name = upload.Name ?? pending.Name,
-                ContentType = FileInfoCard.ContentType,
-                ContentUrl = upload.ContentUrl,
-                Content = new FileInfoCard
-                {
-                    UniqueId = upload.UniqueId,
-                    FileType = upload.FileType
-                }
-            }),
-            cancellationToken);
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not upload generated file to Teams");
+            await turnContext.SendActivityAsync(
+                MessageFactory.Text($"⚠️ Could not upload the generated file: {ex.Message}"),
+                cancellationToken);
+        }
     }
 
     protected override async Task OnTeamsFileConsentDeclineAsync(
@@ -1563,99 +1585,16 @@ public class FoundryBot : TeamsActivityHandler
         FileConsentCardResponse fileConsentCardResponse,
         CancellationToken cancellationToken)
     {
-        var conversationId = turnContext.Activity.Conversation?.Id
-            ?? throw new InvalidOperationException("Teams file consent activity has no conversation ID.");
-        var state = await _state.GetOrCreateAsync(conversationId, cancellationToken);
-        state.PendingFiles ??= new Dictionary<string, PendingFileDelivery>(StringComparer.Ordinal);
-        var fileId = ReadFileId(fileConsentCardResponse.Context);
-        if (fileId is not null)
-        {
-            state.PendingFiles.Remove(fileId);
-            await _state.SaveAsync(conversationId, state, cancellationToken);
-        }
-
+        _teamsFiles?.Discard(fileConsentCardResponse);
         await turnContext.SendActivityAsync(
-            MessageFactory.Text("File upload cancelled."),
+            MessageFactory.Text("Generated file download canceled."),
             cancellationToken);
-    }
-
-    private static string? ReadFileId(object? context)
-    {
-        if (context is null || !TryGetCardData(context, out var data)) return null;
-        return data.Value<string>("fileId");
-    }
-
-    private static bool IsAllowedTeamsUploadUrl(string? raw)
-    {
-        return Uri.TryCreate(raw, UriKind.Absolute, out var uri)
-            && uri.Scheme == Uri.UriSchemeHttps
-            && (uri.Host.EndsWith(".sharepoint.com", StringComparison.OrdinalIgnoreCase)
-                || uri.Host.EndsWith(".sharepoint-df.com", StringComparison.OrdinalIgnoreCase));
-    }
-
-    private static async Task<byte[]> DownloadGeneratedFileAsync(
-        HttpClient client,
-        string sourceUrl,
-        CancellationToken ct)
-    {
-        const int maxBytes = 25 * 1024 * 1024;
-        if (!UrlSafety.TryValidatePublicHttpsUrl(sourceUrl, out var uri, out var reason))
-        {
-            throw new InvalidOperationException($"Generated file URL is unsafe: {reason}");
-        }
-
-        using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, ct);
-        response.EnsureSuccessStatusCode();
-        if (response.Content.Headers.ContentLength is > maxBytes)
-        {
-            throw new InvalidOperationException("Generated file exceeds the 25 MB Teams upload limit.");
-        }
-
-        await using var source = await response.Content.ReadAsStreamAsync(ct);
-        using var destination = new MemoryStream();
-        var buffer = new byte[81920];
-        while (true)
-        {
-            var read = await source.ReadAsync(buffer, ct);
-            if (read == 0) break;
-            if (destination.Length + read > maxBytes)
-            {
-                throw new InvalidOperationException("Generated file exceeds the 25 MB Teams upload limit.");
-            }
-            await destination.WriteAsync(buffer.AsMemory(0, read), ct);
-        }
-        return destination.ToArray();
-    }
-
-    private static IEnumerable<PendingConsent> DeduplicateConsents(IEnumerable<PendingConsent> consents)
-    {
-        var unique = new List<PendingConsent>();
-        foreach (var consent in consents)
-        {
-            var index = unique.FindIndex(existing =>
-                (!string.Equals(consent.Id, "?", StringComparison.Ordinal)
-                 && string.Equals(existing.Id, consent.Id, StringComparison.Ordinal))
-                || string.Equals(existing.ConsentLink, consent.ConsentLink, StringComparison.Ordinal));
-
-            if (index < 0)
-            {
-                unique.Add(consent);
-                continue;
-            }
-
-            if (unique[index].ServerLabel.StartsWith("mcp_", StringComparison.OrdinalIgnoreCase)
-                && !consent.ServerLabel.StartsWith("mcp_", StringComparison.OrdinalIgnoreCase))
-            {
-                unique[index] = consent;
-            }
-        }
-
-        return unique;
     }
 
     private async Task HandleCompletedItemAsync(
         ITurnContext turnContext,
         ConversationState state,
+        Foundry.FoundryClient foundry,
         SdkStreamingMessageHelper streaming,
         ResponseItem item,
         string? responseIdForResume,
@@ -1665,6 +1604,8 @@ public class FoundryBot : TeamsActivityHandler
         HashSet<string> seenIds,
         List<ThinkingStep> steps,
         List<UrlCitation> citations,
+        List<AgentChat.Services.GeneratedFileLink> generatedFiles,
+        HashSet<string> seenGeneratedFiles,
         CancellationToken ct)
     {
         if (item.Id is { } id && !seenIds.Add(id)) return; // de-dup repeated done events for the same item
@@ -1685,15 +1626,7 @@ public class FoundryBot : TeamsActivityHandler
                     string? query = null;
                     try
                     {
-                        var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(ws);
-                        using var doc = System.Text.Json.JsonDocument.Parse(bd);
-                        if (doc.RootElement.TryGetProperty("action", out var actionEl))
-                        {
-                            if (actionEl.TryGetProperty("query", out var q) && q.ValueKind == System.Text.Json.JsonValueKind.String)
-                                query = q.GetString();
-                            else if (actionEl.TryGetProperty("search_query", out var sq) && sq.ValueKind == System.Text.Json.JsonValueKind.String)
-                                query = sq.GetString();
-                        }
+                        query = ToolCallPresentation.ExtractWebSearchQuery(ws);
                     }
                     catch { /* best-effort */ }
                     _logger.LogInformation("Web search call completed (query={Query})", query ?? "(unknown)");
@@ -1704,6 +1637,18 @@ public class FoundryBot : TeamsActivityHandler
                         Arguments:   query is null ? "{}" : $"{{ \"query\": \"{query.Replace("\"", "\\\"")}\" }}",
                         Output:      "(results embedded in message citations)",
                         IsError:     false));
+                    if (state.ShouldShowToolCalls())
+                    {
+                        await streaming.FinalizeAsync(ct);
+                        await turnContext.SendActivityAsync(
+                            MessageFactory.Attachment(AdaptiveCardBuilder.BuildToolCallCard(
+                                toolName: "web_search",
+                                serverLabel: "",
+                                arguments: query ?? "(query unavailable)",
+                                output: null,
+                                toolKind: "WebSearch")),
+                            ct);
+                    }
                 }
                 break;
 
@@ -1754,6 +1699,38 @@ public class FoundryBot : TeamsActivityHandler
                 {
                     _logger.LogDebug(ex, "Failed to extract citations from MessageResponseItem");
                 }
+
+                foreach (var part in msgItem.Content)
+                {
+                    foreach (var annotation in part.OutputTextAnnotations ?? [])
+                    {
+                        if (annotation is not ContainerFileCitationMessageAnnotation containerFile ||
+                            !seenGeneratedFiles.Add($"{containerFile.ContainerId}\n{containerFile.FileId}"))
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            generatedFiles.Add(await _files.CaptureContainerFileAsync(
+                                foundry,
+                                containerFile,
+                                AgentFileService.PublicBaseUri(_httpContext.HttpContext?.Request),
+                                ct));
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(
+                                ex,
+                                "Could not capture generated container file {FileName} ({ContainerId}/{FileId})",
+                                containerFile.Filename,
+                                containerFile.ContainerId,
+                                containerFile.FileId);
+                            streaming.AppendDelta(
+                                $"\n\n⚠️ The generated file `{containerFile.Filename}` could not be downloaded.");
+                        }
+                    }
+                }
                 break;
 
             case McpToolCallApprovalRequestItem appr:
@@ -1783,7 +1760,7 @@ public class FoundryBot : TeamsActivityHandler
                                          ReasoningOutputCap),
                         IsError:     mcpError is not null));
                 }
-                if (!state.ShowToolCalls) break;
+                if (!state.ShouldShowToolCalls()) break;
                 await streaming.FinalizeAsync(ct);
                 var argsStr = mcp.ToolArguments?.ToString() ?? "{}";
                 var output  = mcp.ToolOutput ?? mcp.Error?.ToString() ?? "(no output)";
@@ -1792,7 +1769,7 @@ public class FoundryBot : TeamsActivityHandler
                 // The agent always summarizes the tool output in the next text
                 // delta anyway, so we just show a status card with a small preview.
                 const int previewMax  = 800;   // visible card preview
-                const int fileMaxKB   = 18;    // attach as file only if under this
+                const int fileMaxBytes = 8 * 1024;
                 var preview = output.Length > previewMax
                     ? output.Substring(0, previewMax)
                     : output;
@@ -1800,7 +1777,8 @@ public class FoundryBot : TeamsActivityHandler
                     toolName: mcp.ToolName, serverLabel: mcp.ServerLabel, arguments: argsStr,
                     output: preview + (output.Length > previewMax ? $"\n\n…(+{output.Length - previewMax} chars; full output omitted to fit Teams limits)" : ""),
                     toolKind: "MCP"));
-                if (output.Length > previewMax && output.Length < fileMaxKB * 1024)
+                if (output.Length > previewMax
+                    && System.Text.Encoding.UTF8.GetByteCount(output) <= fileMaxBytes)
                 {
                     msg.Attachments.Add(AgentMessageRenderer.TextAsFile($"tool-output-{mcp.Id}.txt", output));
                 }
@@ -1808,11 +1786,26 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             case CodeInterpreterCallResponseItem ci:
-                if (!state.ShowToolCalls) break;
-                await streaming.FinalizeAsync(ct);
-                // CodeInterpreterCallResponseItem doesn't expose Code directly in
-                // OpenAI 2.9; we'd need to inspect ci.Input or similar. Skip for now —
-                // the streamed text deltas already include the result narrative.
+                {
+                    var (code, ciOutput) = ToolCallPresentation.ExtractCodeInterpreterDetails(ci);
+                    steps.Add(new ThinkingStep(
+                        Kind: "CodeInterpreter",
+                        ToolName: "code_interpreter",
+                        ServerLabel: null,
+                        Arguments: TruncateForStep(code ?? "(code unavailable)", ReasoningArgsCap),
+                        Output: TruncateForStep(ciOutput ?? "(no inline output)", ReasoningOutputCap),
+                        IsError: false));
+                    if (!state.ShouldShowToolCalls()) break;
+                    await streaming.FinalizeAsync(ct);
+                    await turnContext.SendActivityAsync(
+                        MessageFactory.Attachment(AdaptiveCardBuilder.BuildToolCallCard(
+                            toolName: "code_interpreter",
+                            serverLabel: "",
+                            arguments: code ?? "(code unavailable)",
+                            output: ciOutput,
+                            toolKind: "CodeInterpreter")),
+                        ct);
+                }
                 break;
 
             default:
@@ -1906,7 +1899,7 @@ public class FoundryBot : TeamsActivityHandler
             }
 
             var id    = root.TryGetProperty("id",           out var i)  ? i.GetString()  : null;
-            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? NormalizeMcpServerLabel(sl.GetString()) : null;
 
             consent = new PendingConsent(id ?? "?", label ?? "(unknown)", cleanUrl);
             return true;
@@ -1945,7 +1938,7 @@ public class FoundryBot : TeamsActivityHandler
             }
 
             var id    = root.TryGetProperty("item_id",      out var i)  ? i.GetString()  : null;
-            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? NormalizeMcpServerLabel(sl.GetString()) : null;
 
             consent = new PendingConsent(id ?? "?", label ?? "(unknown)", cleanUrl);
             return true;
@@ -1955,6 +1948,11 @@ public class FoundryBot : TeamsActivityHandler
             return false;
         }
     }
+
+    private static string? NormalizeMcpServerLabel(string? label)
+        => label?.StartsWith("mcp_", StringComparison.OrdinalIgnoreCase) == true
+            ? label[4..]
+            : label;
 
     /// <summary>
     /// Serialize an unknown streaming update back to JSON for diagnostics.
@@ -2059,7 +2057,10 @@ public class FoundryBot : TeamsActivityHandler
         string body;
         try
         {
-            body = JsonConvert.SerializeObject(value, Formatting.None) ?? "(empty)";
+            body = value is JsonElement element
+                ? element.GetRawText()
+                : JsonConvert.SerializeObject(value, Formatting.None) ?? "(empty)";
+            body = RedactActivityValue(body);
         }
         catch (Exception ex)
         {
@@ -2067,6 +2068,24 @@ public class FoundryBot : TeamsActivityHandler
         }
 
         return body.Length <= maxChars ? body : body.Substring(0, maxChars);
+    }
+
+    private static string RedactActivityValue(string body)
+    {
+        var json = JToken.Parse(body);
+        foreach (var property in json is JContainer container
+                     ? container.Descendants().OfType<JProperty>()
+                     : Enumerable.Empty<JProperty>())
+        {
+            if (string.Equals(property.Name, "token", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(property.Name, "accessToken", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(property.Name, "uploadUrl", StringComparison.OrdinalIgnoreCase))
+            {
+                property.Value = "[redacted]";
+            }
+        }
+
+        return json.ToString(Formatting.None);
     }
 
     protected override async Task<InvokeResponse> OnInvokeActivityAsync(ITurnContext<IInvokeActivity> turnContext, CancellationToken cancellationToken)
@@ -2130,6 +2149,15 @@ public class FoundryBot : TeamsActivityHandler
         if (value is null) return new TokenExchangeInvokePayload(null, null, null);
         try
         {
+            if (value is JsonElement element)
+            {
+                var properties = ProtocolJsonSerializer.ToJsonElements(element);
+                return new TokenExchangeInvokePayload(
+                    ProtocolJsonSerializer.ToObject<TokenExchangeRequest>(element),
+                    ReadStringProperty(properties, "id"),
+                    ReadStringProperty(properties, "connectionName"));
+            }
+
             var data = value as JObject ?? JObject.FromObject(value);
             return new TokenExchangeInvokePayload(
                 data.ToObject<TokenExchangeRequest>(),
@@ -2142,6 +2170,11 @@ public class FoundryBot : TeamsActivityHandler
             return new TokenExchangeInvokePayload(null, null, null);
         }
     }
+
+    private static string? ReadStringProperty(IDictionary<string, JsonElement> properties, string name)
+        => properties.TryGetValue(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     private static InvokeResponse CreateTokenExchangeInvokeResponse(TokenExchangeInvokePayload payload, TeamsSignInResult result)
         => new()
@@ -2273,6 +2306,12 @@ public class FoundryBot : TeamsActivityHandler
 
         _logger.LogInformation("Calling RunAgentTurnAsync with replayed message of length {Length}", pending.Length);
         await SendTypingAsync(turnContext, ct);
-        await RunAgentTurnAsync(turnContext, state, pending, ct, userTokenOverride: userToken);
+        await RunAgentTurnAsync(
+            turnContext,
+            state,
+            pending,
+            ct,
+            userTokenOverride: userToken,
+            inputFiles: _files.TakePendingFiles(convId));
     }
 }

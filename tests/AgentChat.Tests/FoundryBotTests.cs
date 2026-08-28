@@ -7,12 +7,13 @@ using Microsoft.Agents.Storage;
 using Microsoft.Agents.Builder.Testing;
 using Microsoft.Agents.Connector;
 using Microsoft.Agents.Core.Models;
+using Microsoft.Agents.Extensions.Teams.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Net;
-using System.Text.Json;
 using Newtonsoft.Json.Linq;
+using System.Text.Json;
 using Xunit;
 using ConversationState = AgentChat.Bots.ConversationState;
 
@@ -32,6 +33,274 @@ public class FoundryBotTests
         bot.AgentTurns.Should().ContainSingle().Which.Should().Be("hello");
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
         adapter.GetNextReply().Text.Should().Be("agent:hello");
+    }
+
+    [Fact]
+    public async Task Attachment_only_message_is_forwarded_to_agent_turn()
+    {
+        var inputFile = new AgentInputFile(
+            "notes.txt",
+            "text/plain",
+            BinaryData.FromString("attachment contents"));
+        var bot = MakeBot(attachments: new FakeTeamsAttachmentService(inputFile));
+        var adapter = new TestAdapter();
+        var turn = MakeMessageTurn(adapter, "");
+        turn.Activity.Attachments =
+        [
+            new Attachment
+            {
+                Name = "notes.txt",
+                ContentType = "text/plain",
+                ContentUrl = "https://files.example/notes.txt"
+            }
+        ];
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().ContainSingle()
+            .Which.Should().Be("Use the attached file(s) to complete this request.");
+        bot.AgentTurnFiles.Should().ContainSingle()
+            .Which.Should().ContainSingle()
+            .Which.FileName.Should().Be("notes.txt");
+    }
+
+    [Fact]
+    public async Task Teams_attachment_survives_interactive_sso_replay()
+    {
+        var sso = new ReplaySsoService();
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv_replay\"}");
+        foundry.EnqueueSse(
+            ResponseCreated("resp_replay"),
+            TextDelta("reviewed"),
+            ResponseCompleted("resp_replay"));
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var fileService = new AgentFileService(TestServices.Config());
+        var inputFile = new AgentInputFile(
+            "proposal.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            BinaryData.FromString("document contents"));
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(),
+            new HttpContextAccessor(),
+            foundry.ToClientCache(agents),
+            sso,
+            NullLogger<FoundryBot>.Instance,
+            fileService,
+            new FakeTeamsAttachmentService(inputFile));
+        var adapter = new TestAdapter();
+        var convId = "conv-attachment-sso";
+        var messageTurn = MakeMessageTurn(adapter, "Review this", convId: convId);
+        messageTurn.Activity.Attachments =
+        [
+            new Attachment
+            {
+                Name = "proposal.docx",
+                ContentType = inputFile.ContentType,
+                ContentUrl = "https://files.example/proposal.docx"
+            }
+        ];
+
+        await bot.InvokeAsync(messageTurn);
+
+        foundry.Requests.Should().BeEmpty();
+        (await store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().Be("Review this");
+
+        var invoke = MakeInvokeTurn(adapter, convId, "signin/tokenExchange", JObject.FromObject(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        }));
+        await bot.InvokeAsync(invoke);
+
+        var request = foundry.Requests.Single(r => r.Method == "POST" && r.Url.Contains("/responses"));
+        request.Body.Should().Contain("Review this");
+        request.Body.Should().Contain("\"type\":\"input_file\"");
+        request.Body.Should().Contain("\"filename\":\"proposal.docx\"");
+        foundry.AuthorizationHeaders.Should().OnlyContain(
+            header => header != null && header.StartsWith("Bearer ", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Teams_attachment_is_embedded_in_responses_input()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv_attachment\"}");
+        foundry.EnqueueSse(
+            ResponseCreated("resp_attachment"),
+            TextDelta("processed"),
+            ResponseCompleted("resp_attachment"));
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var fileService = new AgentFileService(TestServices.Config());
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(),
+            new HttpContextAccessor(),
+            foundry.ToClientCache(agents),
+            new FakeSsoService(token: "foundry-user-token", enabled: true),
+            NullLogger<FoundryBot>.Instance,
+            fileService,
+            new FakeTeamsAttachmentService(new AgentInputFile(
+                "budget.csv",
+                "text/csv",
+                BinaryData.FromString("month,total\nJan,42"))));
+        var adapter = new TestAdapter();
+        var turn = MakeMessageTurn(adapter, "", convId: "conv-teams-file");
+        turn.Activity.Attachments =
+        [
+            new Attachment
+            {
+                Name = "budget.csv",
+                ContentType = "text/csv",
+                ContentUrl = "https://files.example/budget.csv"
+            }
+        ];
+
+        await bot.InvokeAsync(turn);
+
+        var request = foundry.Requests.Single(r => r.Method == "POST" && r.Url.Contains("/responses"));
+        request.Body.Should().Contain("\"type\":\"input_file\"");
+        request.Body.Should().Contain("\"filename\":\"budget.csv\"");
+        request.Body.Should().Contain(Convert.ToBase64String(
+            System.Text.Encoding.UTF8.GetBytes("month,total\nJan,42")));
+    }
+
+    [Fact]
+    public async Task Teams_response_sends_generated_container_file_as_attachment()
+    {
+        var catalog = new CatalogHandler("agent-a");
+        var agents = TestServices.AgentService(catalog);
+        var foundry = new RecordingFoundryHandler();
+        foundry.EnqueueJson(HttpStatusCode.OK, "{\"id\":\"conv_generated\"}");
+        foundry.EnqueueSse(
+            ResponseCreated("resp_generated"),
+            GeneratedFileMessageDone("msg_generated", "cntr_teams", "cfile_teams", "report.xlsx"),
+            ResponseCompleted("resp_generated"));
+        foundry.EnqueueBinary(System.Text.Encoding.UTF8.GetBytes("xlsx bytes"));
+        var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
+        var http = new HttpContextAccessor { HttpContext = new DefaultHttpContext() };
+        http.HttpContext.Request.Scheme = "https";
+        http.HttpContext.Request.Host = new HostString("proxy.example");
+        var bot = new ExposedFoundryBot(
+            agents,
+            store,
+            TestServices.Config(),
+            http,
+            foundry.ToClientCache(agents),
+            new FakeSsoService(token: "foundry-user-token", enabled: true),
+            NullLogger<FoundryBot>.Instance,
+            new AgentFileService(TestServices.Config()),
+            teamsFiles: new FakeTeamsFileService());
+        var adapter = new TestAdapter();
+
+        var turn = MakeMessageTurn(adapter, "create a spreadsheet", convId: "conv-generated-file");
+        turn.Activity.Conversation.ConversationType = "personal";
+        await bot.InvokeAsync(turn);
+
+        var replies = new List<IActivity>();
+        IActivity? reply;
+        while ((reply = adapter.GetNextReply()) is not null)
+            replies.Add(reply);
+
+        var fileReply = replies.Single(activity =>
+            activity.Attachments?.Any(attachment => attachment.Name == "report.xlsx") == true);
+        var attachment = fileReply.Attachments!.Single();
+        attachment.ContentType.Should().Be(FileConsentCard.ContentType);
+        attachment.Content.Should().BeOfType<FileConsentCard>();
+        foundry.Requests.Should().Contain(r =>
+            r.Method == "GET" &&
+            r.Url.Contains("/api/projects/default-project/openai/v1/containers/cntr_teams/files/cfile_teams/content"));
+    }
+
+    [Fact]
+    public async Task Teams_file_consent_accept_uploads_generated_file_and_sends_file_info_card()
+    {
+        var upload = new RecordingUploadHandler();
+        var files = new AgentFileService(TestServices.Config());
+        var generated = files.CacheGeneratedFile(
+            "report.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xlsx bytes"u8.ToArray(),
+            new Uri("https://proxy.example"));
+        var teamsFiles = new TeamsFileService(
+            new HandlerHttpClientFactory(upload),
+            files,
+            TestServices.Config());
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(logger: logger, files: files, teamsFiles: teamsFiles);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(
+            adapter,
+            "conv-file-consent",
+            "fileConsent/invoke",
+            JsonSerializer.SerializeToElement(new
+            {
+                action = "accept",
+                context = new { token = generated.Token },
+                uploadInfo = new
+                {
+                    name = "report.xlsx",
+                    uploadUrl = "https://tenant.sharepoint.com/upload/session",
+                    contentUrl = "https://tenant.sharepoint.com/files/report.xlsx",
+                    uniqueId = "drive-item-id",
+                    fileType = "xlsx"
+                }
+            }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        upload.RequestCount.Should().Be(
+            1,
+            string.Join(" | ", logger.Messages.Select(message =>
+                $"{message.Message}: {message.Exception?.Message}")));
+        upload.Body.Should().Equal("xlsx bytes"u8.ToArray());
+        var reply = adapter.GetNextReply();
+        reply.Attachments.Should().ContainSingle();
+        var attachment = reply.Attachments.Single();
+        attachment.Name.Should().Be("report.xlsx");
+        attachment.ContentType.Should().Be(FileInfoCard.ContentType);
+        attachment.ContentUrl.Should().Be("https://tenant.sharepoint.com/files/report.xlsx");
+    }
+
+    [Fact]
+    public async Task Teams_file_consent_decline_does_not_upload_generated_file()
+    {
+        var upload = new RecordingUploadHandler();
+        var files = new AgentFileService(TestServices.Config());
+        var generated = files.CacheGeneratedFile(
+            "report.txt",
+            "text/plain",
+            "report"u8.ToArray(),
+            new Uri("https://proxy.example"));
+        var teamsFiles = new TeamsFileService(
+            new HandlerHttpClientFactory(upload),
+            files,
+            TestServices.Config());
+        var bot = MakeBot(files: files, teamsFiles: teamsFiles);
+        var adapter = new TestAdapter();
+        var turn = MakeInvokeTurn(
+            adapter,
+            "conv-file-decline",
+            "fileConsent/invoke",
+            JsonSerializer.SerializeToElement(new
+            {
+                action = "decline",
+                context = new { token = generated.Token }
+            }));
+
+        await bot.InvokeSignInAsync(turn);
+
+        upload.RequestCount.Should().Be(0);
+        adapter.GetNextReply().Text.Should().Contain("canceled");
+        files.TryGetDownload(generated.Token, out _).Should().BeFalse();
     }
 
     [Fact]
@@ -76,6 +345,44 @@ public class FoundryBotTests
     }
 
     [Fact]
+    public async Task JsonElement_consent_continue_submit_is_routed()
+    {
+        var bot = MakeBot();
+        var adapter = new TestAdapter();
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            action = "consent_continue",
+            conversationId = "foundry-conversation"
+        });
+        var turn = MakeMessageTurn(adapter, "", value, "conv-consent-submit");
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().BeEmpty();
+        adapter.GetNextReply().Text.Should().Contain("pending sign-in");
+    }
+
+    [Fact]
+    public async Task JsonElement_mcp_approval_submit_is_routed()
+    {
+        var bot = MakeBot();
+        var adapter = new TestAdapter();
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            action = "mcp_approval",
+            approve = true,
+            approval_request_id = "mcpr_123",
+            conversationId = "foundry-conversation"
+        });
+        var turn = MakeMessageTurn(adapter, "", value, "conv-approval-submit");
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().BeEmpty();
+        adapter.GetNextReply().Text.Should().Contain("pending MCP approval");
+    }
+
+    [Fact]
     public async Task Signin_token_exchange_replays_saved_pending_sso_message()
     {
         var sso = new FakeSsoService(token: "foundry-user-token");
@@ -100,6 +407,63 @@ public class FoundryBotTests
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
         adapter.GetNextReply().Text.Should().Be("agent:pending question");
         (await bot.Store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
+    }
+
+    [Fact]
+    public void Duplicate_stream_and_item_consent_requests_collapse_to_one_card()
+    {
+        var link = "https://login.example.test/consent?id=1";
+        var consents = new[]
+        {
+            new FoundryBot.PendingConsent("consent-1", "cloud-helper", link),
+            new FoundryBot.PendingConsent("consent-1", "cloud-helper", link)
+        };
+
+        FoundryBot.DeduplicateConsents(consents).Should().ContainSingle();
+    }
+
+    [Fact]
+    public void Consent_requests_with_different_ids_but_same_link_collapse_to_one_card()
+    {
+        var link = "https://login.example.test/consent?id=1";
+        var consents = new[]
+        {
+            new FoundryBot.PendingConsent("stream-item", "cloud-helper", link),
+            new FoundryBot.PendingConsent("completed-item", "cloud-helper", link)
+        };
+
+        FoundryBot.DeduplicateConsents(consents).Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task Signin_token_exchange_parses_activity_protocol_json_element()
+    {
+        var sso = new FakeSsoService(token: "foundry-user-token");
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(sso, logger: logger);
+        var adapter = new TestAdapter();
+        var convId = "conv-sso-json-element";
+        await bot.Store.SaveAsync(convId, new ConversationState { PendingSsoMessage = "pending question" });
+
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            id = "exchange-id",
+            token = "teams-token",
+            connectionName = "foundry-oauth"
+        });
+        var turn = MakeInvokeTurn(adapter, convId, "signin/tokenExchange", value);
+
+        await bot.InvokeSignInAsync(turn);
+
+        sso.ExchangeCalls.Should().Be(1);
+        sso.LastExchangeRequest.Should().NotBeNull();
+        sso.LastExchangeRequest!.Token.Should().Be("teams-token");
+        bot.AgentTurns.Should().ContainSingle().Which.Should().Be("pending question");
+        bot.AgentTurnTokens.Should().ContainSingle().Which.Should().Be("foundry-user-token");
+        (await bot.Store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
+        logger.Messages.Should().Contain(m =>
+            m.Message.Contains("\"token\":\"[redacted]\"")
+            && !m.Message.Contains("teams-token"));
     }
 
     [Fact]
@@ -168,6 +532,31 @@ public class FoundryBotTests
             m.Level == LogLevel.Error
             && m.Message.Contains("Teams SSO signin/failure received")
             && m.Message.Contains("full diagnostic body"));
+    }
+
+    [Fact]
+    public async Task Signin_failure_preserves_activity_protocol_json_element_diagnostic()
+    {
+        var logger = new ListLogger<FoundryBot>();
+        var bot = MakeBot(logger: logger);
+        var adapter = new TestAdapter();
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            code = "invokeerror",
+            message = "Invoke error occurred",
+            details = "actual Teams diagnostic"
+        });
+        var turn = MakeInvokeTurn(adapter, "conv-signin-failure-json-element", "signin/failure", value);
+
+        await bot.InvokeSignInAsync(turn);
+
+        var reply = adapter.GetNextReply().Text;
+        reply.Should().Contain("\"details\":\"actual Teams diagnostic\"");
+        reply.Should().NotContain("\"ValueKind\":1");
+        logger.Messages.Should().Contain(m =>
+            m.Level == LogLevel.Error
+            && m.Message.Contains("\"details\":\"actual Teams diagnostic\"")
+            && !m.Message.Contains("\"ValueKind\":1"));
     }
 
     [Fact]
@@ -433,10 +822,50 @@ public class FoundryBotTests
     private static string TextDelta(string text)
         => $"{{\"type\":\"response.output_text.delta\",\"delta\":\"{text}\",\"output_index\":0,\"content_index\":0,\"item_id\":\"msg_1\"}}";
 
+    private static string GeneratedFileMessageDone(string id, string containerId, string fileId, string fileName)
+        => System.Text.Json.JsonSerializer.Serialize(new
+        {
+            type = "response.output_item.done",
+            output_index = 0,
+            item = new
+            {
+                id,
+                type = "message",
+                role = "assistant",
+                status = "completed",
+                content = new[]
+                {
+                    new
+                    {
+                        type = "output_text",
+                        text = "Download the generated file.",
+                        annotations = new[]
+                        {
+                            new
+                            {
+                                type = "container_file_citation",
+                                container_id = containerId,
+                                file_id = fileId,
+                                start_index = 0,
+                                end_index = 8,
+                                filename = fileName
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
     private static string ResponseCompleted(string id)
         => $"{{\"type\":\"response.completed\",\"response\":{{\"id\":\"{id}\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}";
 
-    private static SpyFoundryBot MakeBot(TeamsSsoService? sso = null, ILogger<FoundryBot>? logger = null, IHttpContextAccessor? httpContext = null)
+    private static SpyFoundryBot MakeBot(
+        TeamsSsoService? sso = null,
+        ILogger<FoundryBot>? logger = null,
+        IHttpContextAccessor? httpContext = null,
+        ITeamsAttachmentService? attachments = null,
+        AgentFileService? files = null,
+        ITeamsFileService? teamsFiles = null)
     {
         var agents = TestServices.AgentService(new CatalogHandler("agent-a"));
         var store = new ConversationStore(new MemoryStorage(), NullLogger<ConversationStore>.Instance);
@@ -447,7 +876,10 @@ public class FoundryBotTests
             httpContext ?? new HttpContextAccessor(),
             new AgentClientCache(agents),
             sso ?? new FakeSsoService(token: null),
-            logger ?? NullLogger<FoundryBot>.Instance);
+            logger ?? NullLogger<FoundryBot>.Instance,
+            files ?? new AgentFileService(TestServices.Config()),
+            attachments,
+            teamsFiles);
     }
 
     private static ITurnContext MakeMessageTurn(TestAdapter adapter, string text, object? value = null, string convId = "conv-1")
@@ -485,8 +917,11 @@ public class FoundryBotTests
             IHttpContextAccessor httpContext,
             AgentClientCache clientCache,
             TeamsSsoService sso,
-            ILogger<FoundryBot> logger)
-            : base(agents, state, config, httpContext, clientCache, sso, new TestHttpClientFactory(), logger)
+            ILogger<FoundryBot> logger,
+            AgentFileService? files = null,
+            ITeamsAttachmentService? attachments = null,
+            ITeamsFileService? teamsFiles = null)
+            : base(agents, state, config, httpContext, clientCache, sso, logger, files, attachments, teamsFiles)
         {
         }
 
@@ -499,6 +934,7 @@ public class FoundryBotTests
         public ConversationStore Store { get; }
         public List<string> AgentTurns { get; } = new();
         public List<string?> AgentTurnTokens { get; } = new();
+        public List<IReadOnlyList<AgentInputFile>> AgentTurnFiles { get; } = new();
 
         public SpyFoundryBot(
             AgentService agents,
@@ -507,8 +943,11 @@ public class FoundryBotTests
             IHttpContextAccessor httpContext,
             AgentClientCache clientCache,
             TeamsSsoService sso,
-            ILogger<FoundryBot> logger)
-            : base(agents, state, config, httpContext, clientCache, sso, new TestHttpClientFactory(), logger)
+            ILogger<FoundryBot> logger,
+            AgentFileService? files = null,
+            ITeamsAttachmentService? attachments = null,
+            ITeamsFileService? teamsFiles = null)
+            : base(agents, state, config, httpContext, clientCache, sso, logger, files, attachments, teamsFiles)
         {
             Store = state;
         }
@@ -519,17 +958,65 @@ public class FoundryBotTests
         public Task InvokeSignInAsync(ITurnContext turnContext)
             => OnTurnAsync(turnContext, CancellationToken.None);
 
-        protected override async Task RunAgentTurnAsync(ITurnContext turnContext, ConversationState state, string userText, CancellationToken ct, string? userTokenOverride = null)
+        protected override async Task RunAgentTurnAsync(
+            ITurnContext turnContext,
+            ConversationState state,
+            string userText,
+            CancellationToken ct,
+            string? userTokenOverride = null,
+            IReadOnlyList<AgentInputFile>? inputFiles = null)
         {
             AgentTurns.Add(userText);
             AgentTurnTokens.Add(userTokenOverride);
+            AgentTurnFiles.Add(inputFiles ?? []);
             await turnContext.SendActivityAsync(MessageFactory.Text("agent:" + userText), ct);
         }
     }
 
-    private sealed class TestHttpClientFactory : IHttpClientFactory
+    private sealed class FakeTeamsAttachmentService(params AgentInputFile[] files) : ITeamsAttachmentService
     {
-        public HttpClient CreateClient(string name) => new();
+        public Task<IReadOnlyList<AgentInputFile>> DownloadAsync(
+            ITurnContext turnContext,
+            CancellationToken cancellationToken)
+            => Task.FromResult<IReadOnlyList<AgentInputFile>>(files);
+    }
+
+    private sealed class FakeTeamsFileService : ITeamsFileService
+    {
+        public bool SupportsNativeFiles(IActivity activity) => true;
+
+        public Attachment CreateConsentCard(GeneratedFileLink file) => new()
+        {
+            Name = file.FileName,
+            ContentType = FileConsentCard.ContentType,
+            Content = new FileConsentCard("Download", file.Size, new { token = file.Token }, new { token = file.Token })
+        };
+
+        public Task<Attachment> UploadAsync(
+            FileConsentCardResponse response,
+            CancellationToken cancellationToken)
+            => throw new NotSupportedException();
+
+        public void Discard(FileConsentCardResponse response)
+        {
+        }
+    }
+
+    private sealed class RecordingUploadHandler : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+        public byte[] Body { get; private set; } = [];
+
+        protected override async Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            Body = request.Content is null
+                ? []
+                : await request.Content.ReadAsByteArrayAsync(cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK);
+        }
     }
 
     private sealed class FakeSsoService : TeamsSsoService
@@ -538,6 +1025,7 @@ public class FoundryBotTests
         private readonly Exception? _exchangeException;
         private readonly SignInResource? _signInResource;
         public int ExchangeCalls { get; private set; }
+        public TokenExchangeRequest? LastExchangeRequest { get; private set; }
 
         public FakeSsoService(string? token, bool enabled = true, Exception? exchangeException = null, SignInResource? signInResource = null)
             : base(enabled
@@ -558,11 +1046,54 @@ public class FoundryBotTests
         public override Task<TokenResponse?> ExchangeTokenAsync(ITurnContext turnContext, TokenExchangeRequest request, CancellationToken ct = default)
         {
             ExchangeCalls++;
+            LastExchangeRequest = request;
             if (_exchangeException is not null)
             {
                 return Task.FromException<TokenResponse?>(_exchangeException);
             }
             return Task.FromResult<TokenResponse?>(_token is null ? null : new TokenResponse { Token = _token });
+        }
+    }
+
+    private sealed class ReplaySsoService : TeamsSsoService
+    {
+        private bool _signedIn;
+
+        public ReplaySsoService()
+            : base(
+                TestServices.Config(new KeyValuePair<string, string?>("TeamsSso:ConnectionName", "foundry-oauth")),
+                NullLogger<TeamsSsoService>.Instance)
+        {
+        }
+
+        public override Task<TokenResponse?> TryGetUserTokenAsync(
+            ITurnContext turnContext,
+            CancellationToken ct = default)
+            => Task.FromResult<TokenResponse?>(_signedIn
+                ? new TokenResponse { Token = "replayed-foundry-token" }
+                : null);
+
+        public override Task<SignInResource?> GetSignInResourceAsync(
+            ITurnContext turnContext,
+            CancellationToken ct = default)
+            => Task.FromResult<SignInResource?>(new SignInResource
+            {
+                SignInLink = "https://login.example/signin",
+                TokenExchangeResource = new TokenExchangeResource
+                {
+                    Uri = "api://bot-app/access_as_user",
+                    Id = "exchange-id",
+                    ProviderId = "aad-v2"
+                }
+            });
+
+        public override Task<TokenResponse?> ExchangeTokenAsync(
+            ITurnContext turnContext,
+            TokenExchangeRequest request,
+            CancellationToken ct = default)
+        {
+            _signedIn = true;
+            return Task.FromResult<TokenResponse?>(new TokenResponse { Token = "replayed-foundry-token" });
         }
     }
 

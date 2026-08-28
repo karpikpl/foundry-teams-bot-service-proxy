@@ -10,11 +10,11 @@ public static partial class GeneratedFileLinkParser
         ".png", ".jpg", ".jpeg", ".gif", ".txt"
     };
 
-    public static IReadOnlyList<GeneratedFileLink> Extract(string text)
+    public static IReadOnlyList<ParsedGeneratedFileLink> Extract(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return [];
 
-        var files = new List<GeneratedFileLink>();
+        var files = new List<ParsedGeneratedFileLink>();
         foreach (Match match in MarkdownLink().Matches(text))
         {
             var label = match.Groups["label"].Value.Trim();
@@ -35,7 +35,7 @@ public static partial class GeneratedFileLinkParser
             {
                 continue;
             }
-            files.Add(new GeneratedFileLink(name, uri.AbsoluteUri));
+            files.Add(new ParsedGeneratedFileLink(name, uri.AbsoluteUri));
         }
 
         return files;
@@ -69,4 +69,4 @@ public static partial class GeneratedFileLinkParser
     private static partial Regex MarkdownLink();
 }
 
-public sealed record GeneratedFileLink(string Name, string Url);
+public sealed record ParsedGeneratedFileLink(string Name, string Url);

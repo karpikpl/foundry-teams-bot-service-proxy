@@ -16,6 +16,7 @@ This is a **sample** that solves the practical problem of exposing Foundry agent
 - **Streaming responses** in Teams 1:1 chat (using the official Teams streaming-ux protocol)
 - **MCP tool approvals** with per-tool "always approve" memory
 - **Function tools** dispatched in-process (no external sidecar)
+- **Code-interpreter file I/O** — browser and Teams uploads become Responses input files; generated artifacts return as short-lived download links
 - **Per-agent URL routing** — one App Service can serve many agents across many Foundry projects
 - **Server-side conversations** so Foundry's portal shows tracing tied to your real conversation IDs
 - **Teams-app manifest generation** — `/admin/manifest` asks for a Bot Service app ID and downloads a sideloadable `.zip` per agent
@@ -115,6 +116,13 @@ See [docs/deploy.md](docs/deploy.md) for a step-by-step.
 | `AdminChatAuth__ClientId` | optional | AAD app client ID; falls back to `TeamsSso__AadAppId` |
 | `AdminChatAuth__ClientSecret` | required when enabled | Client secret for the browser chat confidential client flow |
 | `AdminChatAuth__Instance` | optional | Authority instance; defaults to `https://login.microsoftonline.com/` |
+| `Files__MaxCount` | optional | Maximum attachments per message; defaults to `10` |
+| `Files__MaxFileBytes` | optional | Maximum bytes per input or generated file; defaults to `26214400` (25 MB) |
+| `Files__MaxRequestBytes` | optional | Maximum combined input attachment bytes per message; defaults to `52428800` (50 MB) |
+| `Files__MaxCachedBytes` | optional | Process-wide cap for pending SSO uploads and generated downloads; defaults to `104857600` (100 MB) |
+| `Files__DownloadLifetimeMinutes` | optional | Lifetime of opaque generated-file URLs and pending SSO uploads; defaults to `15` |
+| `OutboundHostValidator__Enabled` | optional | Restricts token-bearing Bot/Teams requests to the Agents SDK Microsoft host allowlist; defaults to `true` |
+| `OutboundHostValidator__Hosts__0` | optional | First additional trusted host suffix for private attachment hosts; repeat with increasing array indexes |
 
 Cosmos is only used for per-conversation bot state. Manifest generation no longer stores bot ↔ agent registrations; operators paste the Bot Service app ID into the inline manifest form.
 
@@ -212,9 +220,10 @@ docker build -t fb:local .
 1. **One `OpenAIClient` per per-agent URL.** Wrapped with two pipeline policies: a bearer-token auth policy that pulls AAD tokens from `TokenCredential` (scope `https://ai.azure.com/.default`), and an api-version policy that appends `?api-version=2025-05-15-preview`.
 2. **Server-side conversations.** First user message creates a Foundry conversation; subsequent turns reuse it. `/reset` deletes it.
 3. **Streaming.** The Foundry Responses API returns standard OpenAI SSE; we forward text deltas to Teams as streaming chunks (via the `streaminfo` Adaptive Card entity protocol).
-4. **MCP approvals.** When the agent wants to call an MCP tool that requires approval, Foundry emits an `mcp_approval_request` item. The bot and `/admin/chat` pause, show an Approve/Deny card, then resume with a `mcp_approval_response` input item chained via `previous_response_id`.
-5. **Function tools.** Same pattern with `function_call` items, dispatched by `FunctionToolDispatcher` (sample implementations: `get_current_time`, `calculate`).
-6. **Per-conversation state in Cosmos.** Just `ConversationId`, `AgentEndpoint`, token counters, and the auto-approve set. ETag-`*` writes (Bot Framework guarantees per-conversation serialization, so last-writer-wins is safe).
+4. **Files.** Browser multipart uploads and Teams file attachments are validated and embedded as Responses `input_file` parts. Code-interpreter `container_file_citation` outputs are downloaded under the active Foundry identity. Browser chat uses unguessable, expiring proxy URLs; personal Teams chats use the native file-consent/upload/file-info flow. Unsupported Teams conversation types fall back to the expiring link.
+5. **MCP approvals.** When the agent wants to call an MCP tool that requires approval, Foundry emits an `mcp_approval_request` item. The bot and `/admin/chat` pause, show an Approve/Deny card, then resume with a `mcp_approval_response` input item chained via `previous_response_id`.
+6. **Function tools.** Same pattern with `function_call` items, dispatched by `FunctionToolDispatcher` (sample implementations: `get_current_time`, `calculate`).
+7. **Per-conversation state in Cosmos.** Just `ConversationId`, `AgentEndpoint`, token counters, and the auto-approve set. ETag-`*` writes (Bot Framework guarantees per-conversation serialization, so last-writer-wins is safe).
 
 ## Repository layout
 

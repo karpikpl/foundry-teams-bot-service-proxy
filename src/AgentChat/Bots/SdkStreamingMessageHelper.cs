@@ -83,6 +83,8 @@ public sealed class SdkStreamingMessageHelper
     }
 
     public bool Enabled    => _enabled;
+
+    public bool HasText => _textStreamingStarted || _fallbackBuffer.Length > 0;
     public bool IsOpen     => _enabled && _ctx.StreamingResponse.IsStreamStarted();
     public bool HasContent => _fallbackBuffer.Length > 0;
     public string BufferedText => _fallbackBuffer.ToString();

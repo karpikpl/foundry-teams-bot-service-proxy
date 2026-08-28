@@ -163,7 +163,10 @@ public sealed class TeamsChatController : ControllerBase
                 body.Message,
                 body.Approval is null
                     ? null
-                    : new ChatSessionService.Approval(body.Approval.RequestId, body.Approval.Approve)),
+                    : new ChatSessionService.Approval(body.Approval.RequestId, body.Approval.Approve),
+                PublicBaseUri: Request.Host.HasValue
+                    ? AgentFileService.PublicBaseUri(Request)
+                    : null),
             projectEndpoint,
             user,
             WriteSseAsync,

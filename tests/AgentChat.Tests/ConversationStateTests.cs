@@ -22,7 +22,8 @@ public class ConversationStateTests
         s.PendingApprovalResponseId.Should().BeNull();
         s.AutoApproveMcpTools.Should().NotBeNull().And.BeEmpty();
         s.ShowUsage.Should().BeFalse();
-        s.ShowToolCalls.Should().BeFalse();
+        s.ShowToolCalls.Should().BeTrue();
+        s.ToolCallDisplayPreferenceSet.Should().BeFalse();
         s.ConversationReference.Should().BeNull();
         s.PromptTokensTotal.Should().Be(0);
         s.RunCount.Should().Be(0);
@@ -38,6 +39,30 @@ public class ConversationStateTests
 
         s.AutoApproveMcpTools.Contains("MICROSOFT_LEARN:SEARCH").Should().BeTrue();
         s.AutoApproveMcpTools.Contains("microsoft_learn:other").Should().BeFalse();
+    }
+
+    [Fact]
+    public void Existing_state_with_old_false_default_adopts_visible_tool_calls()
+    {
+        var state = new ConversationState
+        {
+            ShowToolCalls = false,
+            ToolCallDisplayPreferenceSet = false
+        };
+
+        state.ShouldShowToolCalls().Should().BeTrue();
+    }
+
+    [Fact]
+    public void Explicit_tools_off_preference_is_preserved()
+    {
+        var state = new ConversationState
+        {
+            ShowToolCalls = false,
+            ToolCallDisplayPreferenceSet = true
+        };
+
+        state.ShouldShowToolCalls().Should().BeFalse();
     }
 
     [Fact]

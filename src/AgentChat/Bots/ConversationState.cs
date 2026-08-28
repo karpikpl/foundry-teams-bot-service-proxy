@@ -74,11 +74,20 @@ public class ConversationState : IStoreItem
 
     /// <summary>
     /// Whether to render tool-call cards (MCP results, function outputs,
-    /// code-interpreter blocks). Off by default — these are mostly noise for
-    /// end users; the agent's text summary already reflects the tool result.
-    /// Useful for troubleshooting; toggle with <c>/tools on|off</c>.
+    /// web searches, and code-interpreter blocks). On by default so Teams
+    /// presents the same tool timeline as the browser test chat.
     /// </summary>
-    public bool ShowToolCalls { get; set; } = false;
+    public bool ShowToolCalls { get; set; } = true;
+
+    /// <summary>
+    /// Records tool-card choices made after visible-by-default behavior was
+    /// introduced. Old serialized <c>false</c> values are indistinguishable
+    /// from the former default, so they migrate to visible once.
+    /// </summary>
+    public bool ToolCallDisplayPreferenceSet { get; set; }
+
+    internal bool ShouldShowToolCalls()
+        => ShowToolCalls || !ToolCallDisplayPreferenceSet;
 
     /// <summary>
     /// Whether to surface live "thinking" status updates in the Teams

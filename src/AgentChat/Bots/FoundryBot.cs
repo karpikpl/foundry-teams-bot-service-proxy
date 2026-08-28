@@ -231,7 +231,7 @@ public class FoundryBot : TeamsActivityHandler
                         ("/agent",         "Show active agent + endpoint"),
                         ("/tokens",        "Show token usage for this conversation"),
                         ("/usage on|off",  "Toggle the per-run usage footer"),
-                        ("/tools on|off",  "Show or hide tool-call cards (off by default)"),
+                        ("/tools on|off",  "Show or hide tool-call cards (on by default)"),
                         ("/thinking on|off", "Show or hide live thinking status (on by default)"),
                         ("/auto list|clear", "Manage auto-approved MCP tools"),
                         ("/signout",       "Sign out (clears cached Teams SSO token)"),
@@ -377,10 +377,11 @@ public class FoundryBot : TeamsActivityHandler
         if (newValue is null)
         {
             await turnContext.SendActivityAsync(MessageFactory.Text(
-                $"Tool-call cards are currently **{(state.ShowToolCalls ? "on" : "off")}**. Use `/tools on` to show them (handy for troubleshooting) or `/tools off` to hide them."), ct);
+                $"Tool-call cards are currently **{(state.ShouldShowToolCalls() ? "on" : "off")}**. Use `/tools on` to show them or `/tools off` to hide them."), ct);
             return;
         }
         state.ShowToolCalls = newValue.Value;
+        state.ToolCallDisplayPreferenceSet = true;
         await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
         await turnContext.SendActivityAsync(MessageFactory.Text(
             newValue.Value
@@ -500,7 +501,7 @@ public class FoundryBot : TeamsActivityHandler
     {
         try
         {
-            var data = value as JObject ?? JObject.FromObject(value);
+            var data = ReadCardSubmit(value);
             var action = data.Value<string>("action");
             return !string.IsNullOrWhiteSpace(action) && KnownCardActions.Contains(action);
         }
@@ -512,7 +513,7 @@ public class FoundryBot : TeamsActivityHandler
 
     private async Task HandleCardSubmitAsync(ITurnContext turnContext, CancellationToken ct)
     {
-        var data   = JObject.FromObject(turnContext.Activity.Value!);
+        var data   = ReadCardSubmit(turnContext.Activity.Value!);
         var action = data.Value<string>("action") ?? "";
         var state  = await _state.GetOrCreateAsync(turnContext.Activity.Conversation.Id, ct);
         await _state.TouchAsync(turnContext.Activity.Conversation.Id, turnContext.Activity.GetConversationReference(), ct);
@@ -545,6 +546,14 @@ public class FoundryBot : TeamsActivityHandler
                 break;
         }
     }
+
+    private static JObject ReadCardSubmit(object value)
+        => value switch
+        {
+            JObject data => data,
+            JsonElement element when element.ValueKind == JsonValueKind.Object => JObject.Parse(element.GetRawText()),
+            _ => JObject.FromObject(value)
+        };
 
     /// <summary>
     /// User clicked "I've signed in" on a consent card. Re-stream the previously
@@ -1065,7 +1074,7 @@ public class FoundryBot : TeamsActivityHandler
 
     private static IList<Attachment>? BuildReasoningAttachments(ConversationState state, IList<ThinkingStep> steps)
     {
-        if (!state.ShowThinking || steps.Count == 0) return null;
+        if (!state.ShowThinking || state.ShouldShowToolCalls() || steps.Count == 0) return null;
         return new List<Attachment> { AdaptiveCardBuilder.BuildReasoningCard(steps) };
     }
 
@@ -1121,7 +1130,26 @@ public class FoundryBot : TeamsActivityHandler
     }
 
     /// <summary>Pending OAuth consent request surfaced by Foundry's MCP passthrough.</summary>
-    private sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
+    internal sealed record PendingConsent(string Id, string ServerLabel, string ConsentLink);
+
+    internal static IReadOnlyList<PendingConsent> DeduplicateConsents(IEnumerable<PendingConsent> consents)
+    {
+        var unique = new List<PendingConsent>();
+        foreach (var consent in consents)
+        {
+            if (unique.Any(existing =>
+                    (!string.Equals(consent.Id, "?", StringComparison.Ordinal)
+                     && string.Equals(existing.Id, consent.Id, StringComparison.Ordinal))
+                    || string.Equals(existing.ConsentLink, consent.ConsentLink, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            unique.Add(consent);
+        }
+
+        return unique;
+    }
 
     /// <returns>Whether the loop should stop, or the input items for the next response hop.</returns>
     private async Task<StreamStep> ProcessStreamAsync(
@@ -1378,7 +1406,7 @@ public class FoundryBot : TeamsActivityHandler
                 var argsStr = fc.FunctionArguments?.ToString() ?? "{}";
                 var result  = await FunctionToolDispatcher.ExecuteAsync(fc.FunctionName, argsStr, ct);
 
-                if (state.ShowToolCalls)
+                if (state.ShouldShowToolCalls())
                 {
                     // Same Bot Connector size limit applies to function-tool cards.
                     const int previewMax = 800;
@@ -1415,19 +1443,25 @@ public class FoundryBot : TeamsActivityHandler
         //    mcp_approval_response input item chained to the response that asked.
         if (pendingApprovals.Count > 0)
         {
-            await streaming.FinalizeAsync(ct);
             var req = pendingApprovals[0];
             McpApproval.Store(state, req);
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-            await turnContext.SendActivityAsync(
-                MessageFactory.Attachment(AdaptiveCardBuilder.BuildApprovalCard(
+            if (!streaming.HasText)
+            {
+                streaming.AppendDelta("Approval required to continue.");
+            }
+            await streaming.FinalizeAsync(
+                ct,
+                new List<Attachment>
+                {
+                    AdaptiveCardBuilder.BuildApprovalCard(
                     toolName: req.ToolName,
                     serverLabel: req.ServerLabel,
                     arguments: req.ArgumentsSummary,
                     approvalRequestId: req.ApprovalRequestId,
-                    conversationId: state.ConversationId!)),
-                ct);
+                    conversationId: state.ConversationId!)
+                });
             return new StreamStep(true); // pause for user
         }
 
@@ -1437,17 +1471,20 @@ public class FoundryBot : TeamsActivityHandler
         //     same response with previous_response_id.
         if (pendingConsents.Count > 0)
         {
-            await streaming.FinalizeAsync(ct);
             state.PendingConsentResponseId = state.CurrentResponseId;
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-            foreach (var c in pendingConsents)
+            var consentCards = DeduplicateConsents(pendingConsents)
+                .Select(c => AdaptiveCardBuilder.BuildConsentCard(
+                    serverLabel: c.ServerLabel,
+                    consentLink: c.ConsentLink,
+                    conversationId: state.ConversationId!))
+                .ToList();
+            if (!streaming.HasText)
             {
-                await turnContext.SendActivityAsync(
-                    MessageFactory.Attachment(AdaptiveCardBuilder.BuildConsentCard(
-                        serverLabel: c.ServerLabel, consentLink: c.ConsentLink, conversationId: state.ConversationId!)),
-                    ct);
+                streaming.AppendDelta("Sign-in required to continue.");
             }
+            await streaming.FinalizeAsync(ct, consentCards);
             return new StreamStep(true); // pause for user
         }
 
@@ -1589,15 +1626,7 @@ public class FoundryBot : TeamsActivityHandler
                     string? query = null;
                     try
                     {
-                        var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(ws);
-                        using var doc = System.Text.Json.JsonDocument.Parse(bd);
-                        if (doc.RootElement.TryGetProperty("action", out var actionEl))
-                        {
-                            if (actionEl.TryGetProperty("query", out var q) && q.ValueKind == System.Text.Json.JsonValueKind.String)
-                                query = q.GetString();
-                            else if (actionEl.TryGetProperty("search_query", out var sq) && sq.ValueKind == System.Text.Json.JsonValueKind.String)
-                                query = sq.GetString();
-                        }
+                        query = ToolCallPresentation.ExtractWebSearchQuery(ws);
                     }
                     catch { /* best-effort */ }
                     _logger.LogInformation("Web search call completed (query={Query})", query ?? "(unknown)");
@@ -1608,6 +1637,18 @@ public class FoundryBot : TeamsActivityHandler
                         Arguments:   query is null ? "{}" : $"{{ \"query\": \"{query.Replace("\"", "\\\"")}\" }}",
                         Output:      "(results embedded in message citations)",
                         IsError:     false));
+                    if (state.ShouldShowToolCalls())
+                    {
+                        await streaming.FinalizeAsync(ct);
+                        await turnContext.SendActivityAsync(
+                            MessageFactory.Attachment(AdaptiveCardBuilder.BuildToolCallCard(
+                                toolName: "web_search",
+                                serverLabel: "",
+                                arguments: query ?? "(query unavailable)",
+                                output: null,
+                                toolKind: "WebSearch")),
+                            ct);
+                    }
                 }
                 break;
 
@@ -1719,7 +1760,7 @@ public class FoundryBot : TeamsActivityHandler
                                          ReasoningOutputCap),
                         IsError:     mcpError is not null));
                 }
-                if (!state.ShowToolCalls) break;
+                if (!state.ShouldShowToolCalls()) break;
                 await streaming.FinalizeAsync(ct);
                 var argsStr = mcp.ToolArguments?.ToString() ?? "{}";
                 var output  = mcp.ToolOutput ?? mcp.Error?.ToString() ?? "(no output)";
@@ -1728,7 +1769,7 @@ public class FoundryBot : TeamsActivityHandler
                 // The agent always summarizes the tool output in the next text
                 // delta anyway, so we just show a status card with a small preview.
                 const int previewMax  = 800;   // visible card preview
-                const int fileMaxKB   = 18;    // attach as file only if under this
+                const int fileMaxBytes = 8 * 1024;
                 var preview = output.Length > previewMax
                     ? output.Substring(0, previewMax)
                     : output;
@@ -1736,7 +1777,8 @@ public class FoundryBot : TeamsActivityHandler
                     toolName: mcp.ToolName, serverLabel: mcp.ServerLabel, arguments: argsStr,
                     output: preview + (output.Length > previewMax ? $"\n\n…(+{output.Length - previewMax} chars; full output omitted to fit Teams limits)" : ""),
                     toolKind: "MCP"));
-                if (output.Length > previewMax && output.Length < fileMaxKB * 1024)
+                if (output.Length > previewMax
+                    && System.Text.Encoding.UTF8.GetByteCount(output) <= fileMaxBytes)
                 {
                     msg.Attachments.Add(AgentMessageRenderer.TextAsFile($"tool-output-{mcp.Id}.txt", output));
                 }
@@ -1744,11 +1786,26 @@ public class FoundryBot : TeamsActivityHandler
                 break;
 
             case CodeInterpreterCallResponseItem ci:
-                if (!state.ShowToolCalls) break;
-                await streaming.FinalizeAsync(ct);
-                // CodeInterpreterCallResponseItem doesn't expose Code directly in
-                // OpenAI 2.9; we'd need to inspect ci.Input or similar. Skip for now —
-                // the streamed text deltas already include the result narrative.
+                {
+                    var (code, ciOutput) = ToolCallPresentation.ExtractCodeInterpreterDetails(ci);
+                    steps.Add(new ThinkingStep(
+                        Kind: "CodeInterpreter",
+                        ToolName: "code_interpreter",
+                        ServerLabel: null,
+                        Arguments: TruncateForStep(code ?? "(code unavailable)", ReasoningArgsCap),
+                        Output: TruncateForStep(ciOutput ?? "(no inline output)", ReasoningOutputCap),
+                        IsError: false));
+                    if (!state.ShouldShowToolCalls()) break;
+                    await streaming.FinalizeAsync(ct);
+                    await turnContext.SendActivityAsync(
+                        MessageFactory.Attachment(AdaptiveCardBuilder.BuildToolCallCard(
+                            toolName: "code_interpreter",
+                            serverLabel: "",
+                            arguments: code ?? "(code unavailable)",
+                            output: ciOutput,
+                            toolKind: "CodeInterpreter")),
+                        ct);
+                }
                 break;
 
             default:
@@ -1842,7 +1899,7 @@ public class FoundryBot : TeamsActivityHandler
             }
 
             var id    = root.TryGetProperty("id",           out var i)  ? i.GetString()  : null;
-            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? NormalizeMcpServerLabel(sl.GetString()) : null;
 
             consent = new PendingConsent(id ?? "?", label ?? "(unknown)", cleanUrl);
             return true;
@@ -1881,7 +1938,7 @@ public class FoundryBot : TeamsActivityHandler
             }
 
             var id    = root.TryGetProperty("item_id",      out var i)  ? i.GetString()  : null;
-            var label = root.TryGetProperty("server_label", out var sl) ? sl.GetString() : null;
+            var label = root.TryGetProperty("server_label", out var sl) ? NormalizeMcpServerLabel(sl.GetString()) : null;
 
             consent = new PendingConsent(id ?? "?", label ?? "(unknown)", cleanUrl);
             return true;
@@ -1891,6 +1948,11 @@ public class FoundryBot : TeamsActivityHandler
             return false;
         }
     }
+
+    private static string? NormalizeMcpServerLabel(string? label)
+        => label?.StartsWith("mcp_", StringComparison.OrdinalIgnoreCase) == true
+            ? label[4..]
+            : label;
 
     /// <summary>
     /// Serialize an unknown streaming update back to JSON for diagnostics.

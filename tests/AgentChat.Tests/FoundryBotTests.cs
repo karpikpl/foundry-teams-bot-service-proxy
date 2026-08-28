@@ -331,6 +331,44 @@ public class FoundryBotTests
     }
 
     [Fact]
+    public async Task JsonElement_consent_continue_submit_is_routed()
+    {
+        var bot = MakeBot();
+        var adapter = new TestAdapter();
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            action = "consent_continue",
+            conversationId = "foundry-conversation"
+        });
+        var turn = MakeMessageTurn(adapter, "", value, "conv-consent-submit");
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().BeEmpty();
+        adapter.GetNextReply().Text.Should().Contain("pending sign-in");
+    }
+
+    [Fact]
+    public async Task JsonElement_mcp_approval_submit_is_routed()
+    {
+        var bot = MakeBot();
+        var adapter = new TestAdapter();
+        var value = JsonSerializer.SerializeToElement(new
+        {
+            action = "mcp_approval",
+            approve = true,
+            approval_request_id = "mcpr_123",
+            conversationId = "foundry-conversation"
+        });
+        var turn = MakeMessageTurn(adapter, "", value, "conv-approval-submit");
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().BeEmpty();
+        adapter.GetNextReply().Text.Should().Contain("pending MCP approval");
+    }
+
+    [Fact]
     public async Task Signin_token_exchange_replays_saved_pending_sso_message()
     {
         var sso = new FakeSsoService(token: "foundry-user-token");
@@ -355,6 +393,32 @@ public class FoundryBotTests
         adapter.GetNextReply().Type.Should().Be(ActivityTypes.Typing);
         adapter.GetNextReply().Text.Should().Be("agent:pending question");
         (await bot.Store.GetOrCreateAsync(convId)).PendingSsoMessage.Should().BeNull();
+    }
+
+    [Fact]
+    public void Duplicate_stream_and_item_consent_requests_collapse_to_one_card()
+    {
+        var link = "https://login.example.test/consent?id=1";
+        var consents = new[]
+        {
+            new FoundryBot.PendingConsent("consent-1", "cloud-helper", link),
+            new FoundryBot.PendingConsent("consent-1", "cloud-helper", link)
+        };
+
+        FoundryBot.DeduplicateConsents(consents).Should().ContainSingle();
+    }
+
+    [Fact]
+    public void Consent_requests_with_different_ids_but_same_link_collapse_to_one_card()
+    {
+        var link = "https://login.example.test/consent?id=1";
+        var consents = new[]
+        {
+            new FoundryBot.PendingConsent("stream-item", "cloud-helper", link),
+            new FoundryBot.PendingConsent("completed-item", "cloud-helper", link)
+        };
+
+        FoundryBot.DeduplicateConsents(consents).Should().ContainSingle();
     }
 
     [Fact]

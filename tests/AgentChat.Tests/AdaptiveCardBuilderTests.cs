@@ -102,6 +102,7 @@ public class AdaptiveCardBuilderTests
     [InlineData("MCP",             "🔧")]
     [InlineData("Function",        "🛠️")]
     [InlineData("CodeInterpreter", "🐍")]
+    [InlineData("WebSearch",       "🔎")]
     public void ToolCallCard_picks_icon_per_kind(string kind, string icon)
     {
         var att = AdaptiveCardBuilder.BuildToolCallCard("name", "", "{}", null, toolKind: kind);
@@ -122,6 +123,19 @@ public class AdaptiveCardBuilderTests
         var att = AdaptiveCardBuilder.BuildToolCallCard("name", "", "{}", hugeOutput, "MCP");
         var allText = string.Join("\n", AllText(att));
         allText.Should().Contain("truncated");
+    }
+
+    [Fact]
+    public void ToolCallCard_truncates_large_arguments_to_stay_within_Teams_limits()
+    {
+        var hugeArguments = new string('x', 20_000);
+
+        var att = AdaptiveCardBuilder.BuildToolCallCard("python", "", hugeArguments, "ok", "CodeInterpreter");
+        var allText = string.Join("\n", AllText(att));
+
+        allText.Should().Contain("Arguments (truncated)");
+        allText.Should().NotContain(hugeArguments);
+        allText.Length.Should().BeLessThan(5_000);
     }
 
     // ============================================================ Agent picker

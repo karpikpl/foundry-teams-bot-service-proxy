@@ -85,6 +85,7 @@ public sealed class SdkStreamingMessageHelper
     public bool Enabled    => _enabled;
     public bool IsOpen     => _enabled && _ctx.StreamingResponse.IsStreamStarted();
     public bool HasContent => _fallbackBuffer.Length > 0;
+    public string BufferedText => _fallbackBuffer.ToString();
 
     public void AppendDelta(string delta)
     {
@@ -261,6 +262,11 @@ public sealed class SdkStreamingMessageHelper
         try
         {
             if (!_ctx.StreamingResponse.IsStreamStarted()) return;
+
+            if (_fallbackBuffer.Length == 0 && _ctx.StreamingResponse.FinalMessage is null)
+            {
+                _ctx.StreamingResponse.FinalMessage = MessageFactory.Text(_lastStatus ?? "Action required.");
+            }
 
             if (attachments is { Count: > 0 })
             {

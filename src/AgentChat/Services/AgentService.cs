@@ -21,6 +21,7 @@ public class AgentService
     private readonly TokenCredential _credential;
     private readonly IHttpClientFactory _httpFactory;
     private readonly string _defaultProjectEndpoint;
+    private readonly string _defaultAgentName;
     private readonly TimeSpan _cacheTtl;
     private readonly bool _useManagedIdentity;
 
@@ -56,6 +57,7 @@ public class AgentService
         var endpoint = config["Foundry:ProjectEndpoint"]
             ?? throw new InvalidOperationException("Foundry:ProjectEndpoint not configured");
         _defaultProjectEndpoint = endpoint.TrimEnd('/');
+        _defaultAgentName = config["Foundry:AgentName"] ?? "default";
 
         var ttlSeconds = config.GetValue("Foundry:CatalogCacheSeconds", 300);
         _cacheTtl = TimeSpan.FromSeconds(Math.Max(0, ttlSeconds));
@@ -82,7 +84,9 @@ public class AgentService
     /// Default per-agent endpoint, for callers that need a non-null URL before
     /// a user-scoped catalog is fetched (e.g. routing defaults).
     /// </summary>
-    public string DefaultEndpoint => FoundryAgentsApi.ComposeAgentEndpoint(_defaultProjectEndpoint, "default");
+    public string DefaultEndpoint => FoundryAgentsApi.ComposeAgentEndpoint(
+        _defaultProjectEndpoint,
+        _defaultAgentName);
 
     /// <summary>
     /// Return the signed-in user's agent catalog for a project. Uses the cached
@@ -192,7 +196,9 @@ public class AgentService
         string? userObjectId, string? userToken, string? projectEndpoint = null, CancellationToken ct = default)
     {
         var all = await GetDescriptorsAsync(userObjectId, userToken, projectEndpoint, ct: ct);
-        return all.FirstOrDefault()
+        return all.FirstOrDefault(descriptor =>
+                string.Equals(descriptor.Name, _defaultAgentName, StringComparison.OrdinalIgnoreCase))
+            ?? all.FirstOrDefault()
             ?? throw new InvalidOperationException(
                 $"No active agents found in project {ResolveProject(projectEndpoint)} for the signed-in user.");
     }

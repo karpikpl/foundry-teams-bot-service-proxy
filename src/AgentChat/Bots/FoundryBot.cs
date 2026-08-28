@@ -1,11 +1,13 @@
 using System.ClientModel;
 using System.Diagnostics;
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using AgentChat.Foundry;
 using AgentChat.Services;
 using Microsoft.Agents.Builder;
 using Microsoft.Agents.Extensions.Teams.Compat;
+using Microsoft.Agents.Extensions.Teams.Models;
 using Microsoft.Agents.Authentication;
 using Microsoft.Agents.Core.Models;
 using Newtonsoft.Json;
@@ -31,6 +33,7 @@ public class FoundryBot : TeamsActivityHandler
     private readonly IHttpContextAccessor _httpContext;
     private readonly AgentClientCache _clientCache;
     private readonly TeamsSsoService _sso;
+    private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<FoundryBot> _logger;
     // When true, Foundry calls use the container UAMI, not the user's OBO
     // token. Teams SSO is skipped for the whole turn (no sign-in card, no
@@ -53,6 +56,7 @@ public class FoundryBot : TeamsActivityHandler
         IHttpContextAccessor httpContext,
         AgentClientCache clientCache,
         TeamsSsoService sso,
+        IHttpClientFactory httpClientFactory,
         ILogger<FoundryBot> logger)
     {
         _agents      = agents;
@@ -61,6 +65,7 @@ public class FoundryBot : TeamsActivityHandler
         _httpContext = httpContext;
         _clientCache = clientCache;
         _sso         = sso;
+        _httpClientFactory = httpClientFactory;
         _logger      = logger;
         _useManagedIdentityForAgents = config.GetValue("Foundry:UseManagedIdentityForAgents", false);
         _sendUserIdentityHeader      = config.GetValue("Foundry:SendUserIdentityHeader", false);
@@ -452,21 +457,39 @@ public class FoundryBot : TeamsActivityHandler
 
     private static bool IsKnownCardSubmit(object value)
     {
+        return TryGetCardData(value, out var data)
+            && data.Value<string>("action") is { } action
+            && KnownCardActions.Contains(action);
+    }
+
+    private static bool TryGetCardData(object value, out JObject data)
+    {
         try
         {
-            var data = value as JObject ?? JObject.FromObject(value);
-            var action = data.Value<string>("action");
-            return !string.IsNullOrWhiteSpace(action) && KnownCardActions.Contains(action);
+            data = value switch
+            {
+                JObject jobject => jobject,
+                JsonElement element when element.ValueKind == JsonValueKind.Object
+                    => JObject.Parse(element.GetRawText()),
+                _ => JObject.FromObject(value)
+            };
+            return true;
         }
         catch
         {
+            data = null!;
             return false;
         }
     }
 
     private async Task HandleCardSubmitAsync(ITurnContext turnContext, CancellationToken ct)
     {
-        var data   = JObject.FromObject(turnContext.Activity.Value!);
+        if (!TryGetCardData(turnContext.Activity.Value!, out var data))
+        {
+            _logger.LogWarning("Ignoring malformed card submit payload.");
+            return;
+        }
+
         var action = data.Value<string>("action") ?? "";
         var state  = await _state.GetOrCreateAsync(turnContext.Activity.Conversation.Id, ct);
         await _state.TouchAsync(turnContext.Activity.Conversation.Id, turnContext.Activity.GetConversationReference(), ct);
@@ -1362,7 +1385,7 @@ public class FoundryBot : TeamsActivityHandler
             state.PendingConsentResponseId = state.CurrentResponseId;
             await _state.SaveAsync(turnContext.Activity.Conversation.Id, state, ct);
 
-            foreach (var c in pendingConsents)
+            foreach (var c in DeduplicateConsents(pendingConsents))
             {
                 await turnContext.SendActivityAsync(
                     MessageFactory.Attachment(AdaptiveCardBuilder.BuildConsentCard(
@@ -1400,7 +1423,9 @@ public class FoundryBot : TeamsActivityHandler
             if (citations.Count > 10) sb.Append($"…and {citations.Count - 10} more.\n");
             streaming.AppendDelta(sb.ToString());
         }
+        var completedText = streaming.BufferedText;
         await streaming.FinalizeAsync(ct);
+        await OfferGeneratedFilesAsync(turnContext, state, completedText, ct);
         if (state.ShowUsage && state.LastTotalTokens > 0)
         {
             await turnContext.SendActivityAsync(
@@ -1412,6 +1437,220 @@ public class FoundryBot : TeamsActivityHandler
                 ct);
         }
         return new StreamStep(true);
+    }
+
+    private async Task OfferGeneratedFilesAsync(
+        ITurnContext turnContext,
+        ConversationState state,
+        string responseText,
+        CancellationToken ct)
+    {
+        if (!string.Equals(turnContext.Activity.ChannelId, "msteams", StringComparison.OrdinalIgnoreCase)
+            || !string.Equals(turnContext.Activity.Conversation?.ConversationType, "personal", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+        var conversationId = turnContext.Activity.Conversation?.Id
+            ?? throw new InvalidOperationException("Teams message activity has no conversation ID.");
+
+        var files = GeneratedFileLinkParser.Extract(responseText);
+        if (files.Count == 0) return;
+
+        var now = DateTime.UtcNow;
+        state.PendingFiles ??= new Dictionary<string, PendingFileDelivery>(StringComparer.Ordinal);
+        foreach (var expired in state.PendingFiles
+                     .Where(pair => pair.Value.ExpiresUtc <= now)
+                     .Select(pair => pair.Key)
+                     .ToArray())
+        {
+            state.PendingFiles.Remove(expired);
+        }
+
+        foreach (var file in files)
+        {
+            if (!UrlSafety.TryValidatePublicHttpsUrl(file.Url, out _, out var reason))
+            {
+                _logger.LogWarning("Skipping generated file URL {Url}: {Reason}", file.Url, reason);
+                continue;
+            }
+
+            if (state.PendingFiles.Values.Any(existing =>
+                    string.Equals(existing.SourceUrl, file.Url, StringComparison.Ordinal)))
+            {
+                continue;
+            }
+
+            var fileId = Guid.NewGuid().ToString("N");
+            state.PendingFiles[fileId] = new PendingFileDelivery(
+                file.Name,
+                file.Url,
+                now.AddMinutes(30));
+
+            var context = new { fileId };
+            await turnContext.SendActivityAsync(
+                MessageFactory.Attachment(new Attachment
+                {
+                    Name = file.Name,
+                    ContentType = FileConsentCard.ContentType,
+                    Content = new FileConsentCard(
+                        $"Upload {file.Name} to this Teams chat.",
+                        null,
+                        context,
+                        context)
+                }),
+                ct);
+        }
+
+        await _state.SaveAsync(conversationId, state, ct);
+    }
+
+    protected override async Task OnTeamsFileConsentAcceptAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        FileConsentCardResponse fileConsentCardResponse,
+        CancellationToken cancellationToken)
+    {
+        var conversationId = turnContext.Activity.Conversation?.Id
+            ?? throw new InvalidOperationException("Teams file consent activity has no conversation ID.");
+        var state = await _state.GetOrCreateAsync(conversationId, cancellationToken);
+        state.PendingFiles ??= new Dictionary<string, PendingFileDelivery>(StringComparer.Ordinal);
+        var fileId = ReadFileId(fileConsentCardResponse.Context);
+        if (fileId is null
+            || !state.PendingFiles.TryGetValue(fileId, out var pending)
+            || pending.ExpiresUtc <= DateTime.UtcNow)
+        {
+            await turnContext.SendActivityAsync(
+                MessageFactory.Text("That file offer has expired. Ask me to create the file again."),
+                cancellationToken);
+            return;
+        }
+
+        var upload = fileConsentCardResponse.UploadInfo
+            ?? throw new InvalidOperationException("Teams did not provide file upload information.");
+        if (!IsAllowedTeamsUploadUrl(upload.UploadUrl))
+        {
+            throw new InvalidOperationException("Teams returned an unexpected file upload URL.");
+        }
+        var uploadUrl = upload.UploadUrl!;
+
+        var client = _httpClientFactory.CreateClient();
+        var bytes = await DownloadGeneratedFileAsync(client, pending.SourceUrl, cancellationToken);
+        using var content = new ByteArrayContent(bytes);
+        content.Headers.ContentLength = bytes.Length;
+        content.Headers.ContentRange = new ContentRangeHeaderValue(0, bytes.Length - 1, bytes.Length);
+        using var uploadResponse = await client.PutAsync(uploadUrl, content, cancellationToken);
+        uploadResponse.EnsureSuccessStatusCode();
+
+        state.PendingFiles.Remove(fileId);
+        await _state.SaveAsync(conversationId, state, cancellationToken);
+
+        await turnContext.SendActivityAsync(
+            MessageFactory.Attachment(new Attachment
+            {
+                Name = upload.Name ?? pending.Name,
+                ContentType = FileInfoCard.ContentType,
+                ContentUrl = upload.ContentUrl,
+                Content = new FileInfoCard
+                {
+                    UniqueId = upload.UniqueId,
+                    FileType = upload.FileType
+                }
+            }),
+            cancellationToken);
+    }
+
+    protected override async Task OnTeamsFileConsentDeclineAsync(
+        ITurnContext<IInvokeActivity> turnContext,
+        FileConsentCardResponse fileConsentCardResponse,
+        CancellationToken cancellationToken)
+    {
+        var conversationId = turnContext.Activity.Conversation?.Id
+            ?? throw new InvalidOperationException("Teams file consent activity has no conversation ID.");
+        var state = await _state.GetOrCreateAsync(conversationId, cancellationToken);
+        state.PendingFiles ??= new Dictionary<string, PendingFileDelivery>(StringComparer.Ordinal);
+        var fileId = ReadFileId(fileConsentCardResponse.Context);
+        if (fileId is not null)
+        {
+            state.PendingFiles.Remove(fileId);
+            await _state.SaveAsync(conversationId, state, cancellationToken);
+        }
+
+        await turnContext.SendActivityAsync(
+            MessageFactory.Text("File upload cancelled."),
+            cancellationToken);
+    }
+
+    private static string? ReadFileId(object? context)
+    {
+        if (context is null || !TryGetCardData(context, out var data)) return null;
+        return data.Value<string>("fileId");
+    }
+
+    private static bool IsAllowedTeamsUploadUrl(string? raw)
+    {
+        return Uri.TryCreate(raw, UriKind.Absolute, out var uri)
+            && uri.Scheme == Uri.UriSchemeHttps
+            && (uri.Host.EndsWith(".sharepoint.com", StringComparison.OrdinalIgnoreCase)
+                || uri.Host.EndsWith(".sharepoint-df.com", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<byte[]> DownloadGeneratedFileAsync(
+        HttpClient client,
+        string sourceUrl,
+        CancellationToken ct)
+    {
+        const int maxBytes = 25 * 1024 * 1024;
+        if (!UrlSafety.TryValidatePublicHttpsUrl(sourceUrl, out var uri, out var reason))
+        {
+            throw new InvalidOperationException($"Generated file URL is unsafe: {reason}");
+        }
+
+        using var response = await client.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, ct);
+        response.EnsureSuccessStatusCode();
+        if (response.Content.Headers.ContentLength is > maxBytes)
+        {
+            throw new InvalidOperationException("Generated file exceeds the 25 MB Teams upload limit.");
+        }
+
+        await using var source = await response.Content.ReadAsStreamAsync(ct);
+        using var destination = new MemoryStream();
+        var buffer = new byte[81920];
+        while (true)
+        {
+            var read = await source.ReadAsync(buffer, ct);
+            if (read == 0) break;
+            if (destination.Length + read > maxBytes)
+            {
+                throw new InvalidOperationException("Generated file exceeds the 25 MB Teams upload limit.");
+            }
+            await destination.WriteAsync(buffer.AsMemory(0, read), ct);
+        }
+        return destination.ToArray();
+    }
+
+    private static IEnumerable<PendingConsent> DeduplicateConsents(IEnumerable<PendingConsent> consents)
+    {
+        var unique = new List<PendingConsent>();
+        foreach (var consent in consents)
+        {
+            var index = unique.FindIndex(existing =>
+                (!string.Equals(consent.Id, "?", StringComparison.Ordinal)
+                 && string.Equals(existing.Id, consent.Id, StringComparison.Ordinal))
+                || string.Equals(existing.ConsentLink, consent.ConsentLink, StringComparison.Ordinal));
+
+            if (index < 0)
+            {
+                unique.Add(consent);
+                continue;
+            }
+
+            if (unique[index].ServerLabel.StartsWith("mcp_", StringComparison.OrdinalIgnoreCase)
+                && !consent.ServerLabel.StartsWith("mcp_", StringComparison.OrdinalIgnoreCase))
+            {
+                unique[index] = consent;
+            }
+        }
+
+        return unique;
     }
 
     private async Task HandleCompletedItemAsync(

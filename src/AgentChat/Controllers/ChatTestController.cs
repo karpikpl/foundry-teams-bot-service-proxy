@@ -1,8 +1,5 @@
-using System.ClientModel;
-using System.Collections.Concurrent;
 using System.Security.Claims;
 using System.Text;
-using System.Text.Json;
 using AgentChat.Auth;
 using AgentChat.Bots;
 using AgentChat.Foundry;
@@ -39,15 +36,10 @@ namespace AgentChat.Controllers;
 [AuthorizeForScopes(Scopes = new[] { AdminChatAuthOptions.FoundryScope })]
 public class ChatTestController : ControllerBase
 {
-    private static readonly ConcurrentDictionary<string, PendingMcpApproval> PendingApprovals = new(StringComparer.Ordinal);
-    private static readonly ConcurrentDictionary<string, string> CurrentResponseIds = new(StringComparer.Ordinal);
-
-    private readonly AgentService _agents;
-    private readonly AgentClientCache _clientCache;
     private readonly IWebHostEnvironment _env;
-    private readonly ILogger<ChatTestController> _logger;
     private readonly AdminChatAuthOptions _adminChatAuth;
     private readonly ITokenAcquisition? _tokenAcquisition;
+    private readonly ChatSessionService _chatSessions;
 
     public ChatTestController(
         AgentService agents,
@@ -55,14 +47,16 @@ public class ChatTestController : ControllerBase
         IWebHostEnvironment env,
         ILogger<ChatTestController> logger,
         AdminChatAuthOptions? adminChatAuth = null,
-        ITokenAcquisition? tokenAcquisition = null)
+        ITokenAcquisition? tokenAcquisition = null,
+        ChatSessionService? chatSessions = null)
     {
-        _agents           = agents;
-        _clientCache      = clientCache;
         _env              = env;
-        _logger           = logger;
         _adminChatAuth    = adminChatAuth ?? new AdminChatAuthOptions();
         _tokenAcquisition = tokenAcquisition;
+        _chatSessions     = chatSessions ?? new ChatSessionService(
+            agents,
+            clientCache,
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<ChatSessionService>.Instance);
     }
 
     // ====================================================== HTML page
@@ -121,17 +115,18 @@ public class ChatTestController : ControllerBase
             return BadRequest(new { error = projectError });
 
         var user = await GetFoundryUserContextAsync();
-        using var userAuth = BeginFoundryUserAuthScope(user?.Token);
-        var agent = await _agents.FindByKeyAsync(body.AgentKey, user?.ObjectId, user?.Token, projectEndpoint, ct);
-        if (agent is null) return NotFound(new { error = $"agent '{body.AgentKey}' not found" });
-
-        var foundry = _clientCache.For(agent.Endpoint);
-        var convClient = foundry.OpenAI.GetConversationClient();
-        var result = await convClient.CreateConversationAsync(
-            BinaryContent.Create(BinaryData.FromString("{}")), options: null);
-        var doc = JsonDocument.Parse(result.GetRawResponse().Content.ToString());
-        var id = doc.RootElement.GetProperty("id").GetString()!;
-        return Ok(new CreateConvResponse(id, agent.Name, agent.Endpoint));
+        var conversation = await _chatSessions.CreateConversationAsync(
+            body.AgentKey,
+            ChatSessionService.AgentLookup.Key,
+            projectEndpoint,
+            ToChatUser(user),
+            ct);
+        return conversation is null
+            ? NotFound(new { error = $"agent '{body.AgentKey}' not found" })
+            : Ok(new CreateConvResponse(
+                conversation.ConversationId,
+                conversation.AgentName,
+                conversation.Endpoint));
     }
 
     [HttpDelete("conversations/{conversationId}")]
@@ -146,22 +141,16 @@ public class ChatTestController : ControllerBase
             return BadRequest(new { error = projectError });
 
         var user = await GetFoundryUserContextAsync();
-        using var userAuth = BeginFoundryUserAuthScope(user?.Token);
-        var agent = await _agents.FindByKeyAsync(agentKey, user?.ObjectId, user?.Token, projectEndpoint, ct);
-        if (agent is null) return NotFound(new { error = $"agent '{agentKey}' not found" });
-
-        PendingApprovals.TryRemove(PendingKey(agentKey, conversationId), out _);
-        CurrentResponseIds.TryRemove(PendingKey(agentKey, conversationId), out _);
-        var foundry = _clientCache.For(agent.Endpoint);
-        try
-        {
-            await foundry.OpenAI.GetConversationClient().DeleteConversationAsync(conversationId, options: null);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Delete conversation failed");
-        }
-        return NoContent();
+        var found = await _chatSessions.DeleteConversationAsync(
+            agentKey,
+            ChatSessionService.AgentLookup.Key,
+            conversationId,
+            projectEndpoint,
+            ToChatUser(user),
+            ct);
+        return found
+            ? NoContent()
+            : NotFound(new { error = $"agent '{agentKey}' not found" });
     }
 
     // ====================================================== Streaming chat
@@ -196,13 +185,6 @@ public class ChatTestController : ControllerBase
             return;
         }
 
-        var pendingKey = PendingKey(body.AgentKey, body.ConversationId);
-        if (body.Approval is null && PendingApprovals.ContainsKey(pendingKey))
-        {
-            await WriteSseAsync("error", McpApproval.PendingReminder, ct);
-            return;
-        }
-
         if (!TryProjectEndpoint(body.FoundryHost, body.Project, out var projectEndpoint, out var projectError))
         {
             await WriteSseAsync("error", projectError, ct);
@@ -210,362 +192,39 @@ public class ChatTestController : ControllerBase
         }
 
         var user = await GetFoundryUserContextAsync();
-        using var userAuth = BeginFoundryUserAuthScope(user?.Token);
-        var agent = await _agents.FindByKeyAsync(body.AgentKey, user?.ObjectId, user?.Token, projectEndpoint, ct);
-        if (agent is null)
-        {
-            await WriteSseAsync("error", $"agent '{body.AgentKey}' not found", ct);
-            return;
-        }
-
-        var foundry   = _clientCache.For(agent.Endpoint);
-        var responses = foundry.OpenAI.GetResponsesClient();
-
-        IReadOnlyList<ResponseItem>? inputItems;
-        string? firstPreviousResponseId = null;
-        if (body.Approval is { } approval)
-        {
-            if (!PendingApprovals.TryGetValue(pendingKey, out var pending) ||
-                !string.Equals(pending.ApprovalRequestId, approval.RequestId, StringComparison.Ordinal))
-            {
-                await WriteSseAsync("error", "I don't see that pending MCP approval anymore. Send your message again to retry.", ct);
-                return;
-            }
-            inputItems = new[] { ResponseItem.CreateMcpApprovalResponseItem(approval.RequestId, approval.Approve) };
-            firstPreviousResponseId = pending.PreviousResponseId;
-        }
-        else
-        {
-            inputItems = new[] { ResponseItem.CreateUserMessageItem(body.Message!) };
-        }
-
-        // Stream the response. A user turn binds the Foundry conversation only
-        // when no prior response id is known; otherwise every hop chains via
-        // previous_response_id, matching the Foundry Responses sample.
-        try
-        {
-            int safety = 0;
-            var clearApprovalOnNextStream = body.Approval is not null;
-            while (true)
-            {
-                if (++safety > 8)
-                {
-                    await WriteSseAsync("error", "Aborting after too many tool/approval round-trips.", ct);
-                    return;
-                }
-
-                var opts = BuildResponseOptions(body.ConversationId, pendingKey, inputItems, firstPreviousResponseId);
-                var step = await StreamFoundryOnceAsync(responses, opts, pendingKey, clearApprovalOnNextStream, ct);
-                clearApprovalOnNextStream = false;
-                if (step.Stop) return;
-                inputItems = step.NextInputItems;
-                firstPreviousResponseId = null;
-            }
-        }
-        catch (OperationCanceledException) { /* client disconnected */ }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Stream failed");
-            await WriteSseAsync("error", ex.Message, ct);
-        }
+        await _chatSessions.StreamMessageAsync(
+            body.AgentKey,
+            ChatSessionService.AgentLookup.Key,
+            new ChatSessionService.Message(
+                body.ConversationId,
+                body.Message,
+                body.Approval is null
+                    ? null
+                    : new ChatSessionService.Approval(body.Approval.RequestId, body.Approval.Approve)),
+            projectEndpoint,
+            ToChatUser(user),
+            WriteSseAsync,
+            ct);
     }
 
-    private sealed record StreamStep(bool Stop, IReadOnlyList<ResponseItem>? NextInputItems = null);
-
-    private static CreateResponseOptions BuildResponseOptions(
-        string conversationId,
-        string pendingKey,
-        IReadOnlyList<ResponseItem>? inputItems,
-        string? previousResponseIdOverride = null)
-    {
-        var opts = new CreateResponseOptions { StreamingEnabled = true };
-        var previousResponseId = previousResponseIdOverride
-                                 ?? (CurrentResponseIds.TryGetValue(pendingKey, out var current) ? current : null);
-        if (!string.IsNullOrEmpty(previousResponseId))
-        {
-            opts.PreviousResponseId = previousResponseId;
-        }
-        else
-        {
-            opts.ConversationOptions = new ResponseConversationOptions(conversationId);
-        }
-
-        if (inputItems is not null)
-        {
-            foreach (var item in inputItems)
-                opts.InputItems.Add(item);
-        }
-
-        return opts;
-    }
-
-    private async Task<StreamStep> StreamFoundryOnceAsync(
-        ResponsesClient responses,
-        CreateResponseOptions opts,
-        string pendingKey,
-        bool clearsPendingApproval,
-        CancellationToken ct)
-    {
-        var seenIds = new HashSet<string>();
-        var responseIdForResume = opts.PreviousResponseId;
-        await foreach (var update in responses.CreateResponseStreamingAsync(opts, ct))
-        {
-            switch (update)
-            {
-                case StreamingResponseCreatedUpdate created:
-                    responseIdForResume = created.Response?.Id ?? responseIdForResume;
-                    if (!string.IsNullOrEmpty(created.Response?.Id))
-                    {
-                        CurrentResponseIds[pendingKey] = created.Response.Id;
-                    }
-                    if (clearsPendingApproval)
-                    {
-                        PendingApprovals.TryRemove(pendingKey, out _);
-                        clearsPendingApproval = false;
-                    }
-                    break;
-
-                case StreamingResponseOutputTextDeltaUpdate d when !string.IsNullOrEmpty(d.Delta):
-                    await WriteSseAsync("text", d.Delta!, ct);
-                    break;
-
-                case StreamingResponseOutputItemDoneUpdate done:
-                    var item = done.Item;
-                    if (item.Id is { } id && !seenIds.Add(id)) break;
-                    if (await HandleItemAsync(item, pendingKey, responseIdForResume, ct)) return new StreamStep(true);
-                    break;
-
-                case StreamingResponseCompletedUpdate completed:
-                    responseIdForResume = completed.Response?.Id ?? responseIdForResume;
-                    if (!string.IsNullOrEmpty(completed.Response?.Id))
-                    {
-                        CurrentResponseIds[pendingKey] = completed.Response.Id;
-                    }
-                    var u = completed.Response?.Usage;
-                    var payload = JsonSerializer.Serialize(new
-                    {
-                        inputTokens  = u?.InputTokenCount  ?? 0,
-                        outputTokens = u?.OutputTokenCount ?? 0,
-                        totalTokens  = u?.TotalTokenCount  ?? 0
-                    });
-                    await WriteSseAsync("done", payload, ct);
-                    break;
-
-                case StreamingResponseFailedUpdate failed:
-                    await WriteSseAsync("error", failed.Response?.Error?.Message ?? "Run failed", ct);
-                    return new StreamStep(true);
-
-                case StreamingResponseErrorUpdate err:
-                    await WriteSseAsync("error", $"{err.Code ?? "error"}: {err.Message ?? "unknown"}", ct);
-                    return new StreamStep(true);
-
-                default:
-                    if (TryParseApprovalEvent(update, responseIdForResume, out var approvalEvent))
-                    {
-                        await EmitApprovalAsync(pendingKey, approvalEvent, ct);
-                        return new StreamStep(true);
-                    }
-                    if (TryParseConsentEvent(update, out var serverLabel, out var link))
-                    {
-                        await WriteSseAsync("consent", JsonSerializer.Serialize(new { serverLabel, consentLink = link }), ct);
-                    }
-                    break;
-            }
-        }
-
-        // MCP tools execute server-side within this response. Once Foundry
-        // completes the stream, another POST would have no input and fail
-        // with missing_required_parameter. Only explicit approval responses
-        // start a new request, handled by StreamMessage before this call.
-        return new StreamStep(true);
-    }
-
-    private async Task<bool> HandleItemAsync(ResponseItem item, string pendingKey, string? responseIdForResume, CancellationToken ct)
-    {
-        switch (item)
-        {
-            case McpToolCallApprovalRequestItem approval when !string.IsNullOrEmpty(responseIdForResume):
-                await EmitApprovalAsync(pendingKey, McpApproval.FromSdkItem(approval, responseIdForResume!), ct);
-                return true;
-
-            case McpToolCallItem mcp:
-                await WriteSseAsync("tool", JsonSerializer.Serialize(new
-                {
-                    kind   = "mcp",
-                    tool   = mcp.ToolName,
-                    server = mcp.ServerLabel,
-                    output = Truncate(mcp.ToolOutput ?? mcp.Error?.ToString() ?? "(no output)", 2000)
-                }), ct);
-                return false;
-
-            case WebSearchCallResponseItem webSearch:
-                await WriteSseAsync("tool", JsonSerializer.Serialize(new
-                {
-                    kind = "web_search",
-                    tool = "web_search",
-                    args = ExtractWebSearchQuery(webSearch) ?? "(query unavailable)"
-                }), ct);
-                return false;
-
-            case CodeInterpreterCallResponseItem codeInterpreter:
-                var (code, output) = ExtractCodeInterpreterDetails(codeInterpreter);
-                await WriteSseAsync("tool", JsonSerializer.Serialize(new
-                {
-                    kind = "code_interpreter",
-                    tool = "code_interpreter",
-                    args = code ?? "(code unavailable)",
-                    output = output
-                }), ct);
-                return false;
-
-            case FunctionCallResponseItem fc:
-                await WriteSseAsync("tool", JsonSerializer.Serialize(new
-                {
-                    kind = "function",
-                    tool = fc.FunctionName,
-                    args = fc.FunctionArguments?.ToString() ?? "{}"
-                }), ct);
-                return false;
-
-            default:
-                // Try Foundry-specific shapes via raw JSON.
-                if (TryParseApproval(item, responseIdForResume, out var parsedApproval))
-                {
-                    await EmitApprovalAsync(pendingKey, parsedApproval, ct);
-                    return true;
-                }
-                if (TryParseConsent(item, out var serverLabel, out var link))
-                {
-                    await WriteSseAsync("consent", JsonSerializer.Serialize(new { serverLabel, consentLink = link }), ct);
-                }
-                return false;
-        }
-    }
-
-    private static string? ExtractWebSearchQuery(WebSearchCallResponseItem item)
-    {
-        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
-        if (!doc.RootElement.TryGetProperty("action", out var action)) return null;
-        if (action.TryGetProperty("query", out var query) && query.ValueKind == JsonValueKind.String)
-            return query.GetString();
-        if (action.TryGetProperty("search_query", out var searchQuery) && searchQuery.ValueKind == JsonValueKind.String)
-            return searchQuery.GetString();
-        return null;
-    }
-
-    private static (string? Code, string? Output) ExtractCodeInterpreterDetails(CodeInterpreterCallResponseItem item)
-    {
-        using var doc = JsonDocument.Parse(System.ClientModel.Primitives.ModelReaderWriter.Write(item));
-        var root = doc.RootElement;
-        var code = root.TryGetProperty("code", out var codeElement) && codeElement.ValueKind == JsonValueKind.String
-            ? codeElement.GetString()
-            : null;
-        var output = root.TryGetProperty("outputs", out var outputs) && outputs.ValueKind == JsonValueKind.Array
-            ? Truncate(outputs.GetRawText(), 2000)
-            : null;
-        return (code, output);
-    }
-
-    public static string PendingKey(string agentKey, string conversationId) => $"{agentKey}\n{conversationId}";
+    public static string PendingKey(string agentKey, string conversationId)
+        => ChatSessionService.PendingKey(null, agentKey, conversationId);
 
     public static CreateResponseOptions BuildApprovalResumeOptions(
         string conversationId, string previousResponseId, string approvalRequestId, bool approve)
-        => McpApproval.BuildResumeOptions(conversationId, previousResponseId, approvalRequestId, approve);
+        => ChatSessionService.BuildApprovalResumeOptions(
+            conversationId,
+            previousResponseId,
+            approvalRequestId,
+            approve);
 
     public static string SerializeApprovalEventPayload(PendingMcpApproval approval)
-        => JsonSerializer.Serialize(new
-        {
-            approval_request_id = approval.ApprovalRequestId,
-            server_label = approval.ServerLabel,
-            tool_name = approval.ToolName,
-            arguments_summary = approval.ArgumentsSummary
-        });
-
-    private async Task EmitApprovalAsync(string pendingKey, PendingMcpApproval approval, CancellationToken ct)
-    {
-        PendingApprovals[pendingKey] = approval;
-        await WriteSseAsync("approval", SerializeApprovalEventPayload(approval), ct);
-    }
-
-    private bool TryParseApproval(ResponseItem item, string? responseIdForResume, out PendingMcpApproval approval)
-    {
-        approval = null!;
-        if (string.IsNullOrEmpty(responseIdForResume)) return false;
-        try
-        {
-            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(item);
-            using var doc = JsonDocument.Parse(bd);
-            return McpApproval.TryParseJson(doc.RootElement, responseIdForResume!, out approval);
-        }
-        catch { return false; }
-    }
-
-    private bool TryParseApprovalEvent(StreamingResponseUpdate update, string? responseIdForResume, out PendingMcpApproval approval)
-    {
-        approval = null!;
-        if (string.IsNullOrEmpty(responseIdForResume)) return false;
-        try
-        {
-            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(update);
-            using var doc = JsonDocument.Parse(bd);
-            return McpApproval.TryParseJson(doc.RootElement, responseIdForResume!, out approval);
-        }
-        catch { return false; }
-    }
-
-    private bool TryParseConsent(ResponseItem item, out string serverLabel, out string consentLink)
-    {
-        serverLabel = ""; consentLink = "";
-        try
-        {
-            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(item);
-            using var doc = JsonDocument.Parse(bd);
-            var root = doc.RootElement;
-            if (!string.Equals(root.GetProperty("type").GetString(), "oauth_consent_request", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var rawLink = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
-            var cleanUrl = ConsentLinkParser.ExtractConsentUrl(rawLink);
-            if (string.IsNullOrEmpty(cleanUrl))
-            {
-                _logger.LogWarning("Skipping OAuth consent request {ItemId}: no URL found in consent_link", root.TryGetProperty("id", out var id) ? id.GetString() : null);
-                return false;
-            }
-
-            consentLink = cleanUrl;
-            serverLabel = root.TryGetProperty("server_label", out var sl) ? sl.GetString() ?? "" : "";
-            return true;
-        }
-        catch { return false; }
-    }
-
-    private bool TryParseConsentEvent(StreamingResponseUpdate update, out string serverLabel, out string consentLink)
-    {
-        serverLabel = ""; consentLink = "";
-        try
-        {
-            var bd = System.ClientModel.Primitives.ModelReaderWriter.Write(update);
-            using var doc = JsonDocument.Parse(bd);
-            var root = doc.RootElement;
-            if (!string.Equals(root.GetProperty("type").GetString(), "response.oauth_consent_requested", StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            var rawLink = root.TryGetProperty("consent_link", out var cl) ? cl.GetString() : null;
-            var cleanUrl = ConsentLinkParser.ExtractConsentUrl(rawLink);
-            if (string.IsNullOrEmpty(cleanUrl))
-            {
-                _logger.LogWarning("Skipping OAuth consent event {ItemId}: no URL found in consent_link", root.TryGetProperty("item_id", out var id) ? id.GetString() : null);
-                return false;
-            }
-
-            consentLink = cleanUrl;
-            serverLabel = root.TryGetProperty("server_label", out var sl) ? sl.GetString() ?? "" : "";
-            return true;
-        }
-        catch { return false; }
-    }
+        => ChatSessionService.SerializeApprovalEventPayload(approval);
 
     private sealed record FoundryUserContext(string ObjectId, string Token);
+
+    private static ChatSessionService.UserContext? ToChatUser(FoundryUserContext? user)
+        => user is null ? null : new ChatSessionService.UserContext(user.ObjectId, user.Token);
 
     private async Task<FoundryUserContext?> GetFoundryUserContextAsync()
     {

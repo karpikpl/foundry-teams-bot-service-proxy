@@ -12,6 +12,8 @@
 **/bin
 **/obj
 **/publish
+**/node_modules
+**/dist
 **/*.zip
 
 # --- IDE / editor cruft ---

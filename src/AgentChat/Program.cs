@@ -1,9 +1,12 @@
 using System.Text.Json;
 using AgentChat.Auth;
 using AgentChat.Bots;
+using AgentChat.Hosted;
 using AgentChat.Middleware;
 using AgentChat.Passthrough;
 using AgentChat.Services;
+using Azure.AI.AgentServer.Invocations;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authentication.OpenIdConnect;
 using Microsoft.Agents.Authentication;
 using Microsoft.Agents.Authentication.Msal;
@@ -13,12 +16,28 @@ using Microsoft.Agents.Storage;
 using Microsoft.Agents.Storage.CosmosDb;
 using Microsoft.Identity.Web;
 using Microsoft.Identity.Web.UI;
+using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
+if (builder.Configuration.GetValue("HostedAgent:Enabled", false))
+{
+    var port = Environment.GetEnvironmentVariable("PORT") ?? "8088";
+    builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+
+    // The hosted-agent instance identity is also the Azure Bot identity.
+    // Normalize the standard bot settings before the M365 Agents SDK auth
+    // services read configuration.
+    builder.Configuration["MicrosoftAppId"] ??= builder.Configuration["AZURE_CLIENT_ID"];
+    builder.Configuration["MicrosoftAppType"] ??= "UserAssignedMSI";
+    builder.Configuration["MicrosoftAppTenantId"] ??= builder.Configuration["AZURE_TENANT_ID"];
+}
 var adminChatAuth = AdminChatAuthOptions.FromConfiguration(builder.Configuration);
 adminChatAuth.ValidateIfEnabled();
+var teamsTabAuth = TeamsTabAuthOptions.FromConfiguration(builder.Configuration);
+teamsTabAuth.ValidateIfEnabled();
 
 builder.Services.AddSingleton(adminChatAuth);
+builder.Services.AddSingleton(teamsTabAuth);
 builder.Services.AddScoped<AdminChatAuthFilter>();
 builder.Services.AddControllers().AddNewtonsoftJson();
 if (adminChatAuth.Enabled)
@@ -36,17 +55,70 @@ if (adminChatAuth.Enabled)
         })
         .EnableTokenAcquisitionToCallDownstreamApi(new[] { AdminChatAuthOptions.FoundryScope })
         .AddInMemoryTokenCaches();
-    builder.Services.AddAuthorization();
     builder.Services.AddRazorPages().AddMicrosoftIdentityUI();
 }
+if (teamsTabAuth.Enabled)
+{
+    builder.Services
+        .AddAuthentication()
+        .AddJwtBearer(TeamsTabAuthOptions.Scheme, options =>
+        {
+            options.Authority = teamsTabAuth.Authority;
+            options.Audience = teamsTabAuth.NormalizedAudience;
+            options.SaveToken = true;
+            options.MapInboundClaims = false;
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidIssuers =
+                [
+                    $"https://login.microsoftonline.com/{teamsTabAuth.TenantId}/v2.0",
+                    $"https://sts.windows.net/{teamsTabAuth.TenantId}/"
+                ],
+                ValidateAudience = true,
+                ValidAudiences =
+                [
+                    teamsTabAuth.ClientId!,
+                    teamsTabAuth.NormalizedAudience!
+                ],
+                NameClaimType = "name"
+            };
+        });
+    builder.Services.AddSingleton<TeamsTabTokenService>();
+}
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy(TeamsTabAuthOptions.Policy, policy =>
+    {
+        if (!teamsTabAuth.Enabled)
+        {
+            policy.RequireAssertion(_ => false);
+            return;
+        }
+
+        policy.AddAuthenticationSchemes(TeamsTabAuthOptions.Scheme);
+        policy.RequireAuthenticatedUser();
+        policy.RequireClaim("oid");
+        policy.RequireAssertion(context =>
+            context.User.FindAll("scp")
+                .SelectMany(claim => claim.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+                .Contains(TeamsTabAuthOptions.DelegatedScope, StringComparer.Ordinal));
+    });
+});
 builder.Services.AddApplicationInsightsTelemetry();
 builder.Services.AddHttpClient();
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddHealthChecks();
+if (builder.Configuration.GetValue("HostedAgent:Enabled", false))
+{
+    builder.Services.AddInvocationsServer();
+    builder.Services.AddScoped<InvocationHandler, ActivityInvocationHandler>();
+}
 
 builder.Services.AddSingleton<AgentService>();
 builder.Services.AddSingleton<AgentClientCache>();
 builder.Services.AddSingleton<TeamsSsoService>();
+builder.Services.AddSingleton<ChatSessionService>();
 // IStorage — Cosmos serverless via AAD (no keys).
 builder.Services.AddSingleton<IStorage>(sp =>
 {
@@ -87,23 +159,40 @@ builder.Services.AddSingleton<IRouteRepository, CosmosRouteRepository>();
 // bots without a container restart. See Auth/DynamicConnections.cs and
 // Auth/FicAccessTokenProvider.cs for the FIC flow.
 // -----------------------------------------------------------------------------
-builder.Services.AddSingleton<IConnections>(sp =>
-{
-    var cfg           = sp.GetRequiredService<IConfiguration>();
-    var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
-    var httpFactory   = sp.GetRequiredService<IHttpClientFactory>();
-    var routes        = sp.GetRequiredService<IRouteRepository>();
-
-    var tenantId = cfg["MicrosoftAppTenantId"] ?? cfg["AZURE_TENANT_ID"]
-        ?? throw new InvalidOperationException("MicrosoftAppTenantId not configured.");
-    var uamiClientId = cfg["AZURE_CLIENT_ID"];
-
-    return new DynamicConnections(routes, tenantId, uamiClientId, httpFactory, loggerFactory);
-});
-
 // Wire the M365 Agents SDK auth pipeline (JWT validation for inbound + token
 // service client factory for outbound). Reads TokenValidation from IConfiguration.
 builder.Services.AddDefaultMsalAuth(builder.Configuration);
+
+// AddDefaultMsalAuth registers its own default IConnections. Register the
+// deployment-specific implementation afterward so outbound Connector calls
+// use the intended managed-identity/FIC credential.
+if (builder.Configuration.GetValue("HostedAgent:Enabled", false))
+{
+    builder.Services.AddSingleton<IConnections>(sp =>
+    {
+        var cfg = sp.GetRequiredService<IConfiguration>();
+        var clientId = cfg["AZURE_CLIENT_ID"]
+            ?? throw new InvalidOperationException("AZURE_CLIENT_ID is required in hosted-agent mode.");
+        var logger = sp.GetRequiredService<ILogger<HostedManagedIdentityConnections>>();
+        return new HostedManagedIdentityConnections(clientId, logger);
+    });
+}
+else
+{
+    builder.Services.AddSingleton<IConnections>(sp =>
+    {
+        var cfg           = sp.GetRequiredService<IConfiguration>();
+        var loggerFactory = sp.GetRequiredService<ILoggerFactory>();
+        var httpFactory   = sp.GetRequiredService<IHttpClientFactory>();
+        var routes        = sp.GetRequiredService<IRouteRepository>();
+
+        var tenantId = cfg["MicrosoftAppTenantId"] ?? cfg["AZURE_TENANT_ID"]
+            ?? throw new InvalidOperationException("MicrosoftAppTenantId not configured.");
+        var uamiClientId = cfg["AZURE_CLIENT_ID"];
+
+        return new DynamicConnections(routes, tenantId, uamiClientId, httpFactory, loggerFactory);
+    });
+}
 
 // Registers CloudAdapter + IAgent → FoundryBot + IAgentHttpAdapter → CloudAdapter.
 // AdapterOptions/IActivityTaskQueue/IChannelServiceClientFactory come from
@@ -126,25 +215,31 @@ var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseRouting();
-if (adminChatAuth.Enabled)
+if (adminChatAuth.Enabled || teamsTabAuth.Enabled)
 {
     app.UseAuthentication();
 }
 app.UseMiddleware<BotServiceJwtMiddleware>();
-if (adminChatAuth.Enabled)
-{
-    app.UseAuthorization();
-}
+app.UseAuthorization();
 app.MapControllers();
+if (builder.Configuration.GetValue("HostedAgent:Enabled", false))
+{
+    app.MapInvocationsServer();
+}
 app.MapActivityProtocolPassthrough();
 if (adminChatAuth.Enabled)
 {
     app.MapRazorPages();
 }
 app.MapHealthChecks("/health");
+app.MapHealthChecks("/readiness");
+app.MapHealthChecks("/liveness");
 
 var svc = app.Services.GetRequiredService<AgentService>();
 app.Logger.LogInformation("Configured Foundry project: {Endpoint}. Agent catalog will be discovered on first authenticated request.", svc.DefaultProjectEndpoint);
+app.Logger.LogInformation(
+    "Configured outbound connection provider: {ConnectionProvider}.",
+    app.Services.GetRequiredService<IConnections>().GetType().FullName);
 
 // Hydrate the route registry from Cosmos, seeding from Bots:Routes if the
 // registry is empty. This has to happen after the WebApplication is built
@@ -231,4 +326,3 @@ internal sealed class RouteEntry
     public string? EffectiveProxyAppId =>
         !string.IsNullOrEmpty(ProxyAppId) ? ProxyAppId : AppId;
 }
-

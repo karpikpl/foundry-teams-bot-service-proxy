@@ -32,7 +32,19 @@
 #   - APPLICATIONINSIGHTS_CONNECTION_STRING (optional) App Insights wiring
 
 # ----------------------------------------------------------------------------
-# Build stage
+# Teams tab frontend stage
+# ----------------------------------------------------------------------------
+FROM node:22-alpine AS frontend
+WORKDIR /src/src/AgentChat/ClientApp
+
+COPY src/AgentChat/ClientApp/package.json src/AgentChat/ClientApp/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY src/AgentChat/ClientApp/ ./
+RUN npm run build -- --outDir dist
+
+# ----------------------------------------------------------------------------
+# .NET build stage
 # ----------------------------------------------------------------------------
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
@@ -41,11 +53,13 @@ COPY src/AgentChat/AgentChat.csproj src/AgentChat/
 RUN dotnet restore src/AgentChat/AgentChat.csproj
 
 COPY src/AgentChat/ src/AgentChat/
+COPY --from=frontend /src/src/AgentChat/ClientApp/dist/ src/AgentChat/wwwroot/teams-chat/
 RUN dotnet publish src/AgentChat/AgentChat.csproj \
         -c Release \
         -o /app/publish \
         --no-restore \
-        /p:UseAppHost=false
+        /p:UseAppHost=false \
+        /p:SkipTeamsTabBuild=true
 
 # ----------------------------------------------------------------------------
 # Runtime stage

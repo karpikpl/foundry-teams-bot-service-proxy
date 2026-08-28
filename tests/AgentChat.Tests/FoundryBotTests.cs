@@ -11,6 +11,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Net;
+using System.Text.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
 using ConversationState = AgentChat.Bots.ConversationState;
@@ -53,6 +54,20 @@ public class FoundryBotTests
         var bot = MakeBot();
         var adapter = new TestAdapter();
         var turn = MakeMessageTurn(adapter, "cancel text should not run", value: JObject.FromObject(new { action = "cancel" }));
+
+        await bot.InvokeMessageAsync(turn);
+
+        bot.AgentTurns.Should().BeEmpty();
+        adapter.GetNextReply().Text.Should().Be("Nothing is running right now.");
+    }
+
+    [Fact]
+    public async Task JsonElement_card_submit_from_invocations_is_routed_without_agent_turn()
+    {
+        var bot = MakeBot();
+        var adapter = new TestAdapter();
+        using var document = JsonDocument.Parse("""{"action":"cancel"}""");
+        var turn = MakeMessageTurn(adapter, "", value: document.RootElement.Clone());
 
         await bot.InvokeMessageAsync(turn);
 
@@ -471,7 +486,7 @@ public class FoundryBotTests
             AgentClientCache clientCache,
             TeamsSsoService sso,
             ILogger<FoundryBot> logger)
-            : base(agents, state, config, httpContext, clientCache, sso, logger)
+            : base(agents, state, config, httpContext, clientCache, sso, new TestHttpClientFactory(), logger)
         {
         }
 
@@ -493,7 +508,7 @@ public class FoundryBotTests
             AgentClientCache clientCache,
             TeamsSsoService sso,
             ILogger<FoundryBot> logger)
-            : base(agents, state, config, httpContext, clientCache, sso, logger)
+            : base(agents, state, config, httpContext, clientCache, sso, new TestHttpClientFactory(), logger)
         {
             Store = state;
         }
@@ -510,6 +525,11 @@ public class FoundryBotTests
             AgentTurnTokens.Add(userTokenOverride);
             await turnContext.SendActivityAsync(MessageFactory.Text("agent:" + userText), ct);
         }
+    }
+
+    private sealed class TestHttpClientFactory : IHttpClientFactory
+    {
+        public HttpClient CreateClient(string name) => new();
     }
 
     private sealed class FakeSsoService : TeamsSsoService

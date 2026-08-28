@@ -73,7 +73,35 @@ public class ManifestControllerTests
         manifest["bots"]![0]!["botId"]!.ToString().Should().Be(BotId);
     }
 
-    private static ManifestController MakeController(CatalogHandler handler)
+    [Fact]
+    public async Task Tab_variant_returns_tab_only_manifest_when_public_origin_configured()
+    {
+        var config = TestServices.Config(
+            new KeyValuePair<string, string?>("TeamsTab:Enabled", "true"),
+            new KeyValuePair<string, string?>("TeamsTab:PublicOrigin", "https://proxy.example.com"),
+            new KeyValuePair<string, string?>("TeamsApp:TenantId", "tenant-id"),
+            new KeyValuePair<string, string?>("TeamsApp:BackendAppId", "00000000-0000-0000-0000-deadbeef0001"),
+            new KeyValuePair<string, string?>("TeamsApp:BackendSecret", "secret"),
+            new KeyValuePair<string, string?>("TeamsApp:IdentifierUri", "api://backend"));
+        var controller = MakeController(new CatalogHandler("agent one"), config);
+
+        var result = await controller.AgentManifestVariantDownload(
+            "host-a",
+            "proj-a",
+            "agent one",
+            "tab",
+            CancellationToken.None);
+
+        var file = result.Should().BeOfType<FileContentResult>().Subject;
+        file.FileDownloadName.Should().Be("agent_one-tab.zip");
+        var manifest = ReadManifest(file.FileContents);
+        manifest["bots"].Should().BeNull();
+        var tab = ((JArray)manifest["staticTabs"]!).Should().ContainSingle().Subject;
+        tab["contentUrl"]!.ToString().Should()
+            .Be("https://proxy.example.com/chat/host-a/proj-a/agent%20one/ui");
+    }
+
+    private static ManifestController MakeController(CatalogHandler handler, Microsoft.Extensions.Configuration.IConfiguration? config = null)
     {
         var env = new Mock<IWebHostEnvironment>();
         env.SetupGet(e => e.WebRootPath).Returns(TestServices.WebRootPath());
@@ -90,7 +118,7 @@ public class ManifestControllerTests
         var controller = new ManifestController(
             TestServices.AgentService(handler),
             new HandlerHttpClientFactory(handler),
-            TestServices.Config(),
+            config ?? TestServices.Config(),
             env.Object,
             NullLogger<ManifestController>.Instance,
             new InMemoryRouteRepository(),

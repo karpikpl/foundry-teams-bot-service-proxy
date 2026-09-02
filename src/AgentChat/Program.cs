@@ -232,6 +232,7 @@ if (adminChatAuth.Enabled || teamsTabAuth.Enabled)
 {
     app.UseAuthentication();
 }
+app.UseMiddleware<InboundSourceLoggingMiddleware>();
 app.UseMiddleware<BotServiceJwtMiddleware>();
 app.UseAuthorization();
 app.MapControllers();

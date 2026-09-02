@@ -16,7 +16,7 @@ src/AgentChat/
 ├── Bots/                   # Teams bot, state, cards, streaming, MCP/function tools
 ├── Controllers/            # Bot, admin manifest/chat, proactive notify endpoints
 ├── Foundry/                # Foundry REST/OpenAI SDK helpers and user-token scope
-├── Middleware/             # Inbound Bot Service JWT pre-validation
+├── Middleware/             # Inbound Bot Service JWT pre-validation + source-IP logger
 ├── Services/               # Agent catalog/cache and Teams SSO helpers
 └── wwwroot/                # Browser admin/chat static UI assets
 ```
@@ -31,6 +31,7 @@ src/AgentChat/
   - `NotifyController`: `/api/notify` proactive message helper using stored conversation references.
 - `Middleware/`
   - `BotServiceJwtMiddleware`: route-bound inbound JWT guard for `/api/messages*`. **Does not touch `/api/passthrough/*`.**
+  - `InboundSourceLoggingMiddleware`: log-only classifier for `/api/messages*` and `/api/passthrough*`. Never rejects. Labels each request as `Teams` (52.112.0.0/14, 52.122.0.0/15), `AzureBotService-EastUS` (20.42.0.64/30, 40.71.12.244/30), or `Unknown` based on X-Forwarded-For first hop (fallback: connection remote IP). Emits Info log + writes `SourceLabel`/`ClientIp` to `Activity.Current` so App Insights surfaces them as `customDimensions` on `requests` telemetry. Wired **before** `BotServiceJwtMiddleware` so classification is logged even for JWT-rejected traffic. CIDR table is hardcoded; changing regions is a code change.
 - `Passthrough/`
   - `PassthroughEndpoints` + `ActivityProtocolTransformer`: YARP-based **transparent reverse proxy** at `POST /api/passthrough/{foundry}/{project}/{agent}` → Foundry's `…/endpoint/protocols/activityprotocol` URL. Forwards the inbound JWT (signed by Bot Service for the Foundry agent SP) **unchanged** so Foundry validates it normally; the proxy contributes only a network hop + path rewrite. Used when Foundry public network access is disabled and Bot Service must reach Foundry through a VNet-attached relay. The bot service for this route is configured exactly like the "direct" bot (`msaAppId` = Foundry agent SP) except the endpoint points at our container.
 - `Auth/`
